@@ -12,7 +12,9 @@
 mod crt;
 mod crt_arguments;
 mod crt_callbacks;
+mod crt_format;
 mod crt_startup;
+mod crt_streams;
 mod events;
 mod files;
 mod gdk_queue;
@@ -28,6 +30,7 @@ mod winsock;
 
 use crate::runtime::HResult;
 pub use crt_arguments::{MAX_PROGRAM_ARGUMENT_BYTES, ProgramArgumentsError};
+pub use crt_streams::MAX_CAPTURED_OUTPUT;
 
 use crate::cpu::ExitReason;
 use crate::imports::{ImportRegistry, ServiceStatus};
@@ -205,6 +208,7 @@ pub struct ServicesState {
     last_errors: Mutex<BTreeMap<u64, u32>>,
     crt_arguments: Mutex<crt_arguments::CrtArguments>,
     synch: Mutex<synch::Synch>,
+    crt_streams: Mutex<crt_streams::StandardStreams>,
     pub(crate) threads: Mutex<threads::ThreadTable>,
     pub(crate) hooks: Arc<threads::SchedulerHooks>,
     /// Functions registered with `atexit`, run in reverse order by `_cexit`.
@@ -235,6 +239,7 @@ impl ServicesState {
             last_errors: Mutex::default(),
             crt_arguments: Mutex::default(),
             synch: Mutex::default(),
+            crt_streams: Mutex::default(),
             threads: Mutex::default(),
             hooks: Arc::default(),
             atexit: Mutex::default(),
@@ -346,6 +351,23 @@ impl ServicesState {
             .close_all();
         self.gdk_queue_changed.notify_all();
         status
+    }
+
+    /// Everything the guest has written to `stdout`, as the bytes a text-mode
+    /// stream hands the operating system: each line feed the program wrote is
+    /// a carriage return and a line feed here.
+    pub fn standard_output(&self) -> Vec<u8> {
+        self.crt_streams().output().to_vec()
+    }
+
+    /// Everything the guest has written to `stderr`, in the same form as
+    /// [`Self::standard_output`].
+    pub fn standard_error(&self) -> Vec<u8> {
+        self.crt_streams().error().to_vec()
+    }
+
+    fn crt_streams(&self) -> std::sync::MutexGuard<'_, crt_streams::StandardStreams> {
+        self.crt_streams.lock().expect("standard streams")
     }
 
     /// Read the last-error value for a guest thread's TEB.
@@ -913,6 +935,83 @@ pub(crate) mod handlers {
         let now = context.state.clock.now_filetime();
         time.store(context.memory, now.to_le_bytes())
             .map_err(ExitReason::MemoryFault)
+    }
+
+    // Standard streams and formatted output (#400). `crt_streams.rs` holds
+    // the rules; a documented failure sets errno to EINVAL here.
+
+    fn or_einval<T>(
+        context: &mut ServiceContext<'_>,
+        outcome: crt_streams::Outcome<T>,
+    ) -> Outcome<T> {
+        match outcome? {
+            Ok(value) => Ok(value),
+            Err(crt_streams::Invalid(value)) => {
+                crt::set_errno(context.memory, context.teb, crt::EINVAL)?;
+                Ok(value)
+            }
+        }
+    }
+
+    pub fn standard_stream(context: &mut ServiceContext<'_>, index: u32) -> Outcome<u64> {
+        context.state.crt_streams().file(context.memory, index)
+    }
+
+    pub fn vfprintf(
+        context: &mut ServiceContext<'_>,
+        options: u64,
+        stream: u64,
+        format: u64,
+        locale: u64,
+        arguments: u64,
+    ) -> Outcome<i32> {
+        let outcome = context.state.crt_streams().print(
+            context.memory,
+            options,
+            stream,
+            format,
+            locale,
+            arguments,
+        );
+        or_einval(context, outcome)
+    }
+
+    pub fn fwrite(
+        context: &mut ServiceContext<'_>,
+        buffer: u64,
+        size: u64,
+        count: u64,
+        stream: u64,
+    ) -> Outcome<u64> {
+        let outcome =
+            context
+                .state
+                .crt_streams()
+                .write_items(context.memory, buffer, size, count, stream);
+        or_einval(context, outcome)
+    }
+
+    pub fn fputs(context: &mut ServiceContext<'_>, text: u64, stream: u64) -> Outcome<i32> {
+        let outcome = context
+            .state
+            .crt_streams()
+            .put_string(context.memory, text, stream);
+        or_einval(context, outcome)
+    }
+
+    pub fn fflush(context: &mut ServiceContext<'_>, stream: u64) -> Outcome<i32> {
+        context.state.crt_streams().flush(stream)
+    }
+
+    pub fn setvbuf(
+        context: &mut ServiceContext<'_>,
+        stream: u64,
+        _buffer: u64,
+        mode: i32,
+        size: u64,
+    ) -> Outcome<i32> {
+        let outcome = context.state.crt_streams().set_buffer(stream, mode, size);
+        or_einval(context, outcome)
     }
 
     pub fn get_last_error(context: &mut ServiceContext<'_>) -> Outcome<u32> {
