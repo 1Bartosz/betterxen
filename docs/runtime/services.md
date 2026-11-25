@@ -6,14 +6,14 @@ A declared service is not a claim of compatibility. `implemented` and `partial` 
 
 | Measure | Count |
 | --- | ---: |
-| Services with a declared ABI | 43 |
-| Generated adapters | 43 |
-| Unique handler implementations | 43 |
+| Services with a declared ABI | 47 |
+| Generated adapters | 47 |
+| Unique handler implementations | 47 |
 | Implemented | 7 |
-| Partial | 33 |
+| Partial | 37 |
 | Stub | 3 |
-| Conformance-tested through guest dispatch | 43 |
-| API-set aliases (not services) | 43 |
+| Conformance-tested through guest dispatch | 47 |
+| API-set aliases (not services) | 47 |
 | Independently accepted | 0 |
 
 | Service | Signature | Status | Failure |
@@ -32,10 +32,14 @@ A declared service is not a claim of compatibility. `implemented` and `partial` 
 | `kernel32.dll!GetSystemTimeAsFileTime` | `(time: out<8>) -> void` | implemented | guest fault on an invalid pointer |
 | `ucrtbase.dll!__acrt_iob_func` | `(index: u32) -> ptr` | partial | stops the guest for an index above 2 or when the streams cannot be allocated |
 | `ucrtbase.dll!__stdio_common_vfprintf` | `(options: u64, stream: ptr, format: ptr, locale: ptr, arguments: ptr) -> i32` | partial | -1 with errno EINVAL for a null stream or format or an invalid format; stops the guest for what is not modelled |
-| `ucrtbase.dll!fwrite` | `(buffer: ptr, size: u64, count: u64, stream: ptr) -> u64` | partial | 0 with errno EINVAL for a null buffer or stream; stops the guest for a stream other than stdout or stderr |
-| `ucrtbase.dll!fputs` | `(text: ptr, stream: ptr) -> i32` | partial | EOF with errno EINVAL for a null string or stream; stops the guest for a stream other than stdout or stderr |
-| `ucrtbase.dll!fflush` | `(stream: ptr) -> i32` | partial | stops the guest for a stream that is not a standard stream |
-| `ucrtbase.dll!setvbuf` | `(stream: ptr, buffer: ptr, mode: i32, size: u64) -> i32` | partial | -1 with errno EINVAL for a null stream, an unknown mode or a size outside 2 to INT_MAX; stops the guest for a stream that is not a standard stream |
+| `ucrtbase.dll!fwrite` | `(buffer: ptr, size: u64, count: u64, stream: ptr) -> u64` | partial | 0 with errno EINVAL for a null buffer or stream, or EBADF or ENOSPC for a file; stops the guest for stdin or a pointer that is no stream |
+| `ucrtbase.dll!fputs` | `(text: ptr, stream: ptr) -> i32` | partial | EOF with errno EINVAL for a null string or stream, or EBADF or ENOSPC for a file; stops the guest for stdin or a pointer that is no stream |
+| `ucrtbase.dll!fflush` | `(stream: ptr) -> i32` | partial | stops the guest for a pointer that is no stream |
+| `ucrtbase.dll!setvbuf` | `(stream: ptr, buffer: ptr, mode: i32, size: u64) -> i32` | partial | -1 with errno EINVAL for a null stream, an unknown mode or a size outside 2 to INT_MAX; stops the guest for a pointer that is no stream |
+| `ucrtbase.dll!fopen` | `(name: ptr, mode: ptr) -> ptr` | partial | null with errno EINVAL, ENOENT, EACCES, EMFILE, ENOSPC or ENOMEM |
+| `ucrtbase.dll!fclose` | `(stream: ptr) -> i32` | partial | EOF with errno EINVAL for a null stream; stops the guest for a standard stream or a pointer that is no stream |
+| `ucrtbase.dll!fgets` | `(buffer: ptr, count: i32, stream: ptr) -> ptr` | partial | null at end of file; null with errno EINVAL or EBADF; stops the guest for stdin or a pointer that is no stream |
+| `ucrtbase.dll!perror` | `(message: ptr) -> void` | partial | never |
 | `kernel32.dll!GetLastError` | `() -> u32` | partial | never |
 | `kernel32.dll!SetLastError` | `(code: u32) -> void` | partial | never |
 | `ucrtbase.dll!__p___argc` | `() -> ptr` | partial | stops the guest when the variable cannot be allocated |

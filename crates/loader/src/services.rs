@@ -12,6 +12,7 @@
 mod crt;
 mod crt_arguments;
 mod crt_callbacks;
+mod crt_files;
 mod crt_format;
 mod crt_startup;
 mod crt_streams;
@@ -937,17 +938,18 @@ pub(crate) mod handlers {
             .map_err(ExitReason::MemoryFault)
     }
 
-    // Standard streams and formatted output (#400). `crt_streams.rs` holds
-    // the rules; a documented failure sets errno to EINVAL here.
+    // Streams, files and formatted output (#400, #402). `crt_streams.rs` and
+    // `crt_files.rs` hold the rules; a failure that has an errno value sets it
+    // here. The stream state is always locked before the object state.
 
-    fn or_einval<T>(
+    fn or_errno<T>(
         context: &mut ServiceContext<'_>,
         outcome: crt_streams::Outcome<T>,
     ) -> Outcome<T> {
         match outcome? {
             Ok(value) => Ok(value),
-            Err(crt_streams::Invalid(value)) => {
-                crt::set_errno(context.memory, context.teb, crt::EINVAL)?;
+            Err(crt_streams::Failed(value, errno)) => {
+                crt::set_errno(context.memory, context.teb, errno)?;
                 Ok(value)
             }
         }
@@ -965,15 +967,20 @@ pub(crate) mod handlers {
         locale: u64,
         arguments: u64,
     ) -> Outcome<i32> {
-        let outcome = context.state.crt_streams().print(
-            context.memory,
-            options,
-            stream,
-            format,
-            locale,
-            arguments,
-        );
-        or_einval(context, outcome)
+        let outcome = {
+            let mut streams = context.state.crt_streams();
+            let mut drive = context.state.objects.lock().expect("guest object state");
+            streams.print(
+                context.memory,
+                &mut drive,
+                options,
+                stream,
+                format,
+                locale,
+                arguments,
+            )
+        };
+        or_errno(context, outcome)
     }
 
     pub fn fwrite(
@@ -983,20 +990,21 @@ pub(crate) mod handlers {
         count: u64,
         stream: u64,
     ) -> Outcome<u64> {
-        let outcome =
-            context
-                .state
-                .crt_streams()
-                .write_items(context.memory, buffer, size, count, stream);
-        or_einval(context, outcome)
+        let outcome = {
+            let mut streams = context.state.crt_streams();
+            let mut drive = context.state.objects.lock().expect("guest object state");
+            streams.write_items(context.memory, &mut drive, buffer, size, count, stream)
+        };
+        or_errno(context, outcome)
     }
 
     pub fn fputs(context: &mut ServiceContext<'_>, text: u64, stream: u64) -> Outcome<i32> {
-        let outcome = context
-            .state
-            .crt_streams()
-            .put_string(context.memory, text, stream);
-        or_einval(context, outcome)
+        let outcome = {
+            let mut streams = context.state.crt_streams();
+            let mut drive = context.state.objects.lock().expect("guest object state");
+            streams.put_string(context.memory, &mut drive, text, stream)
+        };
+        or_errno(context, outcome)
     }
 
     pub fn fflush(context: &mut ServiceContext<'_>, stream: u64) -> Outcome<i32> {
@@ -1011,7 +1019,49 @@ pub(crate) mod handlers {
         size: u64,
     ) -> Outcome<i32> {
         let outcome = context.state.crt_streams().set_buffer(stream, mode, size);
-        or_einval(context, outcome)
+        or_errno(context, outcome)
+    }
+
+    pub fn fopen(context: &mut ServiceContext<'_>, name: u64, mode: u64) -> Outcome<u64> {
+        let outcome = {
+            let mut streams = context.state.crt_streams();
+            let mut drive = context.state.objects.lock().expect("guest object state");
+            streams.open(context.memory, &mut drive, name, mode)
+        };
+        or_errno(context, outcome)
+    }
+
+    pub fn fclose(context: &mut ServiceContext<'_>, stream: u64) -> Outcome<i32> {
+        let outcome = context.state.crt_streams().close(context.memory, stream);
+        or_errno(context, outcome)
+    }
+
+    pub fn fgets(
+        context: &mut ServiceContext<'_>,
+        buffer: u64,
+        count: i32,
+        stream: u64,
+    ) -> Outcome<u64> {
+        let outcome = {
+            let mut streams = context.state.crt_streams();
+            let drive = context.state.objects.lock().expect("guest object state");
+            streams.get_line(context.memory, &drive, buffer, count, stream)
+        };
+        or_errno(context, outcome)
+    }
+
+    pub fn perror(context: &mut ServiceContext<'_>, message: u64) -> Outcome<()> {
+        let address = context
+            .memory
+            .crt_errno_address(context.teb)
+            .map_err(ExitReason::MemoryFault)?;
+        let errno = context
+            .memory
+            .read_u32(address)
+            .map_err(ExitReason::MemoryFault)?;
+        let mut streams = context.state.crt_streams();
+        let mut drive = context.state.objects.lock().expect("guest object state");
+        streams.report(context.memory, &mut drive, message, errno)
     }
 
     pub fn get_last_error(context: &mut ServiceContext<'_>) -> Outcome<u32> {

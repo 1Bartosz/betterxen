@@ -133,6 +133,8 @@ remains unsupported.
 
 - Added a bounded synthetic guest drive with synchronous file open, read, write, and size queries.
 
+- Added files for a hosted C program (#402, part of Gate A2): `fopen`, `fclose`, `fgets` and `perror`, and file streams for the output services from #400, so `fprintf`, `fwrite` and `fputs` write to a file `fopen` returned. The files are the ones on the in-memory `C:` drive behind `CreateFileW`, so a file written through a C stream is the file `ReadFile` reads, and the reverse. `fopen` takes `r`, `w` or `a` with `+`, `b` and `t` as Microsoft's page describes them; text mode, the default, stores a line feed as carriage return and line feed, reads the pair back as a line feed and ends input at `CTRL+Z`. Failures return their documented results; the `errno` values beyond `EINVAL` for a null or empty argument are Xenora's choice. Nothing is buffered, there is no seeking, a C stream takes no part in Win32 sharing, and the other mode characters are refused. All four services are `partial`. Eight tests in `runtime_services.rs`, four in the new `crt_files.rs` that cross-check with `ReadFile` and `WriteFile`, and a unit test of the mode strings cover it. Not compared with Windows; awaiting independent review.
+
 - Added unnamed guest semaphores with checked release and immediate mixed-object waits.
 
 - Added non-alertable extended event waits through both Win64 wait APIs.
