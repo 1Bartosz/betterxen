@@ -20,10 +20,12 @@ RUSTC_TC=${RUSTUP_TOOLCHAIN_FOR_WORKLOADS:-1.100.0}
 
 for arch in x86_64 aarch64; do
     d="$OUT/$arch"; mkdir -p "$d"
-    "$TC/bin/$arch-w64-mingw32-clang" -O2 -Wall -Wextra -Werror \
+    "$TC/bin/$arch-w64-mingw32-clang" -O2 -Wall -Wextra -Werror -Wl,--no-insert-timestamp \
         -o "$d/selfcheck-c.exe" "$ROOT/workloads/win-selfcheck-c/selfcheck.c"
-    "$TC/bin/$arch-w64-mingw32-clang" -O2 -Wall -Wextra -Werror \
+    "$TC/bin/$arch-w64-mingw32-clang" -O2 -Wall -Wextra -Werror -Wl,--no-insert-timestamp \
         -o "$d/d3d11-clear.exe" "$ROOT/workloads/d3d11-clear/d3d11_clear.c" -ld3d11 -ldxgi
+    "$TC/bin/$arch-w64-mingw32-clang" -O2 -Wall -Wextra -Werror -Wl,--no-insert-timestamp \
+        -o "$d/d3d11-frameloop.exe" "$ROOT/workloads/d3d11-frameloop/frameloop.c" -ld3d11 -ldxgi -ldxguid -ld3dcompiler -lm
     env_arch=$(echo "$arch" | tr a-z A-Z)
     (
         export PATH="$TC/bin:$PATH"
