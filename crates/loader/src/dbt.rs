@@ -48,6 +48,8 @@ pub struct DbtEngine {
     services: HashMap<u64, HostServiceFn>,
     pub import_registry: Option<crate::imports::ImportRegistry>,
     pub metrics: DbtMetrics,
+    /// Exit status of a guest that ended its process on this engine.
+    exited: Option<u32>,
 }
 
 impl DbtEngine {
@@ -62,6 +64,7 @@ impl DbtEngine {
             services: HashMap::new(),
             import_registry: None,
             metrics: DbtMetrics::default(),
+            exited: None,
         })
     }
 
@@ -79,11 +82,61 @@ impl DbtEngine {
     }
 
     /// Execute guest code starting at CPU RIP until HLT, budget exhaustion, or fault.
+    ///
+    /// Once the guest has ended its process, this engine executes nothing
+    /// further: every later call reports the same exit.
     pub fn run(
         &mut self,
         cpu: &mut CpuState,
         memory: &mut GuestMemory,
         max_instructions: usize,
+    ) -> ExecutionResult {
+        self.run_bounded(cpu, memory, max_instructions, true)
+    }
+
+    /// As [`Self::run`], but stop at the first block boundary that reaches the
+    /// budget. Repeated slices reuse whole blocks instead of compiling a
+    /// shortened one at every cutoff. The budget may be exceeded by less than
+    /// one block.
+    pub(crate) fn run_slice(
+        &mut self,
+        cpu: &mut CpuState,
+        memory: &mut GuestMemory,
+        max_instructions: usize,
+    ) -> ExecutionResult {
+        self.run_bounded(cpu, memory, max_instructions, false)
+    }
+
+    /// Both entry points go through the process-exit latch: once the guest
+    /// process has exited, no guest instruction runs again, whichever guest
+    /// thread the caller tries to run.
+    fn run_bounded(
+        &mut self,
+        cpu: &mut CpuState,
+        memory: &mut GuestMemory,
+        max_instructions: usize,
+        exact: bool,
+    ) -> ExecutionResult {
+        if let Some(status) = self.exited {
+            return ExecutionResult {
+                instructions_executed: 0,
+                final_state: cpu.clone(),
+                exit_reason: ExitReason::ProcessExit(status),
+            };
+        }
+        let result = self.execute(cpu, memory, max_instructions, exact);
+        if let ExitReason::ProcessExit(status) = result.exit_reason {
+            self.exited = Some(status);
+        }
+        result
+    }
+
+    fn execute(
+        &mut self,
+        cpu: &mut CpuState,
+        memory: &mut GuestMemory,
+        max_instructions: usize,
+        exact: bool,
     ) -> ExecutionResult {
         let mut instructions_count = 0;
 
@@ -119,7 +172,11 @@ impl DbtEngine {
             }
 
             // Look up or translate block at cpu.rip
-            let block_limit = (max_instructions - instructions_count).min(MAX_BLOCK_INSTRUCTIONS);
+            let block_limit = if exact {
+                (max_instructions - instructions_count).min(MAX_BLOCK_INSTRUCTIONS)
+            } else {
+                MAX_BLOCK_INSTRUCTIONS
+            };
             let mut block = self.get_or_compile_block(cpu.rip, memory, block_limit);
             // A decode failure can belong to a later instruction in the block.
             // Execute the current instruction alone so earlier effects retire
@@ -335,6 +392,9 @@ pub fn is_native(insn: &Insn) -> bool {
     let scanned = matches!(insn.size, 2 | 4 | 8);
     match insn.op {
         Op::Add | Op::Sub | Op::Cmp | Op::And | Op::Or | Op::Xor | Op::Test => wide,
+        // Register and immediate forms only; a memory destination would have
+        // to restore the guest carry again after the store helper call.
+        Op::Adc | Op::Sbb => wide && insn.memory().is_none(),
         Op::Inc | Op::Dec | Op::Neg | Op::Not => wide,
         Op::Cmov => wide,
         Op::Bsf | Op::Bsr => scanned,
@@ -587,9 +647,26 @@ impl Emitter<'_> {
     }
 
     /// X11 = X9 op X10, setting host NZCV only for the arithmetic operations.
+    /// ADC and SBB also read the guest CF and clobber X12 and X13.
     fn compute(&mut self, op: Op, wide: bool) {
         let asm = &mut *self.asm;
+        if matches!(op, Op::Adc | Op::Sbb) {
+            // ADCS adds the host C, so C must equal the guest CF. SBCS
+            // subtracts NOT C, while x86 SBB subtracts the borrow CF, so there
+            // C must be its inverse. A compare sets C when it does not borrow.
+            asm.ldrb_uoff(X12, X19, CF);
+            if op == Op::Adc {
+                asm.load_imm_64(X13, 1);
+                asm.cmp_reg_32(X12, X13); // C = CF >= 1
+            } else {
+                asm.cmp_reg_32(XZR, X12); // C = 0 >= CF
+            }
+        }
         match (op, wide) {
+            (Op::Adc, true) => asm.adcs_reg_64(X11, X9, X10),
+            (Op::Adc, false) => asm.adcs_reg_32(X11, X9, X10),
+            (Op::Sbb, true) => asm.sbcs_reg_64(X11, X9, X10),
+            (Op::Sbb, false) => asm.sbcs_reg_32(X11, X9, X10),
             (Op::Add | Op::Inc, true) => asm.adds_reg_64(X11, X9, X10),
             (Op::Add | Op::Inc, false) => asm.adds_reg_32(X11, X9, X10),
             (Op::And | Op::Test, true) => asm.ands_reg_64(X11, X9, X10),
@@ -623,7 +700,7 @@ impl Emitter<'_> {
             match op {
                 // INC and DEC leave CF unchanged.
                 Op::Inc | Op::Dec => {}
-                Op::Add => {
+                Op::Add | Op::Adc => {
                     asm.cset_32(X12, Condition::Cs);
                     asm.strb_uoff(X12, X19, CF);
                 }
@@ -1214,9 +1291,20 @@ struct BlockContext {
 const BLOCK_CTX_FAULTED_OFFSET: u32 = 8;
 const _: () = assert!(std::mem::offset_of!(BlockContext, faulted) == 8);
 
+fn check_guest_address(ctx: *mut BlockContext, address: u64, size: u8) -> bool {
+    if x86_exec::canonical_access(address, size) {
+        return true;
+    }
+    fault(ctx, ExitReason::GeneralProtection);
+    false
+}
+
 extern "C" fn write_u64_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
     unsafe {
         if (*ctx).exit_reason.is_some() {
+            return;
+        }
+        if !check_guest_address(ctx, addr, 8) {
             return;
         }
         let mem = &mut *(*ctx).memory_ptr;
@@ -1230,6 +1318,9 @@ extern "C" fn write_u64_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
 extern "C" fn read_u64_helper(ctx: *mut BlockContext, addr: u64) -> u64 {
     unsafe {
         if (*ctx).exit_reason.is_some() {
+            return 0;
+        }
+        if !check_guest_address(ctx, addr, 8) {
             return 0;
         }
         let mem = &*(*ctx).memory_ptr;
@@ -1275,6 +1366,9 @@ fn fault(ctx: *mut BlockContext, reason: ExitReason) {
 
 /// Read 16 bytes at any alignment; returned in X0 (low) and X1 (high).
 extern "C" fn read_u128_helper(ctx: *mut BlockContext, addr: u64) -> u128 {
+    if !check_guest_address(ctx, addr, 16) {
+        return 0;
+    }
     let memory = unsafe { &*(*ctx).memory_ptr };
     let mut bytes = [0; 16];
     if let Err(error) = memory.read_bytes(addr, &mut bytes) {
@@ -1293,6 +1387,9 @@ extern "C" fn read_aligned_u128_helper(ctx: *mut BlockContext, addr: u64) -> u12
 
 /// Write 16 bytes at any alignment; `value` arrives in X2 (low) and X3 (high).
 extern "C" fn write_u128_helper(ctx: *mut BlockContext, addr: u64, value: u128) {
+    if !check_guest_address(ctx, addr, 16) {
+        return;
+    }
     let memory = unsafe { &mut *(*ctx).memory_ptr };
     if let Err(error) = memory.write_bytes(addr, &value.to_le_bytes()) {
         fault(ctx, ExitReason::MemoryFault(error));
@@ -1340,6 +1437,9 @@ extern "C" fn write_u16_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
         if (*ctx).exit_reason.is_some() {
             return;
         }
+        if !check_guest_address(ctx, addr, 2) {
+            return;
+        }
         let mem = &mut *(*ctx).memory_ptr;
         if let Err(e) = mem.write_u16(addr, val as u16) {
             (*ctx).faulted = 1;
@@ -1353,6 +1453,9 @@ extern "C" fn write_u32_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
         if (*ctx).exit_reason.is_some() {
             return;
         }
+        if !check_guest_address(ctx, addr, 4) {
+            return;
+        }
         let mem = &mut *(*ctx).memory_ptr;
         if let Err(e) = mem.write_u32(addr, val as u32) {
             (*ctx).faulted = 1;
@@ -1364,6 +1467,9 @@ extern "C" fn write_u32_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
 extern "C" fn read_u32_helper(ctx: *mut BlockContext, addr: u64) -> u64 {
     unsafe {
         if (*ctx).exit_reason.is_some() {
+            return 0;
+        }
+        if !check_guest_address(ctx, addr, 4) {
             return 0;
         }
         let mem = &*(*ctx).memory_ptr;
@@ -1383,6 +1489,9 @@ extern "C" fn write_u8_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
         if (*ctx).exit_reason.is_some() {
             return;
         }
+        if !check_guest_address(ctx, addr, 1) {
+            return;
+        }
         let mem = &mut *(*ctx).memory_ptr;
         if let Err(e) = mem.write_u8(addr, val as u8) {
             (*ctx).faulted = 1;
@@ -1394,6 +1503,9 @@ extern "C" fn write_u8_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
 extern "C" fn read_u8_helper(ctx: *mut BlockContext, addr: u64) -> u64 {
     unsafe {
         if (*ctx).exit_reason.is_some() {
+            return 0;
+        }
+        if !check_guest_address(ctx, addr, 1) {
             return 0;
         }
         let mem = &*(*ctx).memory_ptr;
@@ -1411,6 +1523,9 @@ extern "C" fn read_u8_helper(ctx: *mut BlockContext, addr: u64) -> u64 {
 extern "C" fn read_u16_helper(ctx: *mut BlockContext, addr: u64) -> u64 {
     unsafe {
         if (*ctx).exit_reason.is_some() {
+            return 0;
+        }
+        if !check_guest_address(ctx, addr, 2) {
             return 0;
         }
         let mem = &*(*ctx).memory_ptr;

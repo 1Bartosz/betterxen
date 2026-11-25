@@ -1,4 +1,4 @@
-# Xenora documentation
+# BetterXen documentation
 
 ## Getting started
 
@@ -7,6 +7,10 @@ then read the [interface contracts](interfaces.md). Reproduce an
 [original guest test program](../experiments/x1/README.md) or run the
 [independent validation suite](../tests/validation/README.md) before changing
 either path. The [changelog](../CHANGELOG.md) records notable changes.
+
+Use the [BetterXen development phases](development-phases.md) for current work
+order, existing issue/PR dependencies and measurable completion criteria.
+Historical phase checkpoints retain their original evidence scope.
 
 ## Architecture and technical design
 
@@ -35,6 +39,7 @@ either path. The [changelog](../CHANGELOG.md) records notable changes.
 - [Guest experiment guide](../experiments/x1/README.md) — Bounded x86-64 execution, executable loading, experimental services, native compute, and offscreen rendering.
 - [x86-64 instruction registry](cpu/instruction-registry.md) — Shared decoder, generated tables, semantics, native lowering and how to add a verified instruction form.
 - [Runtime service registry](runtime/registry.md) and [generated coverage](runtime/services.md) — Import resolution, typed Win64 adapters and how to add a tested service.
+- [Guest threads](runtime/threads.md) — Deterministic scheduler, thread services, limits and tests.
 - [Guest CPU research](research/cpu-boundary.md) — Public specifications and unresolved console requirements.
 - [Synthetic import fixtures](../tests/compat_fixtures/README.md) — Reproducible PE32+ builds and expected service behavior.
 
@@ -43,9 +48,11 @@ either path. The [changelog](../CHANGELOG.md) records notable changes.
 - [Testing and acceptance index](testing/README.md) — Entry point for test procedures, evidence and review records.
 - [AMD RDNA2 desktop GPU (gfx1030) form acceptance](testing/shader-form-acceptance.md) — Independence, command, log and promotion rules for fixture-verified instruction forms.
 - [Engineering progress](progress.md) — Verification commands, metric definitions, and open release gates.
+- [CPU test runtime and shard selection](testing/cpu-coverage.md) — Measured CPU gate cost and deterministic test-target shards.
 - [Test inventory comparison](testing/test-inventory.md) — Detect missing or newly ignored Cargo tests across commits.
 - [Persistent resource and translated rendering acceptance](testing/x9-acceptance.md) — Pinned upstream tests, native ARM64 results and unsupported cases.
 - [Baseline acceptance](testing/phase-02-baseline.md), [Phase 01 assurance](testing/phase01-assurance.md), and [independent reviews](testing/review-log.md) — Candidate-specific results and release findings.
+- [Gate A: a compiled C program](testing/gate-a.md) — The two milestones, what the A1 test checks and what it does not show.
 - [Mutation testing](testing/mutation.md) and [benchmark protocol](testing/benchmarks.md) — Test sensitivity, benchmark inputs, and timing requirements.
 
 ## Research and engineering decisions
@@ -60,7 +67,9 @@ either path. The [changelog](../CHANGELOG.md) records notable changes.
 - [Legal scope](legal.md), [dependency licensing](licenses.md), and [third-party notices](../THIRD_PARTY_NOTICES.md) — Input policy, attribution, and redistribution findings.
 - [Contribution guidelines](../CONTRIBUTING.md) — Original authorship, Developer Certificate of Origin sign-off, and evidence requirements.
 - [Agent task queue](coordination/agent-tasks.md) — Areas, claiming, leases, upstream sync, verification and the security model for parallel contributors and coding agents.
-- [CPU/runtime expansion campaign ledger](coordination/cpu-campaign-ledger.md) — Progress ledger for the Xenora native CPU and runtime compatibility campaign: starting/current commits, completed batches, new forms, verification evidence and the next implementation target.
+- [CPU/runtime expansion campaign ledger](coordination/cpu-campaign-ledger.md) — Progress ledger for the BetterXen native CPU and runtime compatibility campaign: starting/current commits, completed batches, new forms, verification evidence and the next implementation target.
 - [Infrastructure QA ownership](coordination/infrastructure-qa-ownership.md) — Non-overlapping paths for infrastructure and QA tooling.
 - [Agent queue smoke evidence](coordination/agent-queue-smoke.md) — Live Actions results from the disposable smoke repository.
 - [Infrastructure QA tooling](testing/infrastructure/README.md) — Advisory orchestration, PR validation, benchmark analysis and release checks.
+
+- [Migration to BetterXen](migration.md): source attribution, imported history and compatibility names.

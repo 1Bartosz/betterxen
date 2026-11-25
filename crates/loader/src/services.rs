@@ -17,9 +17,11 @@ mod gdk_queue;
 mod heap;
 mod modules;
 mod platform_fixture;
+mod process;
 mod synch;
 pub mod sysinfo;
 mod task_fixture;
+pub(crate) mod threads;
 mod winsock;
 
 use crate::runtime::HResult;
@@ -92,8 +94,14 @@ impl MockClock {
         }
     }
 
+    /// Move both readings forward by `intervals` 100-nanosecond ticks. Each
+    /// stops at its maximum, so neither ever runs backwards.
     pub fn advance(&self, intervals: u64) {
-        self.current.fetch_add(intervals, Ordering::SeqCst);
+        self.current
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_add(intervals))
+            })
+            .expect("clock update always returns a value");
         self.performance_count
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 Some(count.saturating_add(intervals).min(MAX_PERFORMANCE_COUNT))
@@ -193,8 +201,12 @@ pub struct ServicesState {
     objects: Mutex<ObjectState>,
     last_errors: Mutex<BTreeMap<u64, u32>>,
     synch: Mutex<synch::Synch>,
+    pub(crate) threads: Mutex<threads::ThreadTable>,
+    pub(crate) hooks: Arc<threads::SchedulerHooks>,
     /// Functions registered with `atexit`, run in reverse order by `_cexit`.
     atexit: Mutex<Vec<u64>>,
+    /// The status the guest process exited with. Set once.
+    exit_status: Mutex<Option<u32>>,
     winsock: Mutex<winsock::Winsock>,
     task_fixture: Mutex<task_fixture::TaskFixture>,
     platform_fixture: Mutex<platform_fixture::PlatformFixture>,
@@ -217,7 +229,10 @@ impl ServicesState {
             objects: Mutex::new(ObjectState::default()),
             last_errors: Mutex::default(),
             synch: Mutex::default(),
+            threads: Mutex::default(),
+            hooks: Arc::default(),
             atexit: Mutex::default(),
+            exit_status: Mutex::default(),
             winsock: Mutex::default(),
             task_fixture: Mutex::default(),
             platform_fixture: Mutex::default(),
@@ -239,6 +254,76 @@ impl ServicesState {
     /// The scheduling policy recorded for the synthetic process.
     pub fn priority_boost_disabled(&self) -> bool {
         self.priority_boost_disabled.load(Ordering::SeqCst)
+    }
+
+    /// The status the guest process exited with, once it has exited.
+    pub fn exit_status(&self) -> Option<u32> {
+        *self.exit_status.lock().expect("guest exit status")
+    }
+
+    /// How many guest handles are open: kernel objects, sockets and task
+    /// queues, which are kept in three separate tables.
+    pub fn open_handle_count(&self) -> usize {
+        let objects = self
+            .objects
+            .lock()
+            .expect("guest object state")
+            .handles
+            .len();
+        let sockets = self
+            .winsock
+            .lock()
+            .expect("guest Winsock state")
+            .open_count();
+        let queues = self
+            .gdk_queues
+            .lock()
+            .expect("GDK queue handle table")
+            .open_count();
+        objects + sockets + queues
+    }
+
+    /// A file on the synthetic `C:` drive, named as the guest names it.
+    pub fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
+        let path = path.replace('/', "\\").to_ascii_lowercase();
+        let name = path.strip_prefix("c:\\").unwrap_or(&path);
+        self.objects
+            .lock()
+            .expect("guest object state")
+            .files
+            .get(name)
+            .cloned()
+    }
+
+    /// End the guest process. The first exit decides the status; a later one
+    /// reports it again and changes nothing.
+    ///
+    /// Every guest handle is closed: kernel objects, sockets and task queues.
+    /// Files stay on the synthetic drive, guest memory stays mapped for the
+    /// host to inspect, and `atexit` functions are not run.
+    fn exit_process(&self, status: u32) -> u32 {
+        let mut exited = self.exit_status.lock().expect("guest exit status");
+        if let Some(first) = *exited {
+            return first;
+        }
+        *exited = Some(status);
+        // The three table locks are taken one at a time, never nested.
+        self.objects
+            .lock()
+            .expect("guest object state")
+            .handles
+            .clear();
+        self.winsock
+            .lock()
+            .expect("guest Winsock state")
+            .close_all();
+        self.winsock_changed.notify_all();
+        self.gdk_queues
+            .lock()
+            .expect("GDK queue handle table")
+            .close_all();
+        self.gdk_queue_changed.notify_all();
+        status
     }
 
     /// Read the last-error value for a guest thread's TEB.
@@ -294,11 +379,26 @@ impl ServicesState {
 /// hand-written fixture services.
 pub fn register_standard_services(registry: &mut ImportRegistry, state: Arc<ServicesState>) {
     crate::runtime_table::register(registry, &state);
+    registry.hooks = Some(Arc::clone(&state.hooks));
+    threads::register(registry, &state);
 
     let s = state.clone();
     registry.register(KERNEL32, "GetThreadId", move |args, cpu, mem| {
         let handle = args.get(0, mem).map_err(ExitReason::MemoryFault)?;
+        if handle == CURRENT_THREAD {
+            return Ok(u64::from(s.thread_id_of(cpu.gs_base)));
+        }
         let thread = s.objects.lock().expect("guest object state");
+        if let Some(GuestObject::Waitable { state, access }) = thread.handles.get(&handle)
+            && let events::Waitable::Thread { id, .. } =
+                &*state.lock().expect("guest waitable state")
+        {
+            return if access & THREAD_QUERY_RIGHTS == 0 {
+                s.fail(cpu.gs_base, ERROR_ACCESS_DENIED, 0)
+            } else {
+                Ok(u64::from(*id))
+            };
+        }
         if let Err(error) = thread.check_access(handle, THREAD_QUERY_RIGHTS) {
             return s.fail(cpu.gs_base, error, 0);
         }
@@ -324,8 +424,12 @@ pub fn register_standard_services(registry: &mut ImportRegistry, state: Arc<Serv
         if inherit != 0 || options & !DUPLICATE_SAME_ACCESS != 0 || source == CURRENT_PROCESS {
             return s.fail(cpu.gs_base, ERROR_NOT_SUPPORTED, 0);
         }
+        let worker = s.current_worker(cpu.gs_base);
         let mut thread = s.objects.lock().expect("guest object state");
-        let (granted, mut object) = if source == CURRENT_THREAD {
+        let (granted, mut object) = if let (CURRENT_THREAD, Some(state)) = (source, worker) {
+            let access = threads::THREAD_ALL_ACCESS;
+            (access, GuestObject::Waitable { state, access })
+        } else if source == CURRENT_THREAD {
             (
                 THREAD_SUPPORTED_RIGHTS,
                 GuestObject::Thread(THREAD_SUPPORTED_RIGHTS),
@@ -439,20 +543,24 @@ pub fn register_standard_services(registry: &mut ImportRegistry, state: Arc<Serv
             return Ok(0);
         }
 
-        let page_size = 4096;
-        let aligned_size = (size + page_size - 1) & !(page_size - 1);
+        let page_size = 4096usize;
+        // Huge or overflowing sizes fail closed. Unbounded map_region would
+        // try to malloc multi-gigabyte host buffers (libFuzzer OOM on
+        // ~3.7 GiB); route through the virtual budget instead.
+        let Some(aligned_size) = size
+            .checked_add(page_size - 1)
+            .map(|rounded| rounded & !(page_size - 1))
+            .filter(|&aligned| aligned != 0)
+        else {
+            return Ok(0);
+        };
         let alloc_addr = s
             .next_alloc_addr
             .fetch_add(aligned_size as u64, Ordering::SeqCst);
 
-        if mem
-            .map_region(alloc_addr, aligned_size, MemoryPermissions::READ_WRITE)
-            .is_err()
-        {
-            return Ok(0);
-        }
-
-        Ok(alloc_addr)
+        Ok(mem
+            .map_virtual_allocation(alloc_addr, aligned_size, MemoryPermissions::READ_WRITE)
+            .unwrap_or(0))
     };
     registry.register("xmem.dll", "XMemAlloc", handler);
     registry.set_status("xmem.dll", "XMemAlloc", ServiceStatus::Partial);
@@ -602,6 +710,7 @@ pub fn register_standard_services(registry: &mut ImportRegistry, state: Arc<Serv
     platform_fixture::register(registry, &state);
     gdk_queue::register(registry, &state);
     modules::register(registry, &state);
+    process::register(registry, &state);
 }
 
 /// Implementations behind the generated adapters. A failure the guest can
@@ -664,7 +773,7 @@ pub(crate) mod handlers {
     }
 
     pub fn get_current_thread_id(context: &mut ServiceContext<'_>) -> Outcome<u32> {
-        Ok(context.state.thread_id)
+        Ok(context.state.thread_id_of(context.teb))
     }
 
     pub fn open_thread(
@@ -674,21 +783,41 @@ pub(crate) mod handlers {
         id: u32,
     ) -> Outcome<u64> {
         let state = context.state;
-        if id != state.thread_id {
+        let worker = state.worker_object(id);
+        let main = id == state.thread_id && state.main_thread_alive();
+        if !main && worker.is_none() {
             return state.fail(context.teb, ERROR_INVALID_PARAMETER, 0);
         }
-        if inherit || access & !THREAD_SUPPORTED_RIGHTS != 0 {
+        let supported = THREAD_SUPPORTED_RIGHTS
+            | if worker.is_some() {
+                threads::WORKER_RIGHTS
+            } else {
+                0
+            };
+        if inherit || access & !supported != 0 {
             return state.fail(context.teb, ERROR_NOT_SUPPORTED, 0);
         }
         let mut thread = state.objects.lock().expect("guest object state");
         let Some(handle) = thread.next_handle() else {
             return state.fail(context.teb, ERROR_NOT_ENOUGH_MEMORY, 0);
         };
-        thread.insert_handle(handle, GuestObject::Thread(access));
+        let object = match worker {
+            Some(state) => GuestObject::Waitable { state, access },
+            None => GuestObject::Thread(access),
+        };
+        thread.insert_handle(handle, object);
         Ok(handle)
     }
 
     pub fn get_thread_priority(context: &mut ServiceContext<'_>, handle: u64) -> Outcome<i32> {
+        // Only the main thread has a priority; a worker must not change it.
+        if handle == CURRENT_THREAD && context.state.current_worker(context.teb).is_some() {
+            return context.state.fail(
+                context.teb,
+                ERROR_NOT_SUPPORTED,
+                THREAD_PRIORITY_ERROR_RETURN as i32,
+            );
+        }
         let thread = context.state.objects.lock().expect("guest object state");
         if let Err(error) = thread.check_access(handle, THREAD_QUERY_RIGHTS) {
             return context
@@ -703,6 +832,10 @@ pub(crate) mod handlers {
         handle: u64,
         priority: i32,
     ) -> Outcome<bool> {
+        // Only the main thread has a priority; a worker must not change it.
+        if handle == CURRENT_THREAD && context.state.current_worker(context.teb).is_some() {
+            return context.state.fail(context.teb, ERROR_NOT_SUPPORTED, false);
+        }
         let state = context.state;
         let mut thread = state.objects.lock().expect("guest object state");
         if let Err(error) = thread.check_access(handle, THREAD_SET_RIGHTS) {

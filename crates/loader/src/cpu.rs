@@ -167,12 +167,21 @@ pub enum ExitReason {
     StackUnderflow,
     /// Division by zero or a quotient too large for its destination (#DE).
     DivideError,
-    /// A misaligned 16-byte operand or a reserved MXCSR bit (#GP).
+    /// A non-canonical data address, misaligned 16-byte operand or reserved MXCSR bit (#GP).
     GeneralProtection,
     /// An unmasked SSE floating-point exception (#XM); MXCSR holds its flags.
     SimdException,
     /// A host service changed a register the Win64 ABI requires it to preserve.
     ServiceAbiViolation,
+    /// The guest ended its own process with this exit status. Only the guest
+    /// stops; the host keeps running.
+    ProcessExit(u32),
+    /// A service has to wait; it had no effect and runs again later.
+    GuestBlocked,
+    /// A service completed and asked the scheduler for a turn.
+    GuestYield,
+    /// The running guest thread ended itself.
+    GuestThreadExited,
 }
 
 impl fmt::Display for ExitReason {
@@ -188,9 +197,13 @@ impl fmt::Display for ExitReason {
             Self::DivideError => write!(f, "guest divide error"),
             Self::GeneralProtection => write!(f, "guest general-protection fault"),
             Self::SimdException => write!(f, "guest SIMD floating-point exception"),
+            Self::ProcessExit(status) => write!(f, "guest process exited with status {status}"),
             Self::ServiceAbiViolation => {
                 write!(f, "host service changed a nonvolatile guest register")
             }
+            Self::GuestBlocked => write!(f, "guest thread is waiting"),
+            Self::GuestYield => write!(f, "guest thread gave up its turn"),
+            Self::GuestThreadExited => write!(f, "guest thread exited"),
         }
     }
 }

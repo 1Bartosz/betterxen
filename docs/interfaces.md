@@ -66,12 +66,60 @@ returns owned words after command completion or a stage-specific error.
 fixture, guest memory addresses, a service registry and an entry instruction
 budget. It maps and rebases the image, binds imports, initializes thread-local
 storage, invokes its callbacks and runs the entry point. The fixture entry point
-uses a Win64-aligned stack and terminates with HLT. The result includes the loaded
-guest memory and the entry execution outcome.
+uses a Win64-aligned stack. It may end with HLT, call `ExitProcess`, or return.
+The result includes the loaded guest memory and the entry execution outcome.
 
-`xenora probe --mode static` inventories ordinary and delay-loaded PE imports
+A guest ends its process through `kernel32.dll!ExitProcess`, also reachable as
+`api-ms-win-core-processthreads-l1-1-0.dll!ExitProcess`. Execution stops with
+`ExitReason::ProcessExit(status)`, where the status is the full 32-bit value
+the guest passed. Only the guest stops: the host process is not ended. A
+returning entry point does the same with EAX as the status, which matches
+Windows while the process has one thread. The exit closes every guest handle:
+kernel objects, Winsock sockets and task-queue handles, which
+`ServicesState::open_handle_count` counts together. Files stay on the synthetic `C:` drive, guest memory stays mapped so the host
+can inspect it, and `atexit` functions are not run: that belongs to the C
+runtime's `exit`, which is not implemented. `ServicesState::exit_status`
+reports the status. After an exit the `DbtEngine` that ran the guest executes
+no further guest instruction and answers every later `run` with the same
+`ProcessExit`. A service callback that was in progress is never resumed.
+
+A TLS callback may end the process too. Startup then reports the exit as its
+outcome, with the status, and runs neither the remaining callbacks nor the
+entry point; `StartupResult::tls_callbacks` counts the callbacks that finished.
+Any other stop inside a TLS callback is still a startup error.
+
+The engine recognises two return addresses, one under the entry point and one
+under a guest callback, before it executes anything at them. Both are in the
+4 KiB page at `imports::RETURN_SENTINEL_PAGE`, which startup reserves with no
+access. An image or layout that covers that page is refused, and a guest
+allocation there fails. The import trampolines above that page are intercepted
+in the same way and are not reserved.
+
+Loading an image maps its headers as well as its sections. The first
+`SizeOfHeaders` bytes of the file are mapped read-only at the image base, in
+whole 4 KiB pages. Everything in those pages past `SizeOfHeaders` is zero, even
+where the file holds more bytes there. A guest can read its own DOS header,
+section table and data directories; it cannot write or execute them.
+
+When startup loads an image away from its preferred base, it writes the load
+base into the mapped optional header's `ImageBase` field after the relocations
+have been applied, so an entry aimed at that field cannot leave any other value
+there. This is BetterXen's policy: the PE specification defines `ImageBase` as the
+preferred base, and the behaviour has not been compared with Windows.
+
+The load is refused with `PeError::InvalidHeaderSize` when `SizeOfHeaders` is
+zero, ends before the section table does, runs past the end of the file, or its
+pages would reach into a section, and when the bytes given to the loader are not
+the PE32+ headers that were parsed. The page rule is stricter than the loader
+was before: an image whose section alignment is below 4 KiB, with a section
+that starts inside the header page, used to load and is now refused. The header
+pages count toward the 256 MiB mapping budget of one image, which is checked
+before anything is mapped. `ParsedPe::parse` does not make these checks, so
+static inspection of a file is unchanged.
+
+`betterxen probe --mode static` inventories ordinary and delay-loaded PE imports
 without guest execution. Without `--report` it writes to `diagnostics/probe`,
-where `xenora imports sync` also looks. `missing_imports.csv` lists unresolved ordinary keys
+where `betterxen imports sync` also looks. `missing_imports.csv` lists unresolved ordinary keys
 with their import address table relative virtual addresses. The full inventory,
 `imports.csv`, marks each entry `ordinary` or `delayed` in its `import_table`
 column and records whether each key is registered, its implementation
@@ -90,7 +138,7 @@ ordinal, and slot in the delay import address table, after the ordinary rows.
 Binding does not resolve them: the PE format leaves that to a delay-load helper
 inside the image. The totals above and `missing_imports.csv` therefore cover
 ordinary imports only, and the JSON report counts delayed slots and DLLs in
-`delayed_imports` and `delayed_imported_dlls_count`. `xenora imports sync`
+`delayed_imports` and `delayed_imported_dlls_count`. `betterxen imports sync`
 leaves delayed rows out of its backlog for the same reason.
 
 The probe reads only descriptors that lie wholly inside the directory's
@@ -101,6 +149,18 @@ start in section data. A table that breaks one of these rules, sets a reserved
 attribute bit, is truncated, or uses the earlier virtual-address descriptor form
 is reported in `delay_import_error` and in the Markdown report, together with
 the entries read before it.
+
+`xenora_import_gen::demangle` decodes Microsoft Visual C++ decorated names
+for diagnostics, in the style of Microsoft's `undname`. It covers functions,
+data, member access and storage, `this` qualifiers, calling conventions,
+constructors, destructors, common operators, `vftable` names, classes,
+structs, unions, enums, pointers, references, primitive types, templates
+with type and integer arguments, and name and type back-references. Function
+pointer types, RTTI descriptors, nested function scopes and other constructs
+return `None`, so callers show the decorated name instead of a guess. The
+generator manifest's list of imports that need manual engineering shows the
+undecorated form beside each decorated C++ import. Tests check names mangled
+by clang for `x86_64-pc-windows-msvc` against their source declarations.
 
 The synthetic process registry supports the current-process pseudo handle and
 its process ID. The priority boost setter and getter record and query a guest
@@ -254,7 +314,7 @@ created with default security attributes. `SetEvent` signals an event,
 `ResetEvent` clears it, and `CloseHandle` invalidates the handle.
 `WaitForSingleObject` consumes an auto-reset signal once, leaves a manual-reset
 signal set, and reports `WAIT_TIMEOUT` when a zero-timeout poll finds no signal.
-A wait that would block returns `WAIT_FAILED` with `ERROR_NOT_SUPPORTED`.
+Without an attached thread scheduler, a wait that would block returns `WAIT_FAILED` with `ERROR_NOT_SUPPORTED`; with one it blocks the calling guest thread ([guest threads](runtime/threads.md)).
 Thread and event handles are distinct types in the same bounded table.
 Event duplicates share signal state and keep the event alive independently.
 A duplicate can retain or reduce its rights. Waiting requires synchronize
@@ -280,15 +340,15 @@ thread, identified by its TEB. The owner can acquire the mutex again, and
 each acquisition needs a matching `ReleaseMutex`. Another thread sees the
 mutex as unsignaled. A release by a thread that is not the owner fails with
 `ERROR_NOT_OWNER`. Waits, duplicates and wait-all treat mutexes like the
-other waitable objects. Abandonment on thread exit is not modeled, because
-guest threads do not exit yet.
+other waitable objects. A mutex whose owner thread ended
+is reported once as abandoned.
 
 See Microsoft's [event object documentation](https://learn.microsoft.com/windows/win32/sync/event-objects).
 
 ### Locks, one-time initialization and thread-local storage
 
 These services keep their state in the runtime and key ownership by guest
-TEB. There is no guest scheduler, so any call that would block stops the
+TEB. These objects do not block through the guest scheduler yet, so any call that would block stops the
 guest with the runtime-limit fault (`IllegalInstruction(0xFE)`) rather than
 reporting success. Guest code reaches that fault by entering a critical
 section owned by another thread, acquiring a held SRW lock, or beginning a
@@ -415,7 +475,7 @@ four row-major Block Compression 1 (BC1) blocks, including slots beyond the
 logical edge. The reader validates the full byte length, rejects padding
 coordinates and can decode each logical block to sixteen RGBA8 texels.
 The decoder uses bit replication to expand 5:6:5 endpoints and rounds integer
-palette interpolation down. This layout is specific to Xenora fixtures. The block encoding follows the
+palette interpolation down. This layout is specific to BetterXen fixtures. The block encoding follows the
 [Direct3D BC1 description](https://learn.microsoft.com/en-us/windows/win32/direct3d10/d3d10-graphics-programming-guide-resources-block-compression).
 
 `TiledBc1::linearize` strips the tile padding from one selected subresource
