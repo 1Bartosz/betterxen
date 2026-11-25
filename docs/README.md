@@ -38,6 +38,7 @@ Historical phase checkpoints retain their original evidence scope.
 
 - [Guest experiment guide](../experiments/x1/README.md) — Bounded x86-64 execution, executable loading, experimental services, native compute, and offscreen rendering.
 - [x86-64 instruction registry](cpu/instruction-registry.md) — Shared decoder, generated tables, semantics, native lowering and how to add a verified instruction form.
+- [Proposed AVX and AVX2 guest contract](cpu/avx-contract.md) — VEX decoding, vector state, fault behavior and an original integer fixture specification.
 - [Runtime service registry](runtime/registry.md) and [generated coverage](runtime/services.md) — Import resolution, typed Win64 adapters and how to add a tested service.
 - [Guest threads](runtime/threads.md) — Deterministic scheduler, thread services, limits and tests.
 - [Guest CPU research](research/cpu-boundary.md) — Public specifications and unresolved console requirements.
