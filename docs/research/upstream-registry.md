@@ -15,6 +15,18 @@ Reviewed 2026-11-25. Every entry is **evidence class D** (non-normative official
 | VIctory-macOS | [pragyaangaur/VIctory-macOS](https://github.com/pragyaangaur/VIctory-macOS) | `485b230ef596` | GPL-3.0 (GitHub) | Discovery reference only | A macOS port of VIctory using Rosetta, CrossOver Wine and D3DMetal per its README (also noted in [portwatch-native-macos.md](portwatch-native-macos.md)). Same input concern. Its test and "works" claims are self-reported and not verified here. The repository has no parent fork, so the "canonical upstream" is VIctory. |
 | PortWatch VI | [portwatch-vi.xyz](https://portwatch-vi.xyz/), [4lwayz/portwatch-vi](https://github.com/4lwayz/portwatch-vi) | `ed00263cc0c9` | NOASSERTION | Project discovery reference | A tracker of community efforts; progress figures are editorial, with self-reported claims labelled. Not engineering evidence; flagged and ignored queues are not endorsed. |
 
+## Additional candidates found by search (not reviewed)
+
+Found by GitHub search on 2026-11-25. Only repository metadata was read; none was evaluated, installed or run, and none is a recommendation. Licenses are what GitHub reported.
+
+| Project | Source | Pin (head) | License as reported | Why listed |
+| --- | --- | --- | --- | --- |
+| llvm-mingw | [mstorsjo/llvm-mingw](https://github.com/mstorsjo/llvm-mingw) | `903f4cf7faa2` | GitHub: other (read LICENSE before use) | Cross-compiler candidate for building original Windows test programs (#364). README says its compilers come in x86_64 and aarch64 builds, built on Ubuntu; availability and behaviour on a macOS host are **unknown**. |
+| Sikarugir | [Sikarugir-App/Sikarugir](https://github.com/Sikarugir-App/Sikarugir) | `5446b7d18072` | not reported | Wine-wrapper project (successor to Wineskin per its README, macOS 14.6+): a reference for bottle and wrapper management. |
+| macOS Wine builds | [Gcenx/macOS_Wine_builds](https://github.com/Gcenx/macOS_Wine_builds) | `72f8915f2d01` | not reported | Community Wine builds for macOS: possible Wine reference builds. Provenance of the binaries is unreviewed. |
+| Mythic | [MythicApp/Mythic](https://github.com/MythicApp/Mythic) | `754223978e61` | GPL-3.0 | Open-source macOS launcher that runs Windows games through Wine: an architecture reference for configuration and launching. |
+| Playdock | [Jasonilization/Playdock](https://github.com/Jasonilization/Playdock) | `f58b8ef7fb70` | MIT | Describes itself as a free alternative to CrossOver; unreviewed. |
+
 ## Not yet researched
 
 Apple's Game Porting Toolkit documentation and license (D3DMetal's actual terms), Rosetta 2's support lifetime, CrossOver's documented command-line interfaces and bottle management, and other established projects. These are issues #349, #350 and #354; nothing is claimed about them here.

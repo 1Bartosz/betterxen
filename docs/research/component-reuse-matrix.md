@@ -16,7 +16,7 @@ Companion to the [upstream registry](upstream-registry.md); same evidence limits
 | Shader compiler / runtime | VIctory, VIctory-macOS | **Rejected for reuse** | Built for a specific commercial game's Xbox Series build whose provenance is not established as authorized. Ideas only. |
 | Project discovery | PortWatch VI | Reference only | Editorial tracker; not engineering evidence; nothing imported. |
 | x86-64 decode and ARM64 translation, runtime, gfx1030 compiler, Metal backend | BetterXen native implementation | **Preserved, paused** | Reuse only where hybrid needs it and it shows a demonstrated advantage; not forced into the architecture. |
-| Test and diagnostics methodology | BetterXen existing audits, benchmark harness, claims registry | **Reuse** | Existing evidence classes, claims audit and benchmark gating apply to hybrid work (H1, H2). |
-| Configuration, diagnostics, benchmarking around CrossOver | BetterXen | **Build** (H2) | Only after H1 shows what CrossOver does not already provide (#351). |
+| Test and diagnostics methodology | BetterXen existing audits, benchmark harness, claims registry | **Reuse** | Existing evidence classes, claims audit and benchmark gating apply to hybrid work (Phase 1 onward). |
+| Configuration, diagnostics, benchmarking around CrossOver | BetterXen | **Build** (Phase 2, provisional) | Only after Phase 1 shows what CrossOver does not already provide (#351). |
 
 Open items: license text for every selected component must be read from the exact release used; DXMT, DXVK and Wine contributor and file-level notices are not reviewed.
