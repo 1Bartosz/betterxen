@@ -638,14 +638,13 @@ final class InspectionModel: ObservableObject {
     @Published var report = ""
     @Published var status: Int32 = Int32(XENORA_OK)
     @Published var busy = false
-    @Published var importing = false
     /// Why the last file selection could not be used, shown until the next selection.
     @Published var selectionError: String?
 
-    /// Shows the read-only file importer, from the button or File > Open Executable….
+    /// Called when a window is about to show the read-only file importer, from its
+    /// button or File > Open Executable…. Each window presents its own importer.
     func requestImport() {
         selectionError = nil
-        importing = true
     }
 
     /// Handles the importer's completion. A cancelled picker is not a failure.
@@ -707,13 +706,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+/// Opens the file importer of the focused window. Absent when no window can
+/// present it, which disables File > Open Executable….
+struct OpenExecutableKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+
+extension FocusedValues {
+    var openExecutable: OpenExecutableKey.Value? {
+        get { self[OpenExecutableKey.self] }
+        set { self[OpenExecutableKey.self] = newValue }
+    }
+}
+
+/// File > Open Executable… (Command-O), routed to the focused window's importer.
+struct OpenExecutableCommand: Commands {
+    @FocusedValue(\.openExecutable) private var openExecutable
+
+    var body: some Commands {
+        CommandGroup(after: .newItem) {
+            Button("Open Executable…") { openExecutable?() }
+                .keyboardShortcut("o")
+                .disabled(openExecutable == nil)
+        }
+    }
+}
+
 struct InspectorView: View {
     @ObservedObject var model: InspectionModel
+    let openImporter: () -> Void
 
     var body: some View {
         Section("Executable inspection (read-only)") {
             HStack {
-                Button("Open Executable…") { model.requestImport() }
+                Button("Open Executable…") { openImporter() }
                 Text("or drop a file on this window").foregroundStyle(.secondary)
             }
             if let error = model.selectionError {
@@ -741,12 +767,19 @@ struct ContentView: View {
     @ObservedObject var model: FrameModel
     @ObservedObject var loop: FrameLoopModel
     @ObservedObject var inspection = InspectionModel.shared
+    /// This window's importer. Kept per window so only the window that asked shows it.
+    @State private var importing = false
     private var frame: GuestFrame? { model.frame }
     private var running: Bool { model.running }
 
+    private func openImporter() {
+        inspection.requestImport()
+        importing = true
+    }
+
     var body: some View {
         Form {
-            InspectorView(model: inspection)
+            InspectorView(model: inspection, openImporter: openImporter)
             Section("Guest display") {
                 if let image = frame?.image {
                     Image(decorative: image, scale: 1)
@@ -847,7 +880,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
-        .fileImporter(isPresented: $inspection.importing, allowedContentTypes: [.item]) { result in
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
             inspection.importFinished(result)
         }
         .dropDestination(for: URL.self) { urls, _ in
@@ -856,6 +889,7 @@ struct ContentView: View {
             return true
         }
         .frame(minWidth: 520, minHeight: 680)
+        .focusedSceneValue(\.openExecutable, openImporter)
     }
 }
 
@@ -866,12 +900,7 @@ struct BetterXenApp: App {
 
     var body: some Scene {
         WindowGroup("BetterXen") { ContentView(model: model, loop: loop) }
-            .commands {
-                CommandGroup(after: .newItem) {
-                    Button("Open Executable…") { InspectionModel.shared.requestImport() }
-                        .keyboardShortcut("o")
-                }
-            }
+            .commands { OpenExecutableCommand() }
     }
 }
 
@@ -1052,7 +1081,7 @@ if CommandLine.arguments.contains("--smoke-import-result") {
         model.importFinished(.failure(CocoaError(.fileReadNoPermission)))
         if model.selectionError == nil || model.fileName != nil { failures.append("failure is not shown") }
         model.requestImport()
-        if model.selectionError != nil || !model.importing { failures.append("reopening keeps the old message") }
+        if model.selectionError != nil { failures.append("reopening keeps the old message") }
         model.importFinished(.failure(CocoaError(.fileReadNoPermission)))
         model.inspect(URL(fileURLWithPath: "/nonexistent/import-result-check"))
         if model.selectionError != nil || model.fileName != "import-result-check" {
