@@ -4,7 +4,7 @@
 
 ## Native-first milestones
 
-BetterXen's work order is the six [development phases](docs/development-phases.md), which lead to one concrete target: the **first launchable application** (tracker [#311](https://github.com/MacosPorters/betterxen/issues/311)). That target is an original C program, built with native ARM64 tools, that runs through the ARM64 translator, controls its own translated shader pipeline, and shows its Metal frame in the native app window. It is **not** a commercial or authentic Xbox title, and no date or percentage is attached to it.
+BetterXen's work order is the six [development phases](development-phases-native-first.md), which lead to one concrete target: the **first launchable application** (tracker [#311](https://github.com/MacosPorters/betterxen/issues/311)). That target is an original C program, built with native ARM64 tools, that runs through the ARM64 translator, controls its own translated shader pipeline, and shows its Metal frame in the native app window. It is **not** a commercial or authentic Xbox title, and no date or percentage is attached to it.
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'fontFamily':'system-ui, sans-serif','lineColor':'#6e7781'}}}%%
