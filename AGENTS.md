@@ -20,6 +20,12 @@ These rules apply to every contributor and coding agent. They were rewritten on 
 - The independent native implementation (x86-64 decoder, ARM64 translator, runtime, gfx1030 shader compiler, Metal backend) is **preserved and paused**. Do not delete it, expand its roadmap, create speculative native issues or assign contributors to it by default. Native work is allowed only when hybrid development directly requires it, or after an explicit maintainer decision to resume (`docs/research/native-roadmap.md`). Keep its tests passing.
 - This is the intended architecture, not a verified Xbox compatibility stack. Do not assume CrossOver, Rosetta 2 or D3DMetal provide Xbox runtime compatibility; verify the actual capabilities and integration boundaries of the installed versions.
 
+### Planning
+
+- Planning is progressive. Only the current phase has a milestone and open issues; the roadmap outlines later phases provisionally and `Parked ideas` holds future items. Do not create speculative issues, trackers or milestones for distant phases; promote an idea when its prerequisites are met.
+- Every new issue states a specific problem, the evidence it is needed, a deliverable, upstream references, a reuse assessment, dependencies, acceptance criteria and a validation method. Do not create administrative issues to manage planning.
+- Do not open native-only issues. If hybrid work needs a native component, file a focused hybrid issue.
+
 ### Dependencies and reuse
 
 - Wine-based compatibility infrastructure, CrossOver, Rosetta 2 where supported and technically appropriate, and D3DMetal (subject to its license terms) are permitted. DXMT, DXVK, VKD3D-Proton, MoltenVK, FEX and similar projects may be evaluated and used where appropriate. Legitimate external dependencies and open-source implementations are encouraged.
