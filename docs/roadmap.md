@@ -20,7 +20,7 @@ Priorities, in order: practical compatibility, functional integrated execution, 
 
 ## Rolling planning
 
-Only the current phase has a GitHub milestone and detailed issues. Later phases are described below and become milestones and issues only when the evidence from the current phase makes their requirements clear. Work that was specified early but depends on unverified assumptions is listed under [Parked work](#parked-work) with its closed issue, so it can be reopened rather than rewritten. Phase numbers are provisional. The earlier eight-phase plan (H0 to H7) is archived in [archive/hybrid-phases-h0-h7.md](archive/hybrid-phases-h0-h7.md).
+Only the current phase has a GitHub milestone and detailed issues. Later phases are described below and become milestones and issues only when the evidence from the current phase makes their requirements clear. Work that was specified early but depends on unverified assumptions is listed under [Parked ideas](#parked-ideas) with its closed issue, so it can be reopened rather than rewritten. Phase numbers are provisional. The earlier eight-phase plan (H0 to H7) is archived in [archive/hybrid-phases-h0-h7.md](archive/hybrid-phases-h0-h7.md).
 
 ## Engineering rules
 
@@ -75,7 +75,7 @@ Details and sources are in [primary-source-verification-2026-11-25.md](research/
 
 Independent native reassessment is separate and deferred: it needs an explicit maintainer decision.
 
-## Parked work
+## Parked ideas
 
 Specified in detail on 2026-11-25, then closed as premature for Phase 1 with the text preserved. Reopen when the stated prerequisite is met. Parking is not rejection.
 
@@ -90,8 +90,6 @@ Specified in detail on 2026-11-25, then closed as premature for Phase 1 with the
 | [#373](https://github.com/MacosPorters/betterxen/issues/373), [#204](https://github.com/MacosPorters/betterxen/issues/204) | Soak and thermal drift; memory-pressure benchmark | Workloads and baseline exist (Phase 5) |
 | [#374](https://github.com/MacosPorters/betterxen/issues/374) | Re-baseline on a Rosetta-free CrossOver build | Such a build ships (Phase 5); facts folded into #348 |
 | #173, #174, #219 | Contributor-workflow administration | A concrete need appears |
-
-Process notes: sub-issue and blocked-by links between parked issues remain on the closed issues.
 
 ## Native work
 

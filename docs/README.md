@@ -71,6 +71,8 @@ checkpoints retain their original evidence scope.
 - [Texture format inventory](research/texture-formats.md) — Formats and layouts by stage (decode, layout, native upload, sampling, guest), their public specifications, unknowns and ranked follow-ups.
 - [PortWatch native macOS research](research/portwatch-native-macos.md) — Screening of public Xbox-on-Windows port projects for native macOS planning; discovery only.
 - [Synthetic integration and upstream evidence](research/synthetic-integration.md) — Audited source snapshots and remaining commercial startup prerequisites.
+- [Hybrid backlog research record](research/hybrid-backlog-research-2026-11-25.md) — Findings, registry candidates and the issues they produced (2026-11-25); not verified on hardware.
+- [Primary-source verification](research/primary-source-verification-2026-11-25.md) — Which hybrid-research claims were confirmed, contradicted or left unverified against vendor documentation.
 
 ## Security, licensing, and contributions
 
