@@ -200,24 +200,16 @@ impl Case {
             compare("DBT (1 step)", result, &translated_memory, 1, offset);
         }
 
-        // Exercise native block lowering, then reuse the same address space
-        // with its data restored. A new address space is intentionally a cold
-        // cache input, even when it has identical code at identical addresses.
+        // Exercise native block lowering and then reuse those blocks with a
+        // fresh copy of the guest input and memory at the same addresses.
         let mut dbt = DbtEngine::new(128 * 1024).unwrap();
         let mut memory = self.memory();
         let result = Interpreter::new(self.initial.cpu.clone(), &mut memory, BUDGET).run();
         compare("interpreter", result, &memory, BUDGET, 0);
-        let mut translated_memory = self.memory();
         let mut run_full = |engine| {
-            translated_memory
-                .write_bytes(DATA, &self.initial.data)
-                .unwrap();
-            let result = dbt.run(
-                &mut self.initial.cpu.clone(),
-                &mut translated_memory,
-                BUDGET,
-            );
-            compare(engine, result, &translated_memory, BUDGET, 0);
+            let mut memory = self.memory();
+            let result = dbt.run(&mut self.initial.cpu.clone(), &mut memory, BUDGET);
+            compare(engine, result, &memory, BUDGET, 0);
             dbt.metrics
         };
         let cold = run_full("DBT (cold)");

@@ -29,8 +29,8 @@ pub struct DbtMetrics {
     pub blocks_compiled: usize,
     pub cache_hits: usize,
     pub cache_misses: usize,
-    /// Cached blocks discarded after their address space or executable-memory
-    /// generation changed. Each also counts as a cache miss.
+    /// Cached blocks discarded because their guest bytes or executable mappings
+    /// changed. Each also counts as a cache miss.
     pub blocks_invalidated: usize,
     pub native_bytes_emitted: usize,
     pub dbt_dispatches: usize,
@@ -44,17 +44,30 @@ pub struct DbtMetrics {
 ///
 /// Guest stores into executable memory (Intel SDM Vol. 3A 11.6), executable
 /// mapping changes and another address space invalidate the retained token.
-/// Checking it is constant-time and does not reread every instruction byte.
+/// An unchanged token takes a constant-time check. After a generation or address
+/// space change, bytes and execute permissions are revalidated once before an
+/// identical translation may be reused in that generation.
 /// Validation occurs at dispatch boundaries: a store into the currently running
 /// block's later instructions still needs a separate dispatch-boundary design.
 struct CachedBlock {
     code: *const u8,
     generation: Arc<()>,
+    start: u64,
+    source: Box<[u8]>,
 }
 
 impl CachedBlock {
-    fn is_current(&self, memory: &GuestMemory) -> bool {
-        memory.code_is_current(&self.generation)
+    fn is_current(&mut self, memory: &GuestMemory) -> bool {
+        if memory.code_is_current(&self.generation) {
+            return true;
+        }
+        if !self.source.iter().enumerate().all(|(offset, &byte)| {
+            matches!(memory.fetch_instruction_byte(self.start.wrapping_add(offset as u64)), Ok(current) if current == byte)
+        }) {
+            return false;
+        }
+        self.generation = memory.code_generation();
+        true
     }
 }
 
@@ -264,7 +277,7 @@ impl DbtEngine {
         block_limit: usize,
     ) -> Result<*const u8, ExitReason> {
         if block_limit == MAX_BLOCK_INSTRUCTIONS {
-            if let Some(cached) = self.block_cache.get(&rip) {
+            if let Some(cached) = self.block_cache.get_mut(&rip) {
                 if cached.is_current(memory) {
                     self.metrics.cache_hits += 1;
                     return Ok(cached.code);
@@ -280,7 +293,7 @@ impl DbtEngine {
 
         // Keep budget-limited blocks separate so they cannot shorten a later run.
         let key = (rip, block_limit);
-        if let Some(cached) = self.limited_block_cache.get(&key) {
+        if let Some(cached) = self.limited_block_cache.get_mut(&key) {
             if cached.is_current(memory) {
                 self.metrics.cache_hits += 1;
                 return Ok(cached.code);
@@ -378,10 +391,16 @@ impl DbtEngine {
             .map_err(|_| ExitReason::JitCacheExhausted)?;
         self.metrics.blocks_compiled += 1;
         self.metrics.native_bytes_emitted += asm.instructions().len() * 4;
+        let source = (0..rip.wrapping_sub(start_rip))
+            .map(|offset| memory.fetch_instruction_byte(start_rip.wrapping_add(offset)))
+            .collect::<Result<Box<[u8]>, _>>()
+            .map_err(ExitReason::MemoryFault)?;
         self.decoded_blocks.push(insns);
         Ok(CachedBlock {
             code: emitted,
             generation: memory.code_generation(),
+            start: start_rip,
+            source,
         })
     }
 }
@@ -1655,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn cloned_address_spaces_have_independent_code_generations() {
+    fn cloned_address_spaces_diverge_when_executable_code_changes() {
         let (mut engine, mut memory) = writable_fixture(&mov_eax(1));
         assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 1);
         let mut cloned = memory.clone();
@@ -1663,8 +1682,10 @@ mod tests {
         memory.write_u8(ENTRY + 1, 7).unwrap();
         assert_eq!(rax_after_run(&mut engine, &mut cloned, 16), 1);
         assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 7);
-        assert_eq!(engine.metrics.blocks_compiled, 3);
-        assert_eq!(engine.metrics.cache_hits, 1);
+        // A deep clone shares the proven identical executable snapshot. The
+        // write in the original space must still force retranslation there.
+        assert_eq!(engine.metrics.blocks_compiled, 2);
+        assert_eq!(engine.metrics.cache_hits, 2);
     }
 
     #[test]

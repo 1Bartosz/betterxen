@@ -121,9 +121,10 @@ impl MappedRegion {
 /// Guest virtual memory address space.
 #[derive(Default)]
 pub struct GuestMemory {
-    // A retained token identifies both this address space and its executable
-    // generation. Cached translations retain their token, so allocator address
-    // reuse cannot make an obsolete generation compare equal to a new one.
+    // A retained token identifies a validated executable snapshot. Independent
+    // address spaces get distinct tokens. A deep clone may share its identical
+    // snapshot; an executable mutation detaches only the changed address space.
+    // Cached translations retain tokens, preventing allocator-address reuse.
     executable_generation: Arc<()>,
     regions: Vec<MappedRegion>,
     private_heaps: std::collections::BTreeSet<u64>,
@@ -137,7 +138,7 @@ pub struct GuestMemory {
 impl Clone for GuestMemory {
     fn clone(&self) -> Self {
         Self {
-            executable_generation: Arc::new(()),
+            executable_generation: Arc::clone(&self.executable_generation),
             regions: self.regions.clone(),
             private_heaps: self.private_heaps.clone(),
             private_heap_serial: self.private_heap_serial,
