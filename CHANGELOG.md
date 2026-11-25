@@ -49,6 +49,7 @@ remains unsupported.
 - Added a Python 3 fallback for `timeout` in `scripts/test-gpu.sh`, so the native Metal suite runs on stock macOS without GNU coreutils while preserving bounded execution and the usual timeout exit status.
 
 ### Added
+- Added a `Native app build and smoke` CI job (#248). On the same native `macos-26` runner image and pinned Rust toolchain as the Rust checks, it runs `scripts/build-app.sh`, which builds the locked C ABI library and the Swift app together, bundles and ad-hoc signs `BetterXen.app`, and runs its `--smoke` check, so a Swift compile, link or smoke failure is designed to fail CI (implemented and verified locally; not yet shown on a CI run). `scripts/build-app.sh` also prints `file` and a single `otool -L` listing for the executable, fails if that listing fails or is empty, and fails if the executable links any library outside `/System/Library/` and `/usr/lib/`, naming bundle-relative (`@rpath`, `@executable_path`, `@loader_path`) entries separately (checked locally against stubbed failing, empty, bundle-relative and non-system listings). The job is an app build and smoke result; it runs no Metal fixture and is not GPU verification.
 - Recorded the migrated PR integration decisions, native verification and scope exclusions in the testing documentation.
 - Added `xenora-bench startup` (#178), which measures Metal startup in fresh processes and in repeated
   submissions within one process, phase by phase (launch, device and queue, translation, library, pipeline,
