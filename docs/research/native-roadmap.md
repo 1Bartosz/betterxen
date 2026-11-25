@@ -4,7 +4,7 @@
 
 ## Existing implementation (preserved in the workspace)
 
-Rust crates under `crates/` and `app/`, tests under `tests/`, fixtures, fuzz targets and benchmarks. Last pre-transition `main` commit is tagged `native-first-final` (local tag; pushing requires authorization). Contributor history is untouched.
+Rust crates under `crates/` and `app/`, tests under `tests/`, fixtures, fuzz targets and benchmarks. The last `main` commit before the hybrid transition is tagged `native-first-final`. Contributor history is untouched.
 
 ## Verified achievements (synthetic evidence only)
 

@@ -9,7 +9,7 @@ BetterXen was developed native-first: an independent x86-64 decoder, interpreter
 ## Accepted strategic direction
 
 - CrossOver is the primary compatibility foundation, installed externally.
-- Hybrid is the only active development direction. Native research is preserved (local tag `native-first-final`, code in the workspace) and paused; resuming needs an explicit maintainer decision.
+- Hybrid is the only active development direction. Native research is preserved (tag `native-first-final` marks the last `main` commit before this change; the code stays in the workspace) and paused; resuming needs an explicit maintainer decision.
 - Reuse established infrastructure; build independent replacements only for demonstrated limitations.
 - The engineering rules in `AGENTS.md` (and `CLAUDE.md`, a symlink) were rewritten accordingly, replacing the former prohibition on Wine, CrossOver, Rosetta and MoltenVK.
 
