@@ -640,11 +640,31 @@ final class InspectionModel: ObservableObject {
     @Published var busy = false
     @Published var importing = false
 
+    /// Reads and reports one file off the main thread. Replaceable only for the
+    /// `--smoke-inspection-order` check.
+    private let reader: @Sendable (URL) -> (Int32, String)
+    /// Number of the latest `inspect` call. Only that call may publish a result.
+    private var latestRequest: UInt64 = 0
+
+    init(reader: @escaping @Sendable (URL) -> (Int32, String) = InspectionModel.run) {
+        self.reader = reader
+    }
+
+    var failed: Bool { !busy && fileName != nil && status != Int32(XENORA_OK) }
+
     func inspect(_ url: URL) {
+        latestRequest &+= 1
+        let request = latestRequest
         fileName = url.lastPathComponent
+        report = ""
+        status = Int32(XENORA_OK)
         busy = true
+        let reader = reader
         Task {
-            let (newStatus, newReport) = await Task.detached { InspectionModel.run(url) }.value
+            let (newStatus, newReport) = await Task.detached { reader(url) }.value
+            // A newer selection owns the published state, including `busy`;
+            // an older read that finishes late is discarded.
+            guard request == latestRequest else { return }
             status = newStatus
             report = newReport
             busy = false
@@ -696,6 +716,10 @@ struct InspectorView: View {
             }
             if let name = model.fileName {
                 LabeledContent("File", value: model.busy ? "\(name) (inspecting…)" : name)
+                if model.failed {
+                    Text("Inspection of \(name) failed (status \(model.status)).")
+                        .foregroundStyle(.red)
+                }
                 ScrollView {
                     Text(model.report)
                         .font(.system(.caption, design: .monospaced))
@@ -1007,6 +1031,53 @@ if CommandLine.arguments.contains("--smoke-frame") {
     let frame = GuestFrame.run()
     print(frame.summary)
     exit(frame.status == XENORA_OK ? 0 : 1)
+}
+
+// `--smoke-inspection-order` checks that only the latest selection publishes an
+// inspection result. Files are never read: an injected reader answers after a delay
+// named by the file. It needs no GPU.
+if CommandLine.arguments.contains("--smoke-inspection-order") {
+    let reader: @Sendable (URL) -> (Int32, String) = { url in
+        // "<delay in ms>-<ok|fail>-<tag>"
+        let parts = url.lastPathComponent.split(separator: "-")
+        Thread.sleep(forTimeInterval: Double(parts[0])! / 1000)
+        let status = parts[1] == "ok" ? Int32(XENORA_OK) : Int32(XENORA_INVALID_ARGUMENT)
+        return (status, "report \(url.lastPathComponent)")
+    }
+    func file(_ name: String) -> URL { URL(fileURLWithPath: "/nonexistent/\(name)") }
+    func pause(_ ms: UInt64) async { try? await Task.sleep(nanoseconds: ms * 1_000_000) }
+
+    Task { @MainActor in
+        var failures: [String] = []
+        @MainActor func expect(_ model: InspectionModel, _ name: String, busy: Bool, report: String, ok: Bool, _ label: String) {
+            let actual = "file=\(model.fileName ?? "-") busy=\(model.busy) status=\(model.status) report=\(model.report)"
+            if model.fileName != name || model.busy != busy || model.report != report
+                || (model.status == Int32(XENORA_OK)) != ok {
+                failures.append("\(label): \(actual)")
+            }
+        }
+        // A slow first read finishing after a fast second one, with either outcome.
+        for (first, second, ok) in [("400-ok-a", "0-ok-b", true), ("400-fail-a", "0-ok-b", true),
+                                    ("400-ok-a", "0-fail-b", false)] {
+            let model = InspectionModel(reader: reader)
+            model.inspect(file(first))
+            model.inspect(file(second))
+            await pause(700)
+            expect(model, second, busy: false, report: "report \(second)", ok: ok, "\(first) then \(second)")
+        }
+        // An older read that finishes first must not clear the newer request's busy state.
+        let model = InspectionModel(reader: reader)
+        model.inspect(file("100-ok-a"))
+        model.inspect(file("500-fail-b"))
+        await pause(300)
+        expect(model, "500-fail-b", busy: true, report: "", ok: true, "while the newer read runs")
+        await pause(500)
+        expect(model, "500-fail-b", busy: false, report: "report 500-fail-b", ok: false, "after the newer read")
+        for failure in failures { print("smoke-inspection-order: FAILED \(failure)") }
+        print("smoke-inspection-order: \(failures.isEmpty ? "ok" : "\(failures.count) failed")")
+        exit(failures.isEmpty ? 0 : 1)
+    }
+    dispatchMain()
 }
 
 // `--smoke` prints the probe and exits without opening a window, for scripts and CI.
