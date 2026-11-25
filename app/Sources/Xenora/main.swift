@@ -645,6 +645,9 @@ final class InspectionModel: ObservableObject {
     private let reader: @Sendable (URL) -> (Int32, String)
     /// Number of the latest `inspect` call. Only that call may publish a result.
     private var latestRequest: UInt64 = 0
+    /// Reads that have finished, whether their result was published or discarded.
+    /// `--smoke-inspection-order` waits on it instead of on a fixed delay.
+    private(set) var finishedReads: UInt64 = 0
 
     init(reader: @escaping @Sendable (URL) -> (Int32, String) = InspectionModel.run) {
         self.reader = reader
@@ -662,6 +665,7 @@ final class InspectionModel: ObservableObject {
         let reader = reader
         Task {
             let (newStatus, newReport) = await Task.detached { reader(url) }.value
+            finishedReads &+= 1
             // A newer selection owns the published state, including `busy`;
             // an older read that finishes late is discarded.
             guard request == latestRequest else { return }
@@ -1034,21 +1038,49 @@ if CommandLine.arguments.contains("--smoke-frame") {
 }
 
 // `--smoke-inspection-order` checks that only the latest selection publishes an
-// inspection result. Files are never read: an injected reader answers after a delay
-// named by the file. It needs no GPU.
+// inspection result. Files are never read: an injected reader blocks until the check
+// releases that file, so the check, not timing, decides which read finishes first.
+// It needs no GPU.
 if CommandLine.arguments.contains("--smoke-inspection-order") {
+    final class ReadGates: @unchecked Sendable {
+        private let lock = NSLock()
+        private var gates: [String: DispatchSemaphore] = [:]
+        func gate(_ name: String) -> DispatchSemaphore {
+            lock.lock()
+            defer { lock.unlock() }
+            if let gate = gates[name] { return gate }
+            let gate = DispatchSemaphore(value: 0)
+            gates[name] = gate
+            return gate
+        }
+        func release(_ name: String) { gate(name).signal() }
+    }
+    let gates = ReadGates()
+    // "<scenario>-<a|b>-<ok|fail>"; a gate that is never released times out
+    // instead of hanging, and the check then fails on its own deadline.
     let reader: @Sendable (URL) -> (Int32, String) = { url in
-        // "<delay in ms>-<ok|fail>-<tag>"
-        let parts = url.lastPathComponent.split(separator: "-")
-        Thread.sleep(forTimeInterval: Double(parts[0])! / 1000)
-        let status = parts[1] == "ok" ? Int32(XENORA_OK) : Int32(XENORA_INVALID_ARGUMENT)
-        return (status, "report \(url.lastPathComponent)")
+        let name = url.lastPathComponent
+        _ = gates.gate(name).wait(timeout: .now() + 10)
+        let status = name.hasSuffix("-ok") ? Int32(XENORA_OK) : Int32(XENORA_INVALID_ARGUMENT)
+        return (status, "report \(name)")
     }
     func file(_ name: String) -> URL { URL(fileURLWithPath: "/nonexistent/\(name)") }
-    func pause(_ ms: UInt64) async { try? await Task.sleep(nanoseconds: ms * 1_000_000) }
 
     Task { @MainActor in
         var failures: [String] = []
+        // Waits for the model to finish `count` reads. The deadline only bounds the
+        // check; the order of completions is set by releasing gates.
+        @MainActor func settle(_ model: InspectionModel, _ count: UInt64, _ label: String) async -> Bool {
+            let deadline = Date().addingTimeInterval(5)
+            while model.finishedReads < count {
+                if Date() > deadline {
+                    failures.append("\(label): read \(count) did not finish")
+                    return false
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000)
+            }
+            return true
+        }
         @MainActor func expect(_ model: InspectionModel, _ name: String, busy: Bool, report: String, ok: Bool, _ label: String) {
             let actual = "file=\(model.fileName ?? "-") busy=\(model.busy) status=\(model.status) report=\(model.report)"
             if model.fileName != name || model.busy != busy || model.report != report
@@ -1056,23 +1088,35 @@ if CommandLine.arguments.contains("--smoke-inspection-order") {
                 failures.append("\(label): \(actual)")
             }
         }
-        // A slow first read finishing after a fast second one, with either outcome.
-        for (first, second, ok) in [("400-ok-a", "0-ok-b", true), ("400-fail-a", "0-ok-b", true),
-                                    ("400-ok-a", "0-fail-b", false)] {
+        // The newer read finishes first; the older one finishes afterwards and must
+        // change nothing, whatever its outcome.
+        for (scenario, first, second, ok) in [("s1", "a-ok", "b-ok", true), ("s2", "a-fail", "b-ok", true),
+                                              ("s3", "a-ok", "b-fail", false)] {
+            let (older, newer) = ("\(scenario)-\(first)", "\(scenario)-\(second)")
             let model = InspectionModel(reader: reader)
-            model.inspect(file(first))
-            model.inspect(file(second))
-            await pause(700)
-            expect(model, second, busy: false, report: "report \(second)", ok: ok, "\(first) then \(second)")
+            model.inspect(file(older))
+            model.inspect(file(newer))
+            gates.release(newer)
+            if await settle(model, 1, "\(older) then \(newer)") {
+                expect(model, newer, busy: false, report: "report \(newer)", ok: ok, "\(newer) finished")
+            }
+            gates.release(older)
+            if await settle(model, 2, "\(older) then \(newer)") {
+                expect(model, newer, busy: false, report: "report \(newer)", ok: ok, "stale \(older) finished")
+            }
         }
-        // An older read that finishes first must not clear the newer request's busy state.
+        // The older read finishes first and must not clear the newer request's busy state.
         let model = InspectionModel(reader: reader)
-        model.inspect(file("100-ok-a"))
-        model.inspect(file("500-fail-b"))
-        await pause(300)
-        expect(model, "500-fail-b", busy: true, report: "", ok: true, "while the newer read runs")
-        await pause(500)
-        expect(model, "500-fail-b", busy: false, report: "report 500-fail-b", ok: false, "after the newer read")
+        model.inspect(file("s4-a-ok"))
+        model.inspect(file("s4-b-fail"))
+        gates.release("s4-a-ok")
+        if await settle(model, 1, "s4") {
+            expect(model, "s4-b-fail", busy: true, report: "", ok: true, "stale s4-a-ok finished first")
+        }
+        gates.release("s4-b-fail")
+        if await settle(model, 2, "s4") {
+            expect(model, "s4-b-fail", busy: false, report: "report s4-b-fail", ok: false, "s4-b-fail finished")
+        }
         for failure in failures { print("smoke-inspection-order: FAILED \(failure)") }
         print("smoke-inspection-order: \(failures.isEmpty ? "ok" : "\(failures.count) failed")")
         exit(failures.isEmpty ? 0 : 1)
