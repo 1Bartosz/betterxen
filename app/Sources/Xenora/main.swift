@@ -664,7 +664,14 @@ final class InspectionModel: ObservableObject {
         busy = true
         let reader = reader
         Task {
-            let (newStatus, newReport) = await Task.detached { reader(url) }.value
+            // The read blocks on file I/O (and, in `--smoke-inspection-order`, on
+            // its gate), so it runs on a Dispatch queue instead of occupying a
+            // Swift concurrency worker that other tasks may need.
+            let (newStatus, newReport) = await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(returning: reader(url))
+                }
+            }
             finishedReads &+= 1
             // A newer selection owns the published state, including `busy`;
             // an older read that finishes late is discarded.
