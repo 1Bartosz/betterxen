@@ -367,6 +367,6 @@ BetterXen is licensed under the [GNU General Public License v3 or later](LICENSE
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party attribution and [docs/legal.md](docs/legal.md) for the project's research and legal boundaries.
 
-BetterXen is an independent open-source project and is not affiliated with Microsoft, Xbox, Rockstar Games or Apple.
+BetterXen is an independent open-source project and is not affiliated with Microsoft, Xbox, any game publisher or Apple.
 
 ---

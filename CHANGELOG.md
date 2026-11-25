@@ -9,7 +9,14 @@ exact revision and known limitations.
 Guest execution uses original, purpose-built test programs. Commercial Xbox game execution
 remains unsupported.
 
+### Added
+- Added a fast "Repository hygiene" check (`.github/workflows/hygiene.yml`, `scripts/audit/docs_hygiene.py`). It runs on Ubuntu without a Rust toolchain or network access and fails only on merge-conflict markers, broken relative Markdown links and invalid workflow YAML in tracked files. A separate advisory step warns, without failing, when source or script changes have no changelog entry. A local run over the 626 tracked files found no problems, and planted failures of each kind were caught; it has not yet run on GitHub.
+
+### Removed
+- Removed the "PR template" check (`.github/workflows/pr-template.yml`, `scripts/pr_template_check.py` and its tests) and its CI test step. Also removed `.github/PULL_REQUEST_TEMPLATE.md`. Pull request descriptions are no longer validated or pre-filled; CONTRIBUTING.md still asks for the same information and the claim-first rule still applies.
+
 ### Changed
+- Replaced our own references to a specific commercial game title (README non-affiliation line, research and integration notes, ignored diagnostics folder names) with generic "commercial title" wording. The ignored folder names are now `diagnostics/title-candidate-*` and `diagnostics/title-check`. Third-party repository names, URLs and code-span paths in research notes are unchanged so their provenance stays accurate. Our own prose references to the upstream project formerly named in the research notes now read "PE-Vulkan project". Added the PortWatch native-macOS research notes. No behavior change.
 - TLS setup now copies templates from 64 KiB up to 1 MiB straight into the zeroed thread data block, after checking that every template byte is readable, instead of staging them in a second buffer (#111). The pointer array and data block layout, the TLS index write and the error for an unreadable template are unchanged, and nothing is mapped when the template cannot be read. On an Apple M2 Pro, median setup time for original synthetic templates over 31 interleaved samples fell by 21.7 % at 64 KiB, 19.0 % at 256 KiB and 14.2 % at 768 KiB. Smaller and larger templates keep the single staged read and showed no change beyond run-to-run variation.
 - Removed the contributor avatar section from the README.
 - Added `.github/CODEOWNERS` so pull requests request review from the `MacosPorters/maintainers` team. With the `main` branch rule that requires code-owner review, a maintainer must approve each change before it merges.
