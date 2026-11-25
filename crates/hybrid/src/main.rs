@@ -1,4 +1,4 @@
-use betterxen_hybrid::{crossover, frames, host, json::Json, toolchain};
+use betterxen_hybrid::{crossover, frames, host, json::Json, memory, toolchain};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -7,6 +7,8 @@ const USAGE: &str = "usage: betterxen-hybrid <command>
   crossover [--app P]   CrossOver installs and documented preferences (JSON)
   toolchain             Windows cross-compilers found on PATH (JSON)
   frames <file>         frame-time statistics; file has one interval in ms per line (JSON)
+  guard [--min-start-free N] [--min-free N] -- CMD ARGS...
+                        run CMD; refuse to start / stop it when free memory is low
   receipt               host + crossover + toolchain in one JSON document";
 
 fn crossover_json(app: Option<PathBuf>) -> Json {
@@ -58,7 +60,44 @@ fn toolchain_json() -> Json {
     )
 }
 
+fn guard(args: &[String]) -> ExitCode {
+    let mut limits = memory::Limits {
+        min_start_free: 70,
+        min_free: 20,
+        poll: std::time::Duration::from_secs(1),
+        grace: std::time::Duration::from_secs(10),
+    };
+    let mut i = 0;
+    while i < args.len() && args[i] != "--" {
+        let v = args.get(i + 1).and_then(|v| v.parse::<u8>().ok());
+        match (args[i].as_str(), v) {
+            ("--min-start-free", Some(v)) => limits.min_start_free = v,
+            ("--min-free", Some(v)) => limits.min_free = v,
+            _ => {
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 2;
+    }
+    let Some(cmd) = args.get(i + 1) else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    match memory::supervise(cmd, &args[i + 2..], limits, &mut memory::free_percentage) {
+        memory::Outcome::Exited(Some(0)) => ExitCode::SUCCESS,
+        memory::Outcome::Exited(c) => ExitCode::from(c.map_or(1, |c| c.clamp(1, 255)) as u8),
+        other => {
+            eprintln!("guard: {other:?}");
+            ExitCode::from(3)
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("guard") {
+        return guard(&std::env::args().skip(2).collect::<Vec<_>>());
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result: Result<Json, String> = match args.first().map(String::as_str) {
         Some("host") => Ok(host::collect().to_json()),

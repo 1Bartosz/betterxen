@@ -6,6 +6,7 @@ pub mod crossover;
 pub mod frames;
 pub mod host;
 pub mod json;
+pub mod memory;
 pub mod toolchain;
 
 /// Value of a top-level string key in flat JSON produced by `plutil -convert json`.
