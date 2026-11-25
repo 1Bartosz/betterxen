@@ -18,5 +18,9 @@ Companion to the [upstream registry](upstream-registry.md); same evidence limits
 | x86-64 decode and ARM64 translation, runtime, gfx1030 compiler, Metal backend | BetterXen native implementation | **Preserved, paused** | Reuse only where hybrid needs it and it shows a demonstrated advantage; not forced into the architecture. |
 | Test and diagnostics methodology | BetterXen existing audits, benchmark harness, claims registry | **Reuse** | Existing evidence classes, claims audit and benchmark gating apply to hybrid work (Phase 1 onward). |
 | Configuration, diagnostics, benchmarking around CrossOver | BetterXen | **Build** (Phase 2, provisional) | Only after Phase 1 shows what CrossOver does not already provide (#351). |
+| Host receipt, frame statistics, cross-toolchain probe | `crates/hybrid` | **Build** (original Rust, public system interfaces) | ossover and Whisky are Swift references; no code adapted. See [audit](upstream-integration-audit.md). |
+| Metal HUD log parsing | ossover `MetalHUDLog` | **Reference only** | Log format is documented only by third-party observation; implement after a real trace is captured (#145). |
+| Bottle and bundle internals (`cxbottle.conf`, SharedSupport layout) | ossover and others | **Do not depend** | Undocumented, derived from reverse engineering; #350 decides. |
+| Game-specific XCL layers | MacBox, ScarlettMac | **Rejected** | GPL-2.0-only and game-specific. |
 
 Open items: license text for every selected component must be read from the exact release used; DXMT, DXVK and Wine contributor and file-level notices are not reviewed.

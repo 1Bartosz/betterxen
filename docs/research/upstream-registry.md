@@ -27,6 +27,20 @@ Found by GitHub search on 2026-11-25. Only repository metadata was read; none wa
 | Mythic | [MythicApp/Mythic](https://github.com/MythicApp/Mythic) | `754223978e61` | GPL-3.0 | Open-source macOS launcher that runs Windows games through Wine: an architecture reference for configuration and launching. |
 | Playdock | [Jasonilization/Playdock](https://github.com/Jasonilization/Playdock) | `f58b8ef7fb70` | MIT | Describes itself as a free alternative to CrossOver; unreviewed. |
 
+## Reviewed in the integration audit (2026-11-25)
+
+Source read through the GitHub API; nothing executed. Detail and decisions are in [upstream-integration-audit.md](upstream-integration-audit.md).
+
+| Project | Source | Pin (head) | License as reported | Role for BetterXen | Findings |
+| --- | --- | --- | --- | --- | --- |
+| victory-mac | [skakwy/victory-mac](https://github.com/skakwy/victory-mac) | not pinned | GPL-3.0 (GitHub) | Discovery reference only | Contributor's fork of VIctory with a Mac build; same input concern. Reported frame results are unverified. |
+| MacBox | [aykhanium/MacBox](https://github.com/aykhanium/MacBox) | not pinned | GPL-2.0 (GitHub) | Rejected for reuse | Game-specific XCL layer; GPL-2.0-only is not combinable with GPL-3.0-or-later. Its README states gameplay is unverified. |
+| ScarlettMac | [paveledits/ScarlettMac](https://github.com/paveledits/ScarlettMac) | not pinned | GPL-2.0 (GitHub), extra licence files | Rejected for reuse | Game-specific patches and scripts. |
+| ossover | [hemkum/ossover](https://github.com/hemkum/ossover) | `5c11bd7be8da` | GPL-3.0-or-later (README, attribution file) | Technical reference | Swift CLI with system-info, Metal HUD log parsing and benchmark harness. Uses reverse-engineered CrossOver internals, which BetterXen does not treat as an interface. |
+| Whisky | [Whisky-App/Whisky](https://github.com/Whisky-App/Whisky) | `fd5480a76b3e` | GPL-3.0-or-later (file header read) | Technical reference | Archived 2025-05-11. |
+| rum | [lunguini/rum](https://github.com/lunguini/rum) | `657461b194e1` | GPL-3.0 (GitHub) | Technical reference | Active Whisky fork. |
+| Game Porting Toolkit licence | copy of `D3DMetal/4.0/License.pdf` in Sikarugir | read | Apple proprietary | User-supplied only | Non-commercial distribution, evaluation purpose, no reverse engineering. See audit file. |
+
 ## Not yet researched
 
 Apple's Game Porting Toolkit documentation and license (D3DMetal's actual terms), Rosetta 2's support lifetime, CrossOver's documented command-line interfaces and bottle management, and other established projects. These are issues #349, #350 and #354; nothing is claimed about them here.

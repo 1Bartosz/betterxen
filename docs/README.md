@@ -68,6 +68,7 @@ checkpoints retain their original evidence scope.
 
 - [Public sources](research/sources.md), [RDNA 2 notes](research/rdna2.md), and [Xbox GPU evidence](research/xbox-gpu.md) — Specifications, evidence scope, and unknown console behavior.
 - [Shader inputs](research/shader-containers.md) and [risk register](risk-register.md) — Input provenance and unresolved engineering risks.
+- [Upstream integration audit](research/upstream-integration-audit.md) — Source-level review of external macOS compatibility projects, licence and provenance decisions, and what was implemented in `crates/hybrid`.
 - [Texture format inventory](research/texture-formats.md) — Formats and layouts by stage (decode, layout, native upload, sampling, guest), their public specifications, unknowns and ranked follow-ups.
 - [PortWatch native macOS research](research/portwatch-native-macos.md) — Screening of public Xbox-on-Windows port projects for native macOS planning; discovery only.
 - [Synthetic integration and upstream evidence](research/synthetic-integration.md) — Audited source snapshots and remaining commercial startup prerequisites.
