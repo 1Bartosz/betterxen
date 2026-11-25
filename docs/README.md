@@ -8,9 +8,14 @@ then read the [interface contracts](interfaces.md). Reproduce an
 [independent validation suite](../tests/validation/README.md) before changing
 either path. The [changelog](../CHANGELOG.md) records notable changes.
 
-Use the [BetterXen development phases](development-phases.md) for current work
-order, existing issue/PR dependencies and measurable completion criteria.
-Historical phase checkpoints retain their original evidence scope.
+Use the [roadmap](roadmap.md) for the active CrossOver-based hybrid plan, phases,
+critical path and completion criteria; see [ADR 0005](adr/0005-crossover-hybrid-direction.md)
+for the decision and [project board setup](planning/project-board.md). Native work is
+paused: [deferred native roadmap](research/native-roadmap.md) and the archived
+[native-first plan](archive/development-phases-native-first.md) with
+[retired milestones](archive/native-first-milestones.json). Research inputs: the [upstream research registry](research/upstream-registry.md) and
+[component reuse matrix](research/component-reuse-matrix.md). Historical phase
+checkpoints retain their original evidence scope.
 
 ## Architecture and technical design
 
