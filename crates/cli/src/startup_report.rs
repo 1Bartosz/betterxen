@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub(super) const WATCHDOG_EXIT: u8 = 124;
+pub(super) const JOURNAL_ERROR_EXIT: u8 = 125;
 const VERSION: &str = "1";
 const RECORD_SEPARATOR: char = '\t';
 const MAX_BYTES: usize = 8192;
@@ -60,15 +62,10 @@ impl Journal {
 
     pub(super) fn finish(
         &self,
-        path: &Path,
+        mut destination: File,
         termination: &io::Result<Termination>,
     ) -> io::Result<()> {
-        let report = self.read().json(termination);
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?
-            .write_all(report.as_bytes())
+        destination.write_all(self.read().json(termination).as_bytes())
     }
 }
 
@@ -79,7 +76,7 @@ impl Drop for Journal {
     }
 }
 
-pub(super) struct Events(File);
+pub(super) struct Events(File, Option<io::Error>);
 
 impl Events {
     pub(super) fn open(path: &Path) -> io::Result<Self> {
@@ -87,11 +84,11 @@ impl Events {
             .write(true)
             .create_new(true)
             .open(path)
-            .map(Self)
+            .map(|file| Self(file, None))
     }
 
     pub(super) fn stage(&mut self, stage: &str) {
-        let _ = writeln!(self.0, "{VERSION}\t{stage}");
+        self.record(format_args!("{VERSION}\t{stage}"));
     }
 
     pub(super) fn failure(&mut self, error: &dyn std::error::Error) {
@@ -101,11 +98,19 @@ impl Events {
         for byte in message[..end].bytes() {
             write!(encoded, "{byte:02x}").unwrap();
         }
-        let _ = writeln!(
-            self.0,
+        self.record(format_args!(
             "{VERSION}\tfailure\t{}\t{encoded}",
             u8::from(end < message.len())
-        );
+        ));
+    }
+    fn record(&mut self, arguments: std::fmt::Arguments<'_>) {
+        if self.1.is_none() {
+            self.1 = writeln!(self.0, "{arguments}").err();
+        }
+    }
+
+    pub(super) fn write_error(&self) -> Option<&io::Error> {
+        self.1.as_ref()
     }
 }
 
@@ -156,7 +161,7 @@ impl Report {
         let Some((VERSION, record)) = line.split_once(RECORD_SEPARATOR) else {
             return false;
         };
-        if self.error.is_some() || self.completed == STAGES.len() {
+        if self.error.is_some() {
             return false;
         }
         if STAGES.get(self.completed) == Some(&record) {
@@ -191,6 +196,13 @@ impl Report {
     }
 
     fn json(&self, termination: &io::Result<Termination>) -> String {
+        let unwritable = matches!(termination, Ok(Termination::Exited(status))
+            if status.code() == Some(i32::from(JOURNAL_ERROR_EXIT)));
+        let integrity = if unwritable {
+            "unwritable"
+        } else {
+            self.integrity
+        };
         let (outcome, status, detail) = match termination {
             Ok(Termination::Deadline) => (
                 "timeout",
@@ -198,19 +210,27 @@ impl Report {
                 Some("worker exceeded the wall deadline".into()),
             ),
             Err(error) => ("unknown", None, Some(error.to_string())),
-            Ok(Termination::Exited(status)) if status.code() == Some(124) => (
+            Ok(Termination::Exited(status)) if status.code() == Some(i32::from(WATCHDOG_EXIT)) => (
                 "timeout",
                 Some(status),
                 Some("worker watchdog expired".into()),
             ),
+            Ok(Termination::Exited(status)) if unwritable => (
+                "unknown",
+                Some(status),
+                Some("worker could not write its startup journal".into()),
+            ),
             Ok(Termination::Exited(status))
                 if status.success()
+                    && self.error.is_none()
                     && self.completed == STAGES.len()
                     && self.integrity == "complete" =>
             {
                 ("verified", Some(status), None)
             }
-            Ok(Termination::Exited(status)) if !status.success() && self.error.is_some() => {
+            Ok(Termination::Exited(status))
+                if status.code().is_some() && !status.success() && self.error.is_some() =>
+            {
                 ("stage_failure", Some(status), None)
             }
             Ok(Termination::Exited(status)) if status.code().is_some() && !status.success() => {
@@ -232,7 +252,7 @@ impl Report {
             .map_or("null".into(), |code| code.to_string());
         format!(
             "{{\"schema_version\":{VERSION},\"outcome\":\"{outcome}\",\"last_completed_stage\":{last},\"record_integrity\":\"{}\",\"worker_exit_code\":{code},\"termination_detail\":{detail},\"error\":{error},\"error_truncated\":{},\"stages\":[{records}]}}\n",
-            self.integrity, self.error_truncated
+            integrity, self.error_truncated
         )
     }
 }
@@ -259,6 +279,43 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn journal_write_error_surfaces_in_report() {
+        use std::os::unix::process::ExitStatusExt;
+        let journal = Journal::create().unwrap();
+        fs::write(journal.path(), b"1\tparsed\n").unwrap();
+        let mut events = Events(File::open(journal.path()).unwrap(), None);
+        events.stage("mapped");
+        assert!(events.write_error().is_some());
+        let status = ExitStatus::from_raw(i32::from(JOURNAL_ERROR_EXIT) << 8);
+        let result = journal.read().json(&Ok(Termination::Exited(status)));
+        assert!(
+            result.contains(r#""record_integrity":"unwritable""#),
+            "{result}"
+        );
+        assert!(
+            result.contains(r#""last_completed_stage":"parsed""#),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn terminal_failure_keeps_signal_detail_after_all_stages() {
+        use std::os::unix::process::ExitStatusExt;
+        let journal = Journal::create().unwrap();
+        let mut events = Events::open(&journal.path()).unwrap();
+        for stage in STAGES {
+            events.stage(stage);
+        }
+        events.failure(&io::Error::other("late error"));
+        let report = journal.read();
+        assert_eq!(report.integrity, "complete");
+        let result = report.json(&Ok(Termination::Exited(ExitStatus::from_raw(15))));
+        assert!(result.contains(r#""outcome":"unknown""#), "{result}");
+        assert!(result.contains(r#""error":"late error""#), "{result}");
+        assert!(result.contains("signal: 15"), "{result}");
+    }
 
     #[test]
     fn supervisor_distinguishes_early_exit_watchdog_signal_and_deadline() {

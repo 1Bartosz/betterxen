@@ -41,6 +41,7 @@ remains unsupported.
 - Extended the read-only RDNA2 planning CLI (`python3 -m qa rdna2`) with family/status filters, compact summaries, Codex-ready manifests under `artifacts/`, active-claim exclusion (family claims exclude those families; path-only claims block overlapping permitted files), coverage reconcile against `semantic_coverage` without inflating counts, and inventory diffs. Covered by `tests/qa/test_rdna2_plan.py`; planning only, no GPU production edits.
 
 ### Fixed
+- Startup reports now reject existing destinations before guest execution, surface journal write failures, and preserve late errors alongside signal termination.
 - Restored the DBT benchmark report-test fixture after the cache-invalidation counter was added. Its existing percentile, JSON and comparison tests now run in ordinary workspace CI instead of requiring a separate benchmark test-harness command.
 - DBT cache hits now compare an executable-generation token instead of rereading every instruction byte. Address-space or executable-memory changes trigger byte and execute-permission revalidation before a translation can be reused; changed code is retranslated. Ordinary data writes retain the fast path. Tests cover cloned spaces, loader bypass writes, split writes, remapping and bounded cache exhaustion. Same-dispatch self-modification and discarded-code reclamation remain unsupported.
 - Gate A2 checks the cross-compiler driver before invoking it, then checks its helpers before fixture compilation. CI also verifies the driver architecture before requesting its version.

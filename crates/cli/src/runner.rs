@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -18,7 +18,7 @@ use xenora_shader::{Architecture, PIXEL_ENTRY_POINT, VERTEX_ENTRY_POINT, compile
 
 #[path = "startup_report.rs"]
 mod startup_report;
-use startup_report::{Events, Journal, Termination};
+use startup_report::{Events, JOURNAL_ERROR_EXIT, Journal, Termination, WATCHDOG_EXIT};
 
 const FIXTURE: &[u8] = include_bytes!("../../../fixtures/pe/trusted-runner.exe");
 const SERVICES_FIXTURE: &[u8] = include_bytes!("../../../fixtures/pe/runtime-services.exe");
@@ -108,7 +108,7 @@ pub fn command(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         }
     };
     let result = if options.worker {
-        worker_command(&options).map(|()| ExitCode::SUCCESS)
+        worker_command(&options)
     } else {
         launch_worker(&options)
     };
@@ -127,8 +127,20 @@ fn launch_worker(options: &Options) -> Result<ExitCode, Box<dyn Error>> {
         .as_ref()
         .map(|_| Journal::create())
         .transpose()?;
+    let executable = std::env::current_exe()?;
+    let destination = options
+        .report
+        .as_ref()
+        .map(|path| {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|error| format!("could not create startup report: {error}"))
+        })
+        .transpose()?;
     let started = Instant::now();
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(executable);
     command
         .args([
             "run",
@@ -148,10 +160,13 @@ fn launch_worker(options: &Options) -> Result<ExitCode, Box<dyn Error>> {
     let termination = command
         .spawn()
         .and_then(|child| supervise(child, started, WALL_LIMIT));
-    if let (Some(journal), Some(path)) = (&journal, &options.report) {
-        journal
-            .finish(path, &termination)
-            .map_err(|error| format!("could not write startup report: {error}"))?;
+    if let (Some(journal), Some(destination)) = (&journal, destination)
+        && let Err(error) = journal.finish(destination, &termination)
+    {
+        eprintln!("could not write startup report: {error}");
+        if matches!(&termination, Ok(Termination::Exited(status)) if status.success()) {
+            return Ok(ExitCode::FAILURE);
+        }
     }
     match termination? {
         Termination::Exited(status) => match status.code() {
@@ -181,13 +196,28 @@ fn supervise(mut child: Child, started: Instant, limit: Duration) -> std::io::Re
     }
 }
 
-fn worker_command(options: &Options) -> Result<(), Box<dyn Error>> {
-    let mut events = options.journal.as_deref().map(Events::open).transpose()?;
+fn worker_command(options: &Options) -> Result<ExitCode, Box<dyn Error>> {
+    let mut events = match options.journal.as_deref().map(Events::open).transpose() {
+        Ok(events) => events,
+        Err(error) => {
+            eprintln!("could not open startup journal: {error}");
+            return Ok(ExitCode::from(JOURNAL_ERROR_EXIT));
+        }
+    };
     let result = run_worker(options, events.as_mut());
-    if let (Some(events), Err(error)) = (events.as_mut(), &result) {
-        events.failure(error.as_ref());
+    if let Some(events) = events.as_mut() {
+        if let Err(error) = &result {
+            events.failure(error.as_ref());
+        }
+        if let Some(error) = events.write_error() {
+            if let Err(error) = result {
+                eprintln!("run failed: {error}");
+            }
+            eprintln!("could not write startup journal: {error}");
+            return Ok(ExitCode::from(JOURNAL_ERROR_EXIT));
+        }
     }
-    result
+    result.map(|()| ExitCode::SUCCESS)
 }
 
 fn verify_fixture(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
@@ -220,7 +250,7 @@ fn run_worker(options: &Options, mut events: Option<&mut Events>) -> Result<(), 
             std::thread::sleep(WALL_LIMIT);
             // The supervisor also enforces this deadline. The worker retains
             // its own deadline if it is invoked directly.
-            std::process::exit(124);
+            std::process::exit(i32::from(WATCHDOG_EXIT));
         })?;
     let fixture = verify_fixture(&options.path)?;
     let (name, ticket, bound_imports) = if fixture == SERVICES_FIXTURE {

@@ -77,3 +77,33 @@ fn assert_stages(report: &str, stages: &[&str]) {
             .1;
     }
 }
+
+#[test]
+fn existing_report_path_prevents_worker_launch() {
+    let path = std::env::temp_dir().join(format!(
+        "betterxen-report-existing-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&path, "previous report").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_betterxen"))
+        .args([
+            "run",
+            "--experimental",
+            "--pe",
+            "missing-fixture",
+            "--startup-report",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(contents, "previous report");
+    assert!(!result.status.success());
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(
+        stderr.contains("could not create startup report"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("No such file or directory"), "{stderr}");
+}
