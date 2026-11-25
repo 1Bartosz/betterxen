@@ -113,8 +113,8 @@ repeated here except where the map adds evidence.
 
 All commands ran on Apple M5, macOS 26.6.2, native arm64, Rust
 `1.100.0-aarch64-apple-darwin` (the revision CI pins), `CARGO_BUILD_JOBS=2`,
-one run, on the branch holding this change, based on upstream `main` at
-`d26af53` (2026-11-25). Recorded evidence commands:
+in one run against source at `d26af53` (2026-11-25). The table below
+preserves the counts from that revision. Recorded evidence commands:
 
 ```sh
 python3 crates/loader/generate_x86.py validate   # 213 operations, 403 forms, 498 opcode slots
@@ -151,21 +151,21 @@ are covered form by form in `tests/cpu_rep.rs` and the loop tests).
 
 ## Engine path per operation
 
-Every one of the 213 operations runs in exactly one primary path in the native
-DBT: **93 are lowered to ARM64** by `is_native` in
-`crates/loader/src/dbt.rs`, and **120 use the shared interpreter semantics**
-through a helper call, counted in `DbtMetrics::interpreter_fallbacks`.
-`SYSCALL` is decoded but the DBT refuses to translate it (`is_translatable`),
-so it ends translated execution. The conditional gates inside `is_native`
-matter when reading the split:
+Of the 213 declared operations, **93 have an ARM64 lowering** for at least
+one form and **119 use the shared interpreter semantics for every translated
+form**. Calls to those semantics count toward
+`DbtMetrics::interpreter_fallbacks`. The remaining operation, `SYSCALL`,
+decodes but `is_translatable` refuses it in the DBT. For operations with an
+ARM64 lowering, `is_native` in `crates/loader/src/dbt.rs` applies these
+form-specific rules:
 
 - `ADD`, `SUB`, `CMP`, `AND`, `OR`, `XOR`, `TEST`, `INC`, `DEC`, `NEG`, `NOT`
   and `CMOV` are native only at 32- and 64-bit width; 8- and 16-bit forms use
   the shared semantics.
 - `ADC` and `SBB` are native only for register and immediate operands; a memory
   destination stays on the helper path.
-- `BT` is native only in the `0F A3` register-index form; the `0F BA`
-  immediate-index form can write memory and stays on the helper path.
+- `BT` is native only in the `0F A3` register-index form. The `0F BA /4`
+  immediate-index form uses the helper and can read a memory operand.
 - `BSF` and `BSR` are native at 16/32/64-bit width.
 - `POP` is native only in the opcode-register form.
 
@@ -196,13 +196,13 @@ passed/ignored). Expectation sources are named so independence can be judged.
 | `memory_page_boundaries.rs`, `memory_validation.rs` | mapping/permission/boundary contracts | 8 + 9 passed |
 | `generated_conformance.rs`, `bootstrap.rs`, `gate_a1.rs`, `gate_a2.rs`, `indirect_control.rs`, `bswap.rs`, `dbt_render.rs`, `process_exit.rs` | per-file documented contracts (generated conformance vectors, startup gates, control flow) | all passed except one Metal-gated ignore in `dbt_render.rs` |
 
-The one ignore in `cpu_known_answers.rs` is
+At `d26af53`, the one ignore in `cpu_known_answers.rs` was
 `defect_dbt_executes_modified_code_after_a_jump`, the known DBT defect that
-keeps a translated block after the guest rewrites its code, tracked by issue
-#79. It stays ignored at this revision until the cache-identity fix lands. The
-loader package's remaining ignores in the run are Metal-gated tests (run by
-`scripts/test-gpu.sh`) and one manual TLS timing profile; none is counted as a
-pass.
+kept a translated block after the guest rewrote its code. The cache
+revalidation change in [PR #269](https://github.com/MacosPorters/betterxen/pull/269)
+restored the test as `dbt_executes_modified_code_after_a_jump`. The other
+loader ignores in the recorded run were Metal-gated tests and one manual TLS
+timing profile.
 
 ## Operations covered by model tests instead of the fixture corpus
 
