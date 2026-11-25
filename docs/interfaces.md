@@ -389,15 +389,65 @@ Everything else that is not modelled stops the guest with the runtime-limit
 fault and writes nothing, so that nothing is printed wrongly: the
 floating-point types (`e`, `f`, `g`, `a`), wide characters and strings (`C`,
 `S`, `lc`, `ls`), a locale object, option bits other than the three that do
-not affect these conversions, any stream other than `stdout` and `stderr`
-(files do not exist yet, and `stdin` cannot be written), an index above 2,
-more than 1 MiB in one call, and output past the 16 MiB bound.
+not affect these conversions, a pointer that is no stream, writing `stdin`,
+an index above 2, more than 1 MiB in one call, and output past the 16 MiB
+bound.
 
 Choices where the documentation leaves room, each marked in the source:
 `%p` prints sixteen upper-case hexadecimal digits; `0` pads a character and
 a string as it pads a number; a precision also limits `(null)`; `%#.0o` of
 zero prints `0`, which is ISO C's rule. All six services are `partial`. None
 of this has been compared with Windows.
+
+### Files through the C runtime
+
+`fopen`, `fclose` and `fgets` give a hosted C program files, and the output
+services above (`__stdio_common_vfprintf`, `fwrite`, `fputs`, `fflush`,
+`setvbuf`) accept a stream `fopen` returned as well as `stdout` and `stderr`.
+The files are the ones on the in-memory `C:` drive described under
+"Synthetic guest files": a file written through a C stream is the file
+`ReadFile` reads, and the reverse.
+
+| Service | Behaviour |
+| --- | --- |
+| `fopen(name, mode)` | Opens a file and returns its `FILE*`, or null with `errno` set. `r` needs the file to exist; `w` creates it or destroys its contents; `a` creates it and makes every write go to its end; `+` adds the other direction; `b` or `t` selects binary or text |
+| `fclose(stream)` | Closes the stream and returns 0; `EOF` with `EINVAL` for a null stream |
+| `fgets(buffer, count, stream)` | Reads up to `count - 1` characters, stopping after a newline, which it keeps, and adds a terminator. Returns the buffer, or null at end of file or on an error |
+| `perror(message)` | Writes the message, `: `, the text for `errno` and a newline to `stderr`; only the text when the message is null or empty |
+
+A stream is in text mode unless its mode has `b`: a line feed is stored as a
+carriage return and a line feed, the pair is read back as a line feed, and
+`CTRL+Z` ends the input. Names are ASCII, with either slash, in any case,
+with or without `C:\`, as the drive accepts them.
+
+`errno` after a failed `fopen`: `EINVAL` for a null or empty name or mode, a
+mode this runtime does not open, and a name the drive rejects; `ENOENT` when
+the file or its directory does not exist; `EACCES` for a directory; `EMFILE`
+when 64 streams are already open; `ENOSPC` when the drive holds its 256
+files; `ENOMEM` when the `FILE` object cannot be allocated. Output to a
+stream that was not opened for writing, and reading one not opened for
+reading, fail with `EBADF`; output the drive has no room for fails with
+`ENOSPC`. A failed write writes nothing.
+
+What is not provided, and what is Xenora's choice:
+
+- **Not provided:** the mode characters `x`, `c`, `n`, `N`, `S`, `R`, `T`,
+  `D` and `ccs=`, which are refused; `fread`, `fseek`, `ftell`, `rewind`,
+  `feof`, `ferror`, `fscanf`; reading `stdin` and closing a standard stream,
+  which stop the guest.
+- **No buffering.** A write reaches the drive at once, so the rule that a
+  `+` stream needs `fflush` or a seek between writing and reading does not
+  apply.
+- **No sharing.** A C stream is not a Win32 handle. It does not stop
+  `DeleteFileW` or `MoveFileW`, and ignores a handle's sharing mode. After
+  its file is deleted a stream's reads and writes fail with `EBADF`.
+- **Choices:** the `errno` values above other than `EINVAL` for a null or
+  empty argument, which is documented; an `a+` stream reads from the start;
+  every `perror` text except "No such file or directory", which is the one
+  Microsoft's page shows.
+
+All four services are `partial`. None of this has been compared with
+Windows.
 
 ### CRT integer conversion
 
