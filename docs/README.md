@@ -8,6 +8,12 @@ then read the [interface contracts](interfaces.md). Reproduce an
 [independent validation suite](../tests/validation/README.md) before changing
 either path. The [changelog](../CHANGELOG.md) records notable changes.
 
+Use the [BetterXen development phases](development-phases.md) for current work
+order, existing issue/PR dependencies and measurable completion criteria.
+Historical phase checkpoints retain their original evidence scope.
+The active plan replaces the former roadmap with workload-based phases, from
+compiled guest boot to separately admitted Xbox compatibility experiments.
+
 ## Architecture and technical design
 
 - [Interface contracts](interfaces.md) — Translated shader stages, guest services, native command submission, and synthetic textures.
@@ -53,6 +59,7 @@ either path. The [changelog](../CHANGELOG.md) records notable changes.
 
 ## Research and engineering decisions
 
+- [PortWatch projects and the native macOS plan](research/portwatch-native-macos.md) — Complete pinned tracker screen, native ARM64 gaps, contributor issues and revised phase dependencies; external claims remain unverified.
 - [Public sources](research/sources.md), [RDNA 2 notes](research/rdna2.md), and [Xbox GPU evidence](research/xbox-gpu.md) — Specifications, evidence scope, and unknown console behavior.
 - [Shader inputs](research/shader-containers.md) and [risk register](risk-register.md) — Input provenance and unresolved engineering risks.
 - [Synthetic integration and upstream evidence](research/synthetic-integration.md) — Audited source snapshots and remaining commercial startup prerequisites.
