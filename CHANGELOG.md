@@ -42,6 +42,7 @@ remains unsupported.
 - Added a Python 3 fallback for `timeout` in `scripts/test-gpu.sh`, so the native Metal suite runs on stock macOS without GNU coreutils while preserving bounded execution and the usual timeout exit status.
 
 ### Added
+- Added opt-in `betterxen run --startup-report <path>` JSON diagnostics with the last observed startup stage, fixture verification outcome and preserved failure or termination detail (#255).
 - Recorded the migrated PR integration decisions, native verification and scope exclusions in the testing documentation.
 - Added `xenora-bench startup` (#178), which measures Metal startup in fresh processes and in repeated
   submissions within one process, phase by phase (launch, device and queue, translation, library, pipeline,
