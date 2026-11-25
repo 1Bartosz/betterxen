@@ -17,6 +17,7 @@ remains unsupported.
 - Documented the proposed guest AVX/AVX2 state and decoding contract and specified an original integer fixture with known results and fault controls (#299).
 
 ### Removed
+- Removed the "Agent PR checks" workflow (`.github/workflows/agent-pr-checks.yml`), its section in `docs/coordination/agent-tasks.md` and the four workflow tests in `tests/agent_queue/test_workflows_cli.py` that only exercised it. Pull requests are no longer checked for `Closes #N`, task file patterns or `/verified` comments; the claims workflow and its tests are unchanged. The agent queue Python tests pass locally (85 tests).
 - Removed the "PR template" check (`.github/workflows/pr-template.yml`, `scripts/pr_template_check.py` and its tests) and its CI test step. Also removed `.github/PULL_REQUEST_TEMPLATE.md`. Pull request descriptions are no longer validated or pre-filled; CONTRIBUTING.md still asks for the same information and the claim-first rule still applies.
 
 ### Changed
