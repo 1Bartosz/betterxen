@@ -985,6 +985,7 @@ mod tests {
                 let mut asm = Arm64Assembler::new();
                 // Seed the destination so a W-register load must clear the high bits.
                 asm.movn_64(register, 0, 0);
+                // Assembler offsets count 32-bit instruction words.
                 let start = asm.current_offset();
                 asm.load_imm_64(register, value);
                 assert_eq!(
