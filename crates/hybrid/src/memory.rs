@@ -63,7 +63,7 @@ pub enum Outcome {
     SpawnFailed(String),
 }
 
-fn terminate(child: &mut Child, grace: Duration) {
+pub(crate) fn terminate(child: &mut Child, grace: Duration) {
     let _ = Command::new("/bin/kill")
         .args(["-TERM", &child.id().to_string()])
         .status();
