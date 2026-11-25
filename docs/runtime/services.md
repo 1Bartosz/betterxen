@@ -6,14 +6,14 @@ A declared service is not a claim of compatibility. `implemented` and `partial` 
 
 | Measure | Count |
 | --- | ---: |
-| Services with a declared ABI | 32 |
-| Generated adapters | 32 |
-| Unique handler implementations | 32 |
+| Services with a declared ABI | 37 |
+| Generated adapters | 37 |
+| Unique handler implementations | 37 |
 | Implemented | 7 |
-| Partial | 22 |
+| Partial | 27 |
 | Stub | 3 |
-| Conformance-tested through guest dispatch | 32 |
-| API-set aliases (not services) | 32 |
+| Conformance-tested through guest dispatch | 37 |
+| API-set aliases (not services) | 37 |
 | Independently accepted | 0 |
 
 | Service | Signature | Status | Failure |
@@ -32,6 +32,11 @@ A declared service is not a claim of compatibility. `implemented` and `partial` 
 | `kernel32.dll!GetSystemTimeAsFileTime` | `(time: out<8>) -> void` | implemented | guest fault on an invalid pointer |
 | `kernel32.dll!GetLastError` | `() -> u32` | partial | never |
 | `kernel32.dll!SetLastError` | `(code: u32) -> void` | partial | never |
+| `ucrtbase.dll!__p___argc` | `() -> ptr` | partial | stops the guest when the variable cannot be allocated |
+| `ucrtbase.dll!__p___argv` | `() -> ptr` | partial | stops the guest when the variable cannot be allocated |
+| `ucrtbase.dll!__p__environ` | `() -> ptr` | partial | stops the guest when the variable cannot be allocated |
+| `ucrtbase.dll!_configure_narrow_argv` | `(mode: i32) -> i32` | partial | EINVAL for a mode other than 0, 1 or 2; stops the guest when the table cannot be allocated |
+| `ucrtbase.dll!_initialize_narrow_environment` | `() -> i32` | partial | stops the guest when the table cannot be allocated |
 | `kernel32.dll!VirtualAlloc` | `(address: ptr, size: u64, kind: u32, protect: u32) -> ptr` | partial | 0 with ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_ADDRESS or ERROR_NOT_ENOUGH_MEMORY |
 | `kernel32.dll!VirtualFree` | `(address: ptr, size: u64, kind: u32) -> bool32` | partial | 0 with ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER or ERROR_INVALID_ADDRESS |
 | `kernel32.dll!VirtualProtect` | `(address: ptr, size: u64, protect: u32, old: out<4>) -> bool32` | stub | always: stops the guest with the runtime-limit fault; no protection changes |
