@@ -15,7 +15,7 @@ use crate::memory::GuestMemory;
 use crate::x86_decode::{Encoding, Insn, MemOperand, RegOperand, RmOperand, Segment, decode};
 use crate::x86_exec;
 use crate::x86_table::{FORMS, Op};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 const MAX_BLOCK_INSTRUCTIONS: usize = 16;
 
@@ -29,8 +29,8 @@ pub struct DbtMetrics {
     pub blocks_compiled: usize,
     pub cache_hits: usize,
     pub cache_misses: usize,
-    /// Cached blocks discarded because the guest bytes they were translated
-    /// from changed or became unreadable. Each also counts as a cache miss.
+    /// Cached blocks discarded after their address space or executable-memory
+    /// generation changed. Each also counts as a cache miss.
     pub blocks_invalidated: usize,
     pub native_bytes_emitted: usize,
     pub dbt_dispatches: usize,
@@ -40,23 +40,21 @@ pub struct DbtMetrics {
     pub service_calls: usize,
 }
 
-/// A translated block and the guest bytes it was translated from.
+/// A translated block and its executable-memory generation.
 ///
-/// A cached block is only valid while those bytes are still executable at the
-/// same address. Guest stores into code (Intel SDM Vol. 3A 11.6) and a different
-/// address space at the same address both change them.
+/// Guest stores into executable memory (Intel SDM Vol. 3A 11.6), executable
+/// mapping changes and another address space invalidate the retained token.
+/// Checking it is constant-time and does not reread every instruction byte.
+/// Validation occurs at dispatch boundaries: a store into the currently running
+/// block's later instructions still needs a separate dispatch-boundary design.
 struct CachedBlock {
     code: *const u8,
-    start: u64,
-    source: Box<[u8]>,
+    generation: Arc<()>,
 }
 
 impl CachedBlock {
     fn is_current(&self, memory: &GuestMemory) -> bool {
-        self.source.iter().enumerate().all(|(offset, &byte)| {
-            let address = self.start.wrapping_add(offset as u64);
-            matches!(memory.fetch_instruction_byte(address), Ok(current) if current == byte)
-        })
+        memory.code_is_current(&self.generation)
     }
 }
 
@@ -380,16 +378,10 @@ impl DbtEngine {
             .map_err(|_| ExitReason::JitCacheExhausted)?;
         self.metrics.blocks_compiled += 1;
         self.metrics.native_bytes_emitted += asm.instructions().len() * 4;
-        // Decoding just read every one of these bytes, so they are readable.
-        let source = (0..rip.wrapping_sub(start_rip))
-            .map(|offset| memory.fetch_instruction_byte(start_rip.wrapping_add(offset)))
-            .collect::<Result<Box<[u8]>, _>>()
-            .map_err(ExitReason::MemoryFault)?;
         self.decoded_blocks.push(insns);
         Ok(CachedBlock {
             code: emitted,
-            start: start_rip,
-            source,
+            generation: memory.code_generation(),
         })
     }
 }
@@ -1640,6 +1632,128 @@ mod tests {
         assert_eq!(engine.metrics.blocks_compiled, 1);
         assert_eq!(engine.metrics.cache_hits, 1);
         assert_eq!(engine.metrics.blocks_invalidated, 0);
+    }
+
+    #[test]
+    fn data_writes_and_allocations_do_not_invalidate_executable_code() {
+        let (mut engine, mut memory) = writable_fixture(&mov_eax(1));
+        memory
+            .map_region(ENTRY + 0x1000, 8, MemoryPermissions::READ_WRITE)
+            .unwrap();
+        assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 1);
+        for value in 0..64 {
+            memory.write_u64(ENTRY + 0x1000, value).unwrap();
+            let allocation = memory
+                .map_virtual_allocation(0, 4096, MemoryPermissions::READ_WRITE)
+                .unwrap();
+            assert!(memory.release_virtual_allocation(allocation));
+            assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 1);
+        }
+        assert_eq!(engine.metrics.blocks_compiled, 1);
+        assert_eq!(engine.metrics.cache_hits, 64);
+        assert_eq!(engine.metrics.blocks_invalidated, 0);
+    }
+
+    #[test]
+    fn cloned_address_spaces_have_independent_code_generations() {
+        let (mut engine, mut memory) = writable_fixture(&mov_eax(1));
+        assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 1);
+        let mut cloned = memory.clone();
+        assert_eq!(rax_after_run(&mut engine, &mut cloned, 16), 1);
+        memory.write_u8(ENTRY + 1, 7).unwrap();
+        assert_eq!(rax_after_run(&mut engine, &mut cloned, 16), 1);
+        assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 7);
+        assert_eq!(engine.metrics.blocks_compiled, 3);
+        assert_eq!(engine.metrics.cache_hits, 1);
+    }
+
+    #[test]
+    fn executable_bypass_writes_invalidate_cached_translations() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map_region_with_data(
+                ENTRY,
+                8,
+                MemoryPermissions::READ_EXECUTE,
+                &[0xB8, 1, 0, 0, 0, 0xF4, 0, 0],
+            )
+            .unwrap();
+        let mut engine = DbtEngine::new(64 * 1024).unwrap();
+        assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 1);
+        assert!(memory.write_u32(ENTRY + 1, 9).is_err());
+        assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 1);
+        assert_eq!(engine.metrics.blocks_invalidated, 0);
+        memory
+            .write_u64_bypass(ENTRY, u64::from_le_bytes([0xB8, 2, 0, 0, 0, 0xF4, 0, 0]))
+            .unwrap();
+        assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 2);
+        memory.write_u32_bypass(ENTRY + 1, 3).unwrap();
+        assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 3);
+        assert_eq!(engine.metrics.blocks_invalidated, 2);
+    }
+
+    #[test]
+    fn executable_writes_crossing_regions_invalidate_cached_translations() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map_region_with_data(ENTRY, 2, MemoryPermissions::READ_WRITE_EXECUTE, &[0xB8, 1])
+            .unwrap();
+        memory
+            .map_region_with_data(
+                ENTRY + 2,
+                4,
+                MemoryPermissions::READ_WRITE_EXECUTE,
+                &[0, 0, 0, 0xF4],
+            )
+            .unwrap();
+        let mut engine = DbtEngine::new(64 * 1024).unwrap();
+        assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 1);
+        memory.write_u32(ENTRY + 1, 9).unwrap();
+        assert_eq!(rax_after_run(&mut engine, &mut memory, 16), 9);
+        assert_eq!(engine.metrics.blocks_invalidated, 1);
+    }
+
+    #[test]
+    fn remapped_non_executable_memory_cannot_reuse_a_translation() {
+        let mut memory = GuestMemory::new();
+        let base = memory
+            .map_virtual_allocation(0, 4096, MemoryPermissions::READ_WRITE_EXECUTE)
+            .unwrap();
+        memory.write_bytes(base, &mov_eax(1)).unwrap();
+        let mut engine = DbtEngine::new(64 * 1024).unwrap();
+        let mut cpu = CpuState::new(base, 0);
+        assert_eq!(
+            engine.run(&mut cpu, &mut memory, 16).exit_reason,
+            ExitReason::Halt
+        );
+        assert!(memory.release_virtual_allocation(base));
+        assert_eq!(
+            memory.map_virtual_allocation(base, 4096, MemoryPermissions::READ_WRITE),
+            Ok(base)
+        );
+        memory.write_bytes(base, &mov_eax(1)).unwrap();
+        let mut cpu = CpuState::new(base, 0);
+        assert!(matches!(
+            engine.run(&mut cpu, &mut memory, 16).exit_reason,
+            ExitReason::MemoryFault(_)
+        ));
+        assert_eq!(engine.metrics.blocks_invalidated, 1);
+    }
+
+    #[test]
+    fn repeated_code_rewrites_report_bounded_jit_cache_exhaustion() {
+        let (mut engine, mut memory) = writable_fixture(&mov_eax(1));
+        for value in 0..16_384u32 {
+            memory.write_u32(ENTRY + 1, value).unwrap();
+            let mut cpu = CpuState::new(ENTRY, 0);
+            let result = engine.run(&mut cpu, &mut memory, 16);
+            if result.exit_reason == ExitReason::JitCacheExhausted {
+                return;
+            }
+            assert_eq!(result.exit_reason, ExitReason::Halt);
+            assert_eq!(cpu.get(Register::Rax), u64::from(value));
+        }
+        panic!("rewritten blocks unexpectedly avoided the bounded JIT capacity");
     }
 
     #[test]
