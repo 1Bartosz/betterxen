@@ -11,8 +11,6 @@ either path. The [changelog](../CHANGELOG.md) records notable changes.
 Use the [BetterXen development phases](development-phases.md) for current work
 order, existing issue/PR dependencies and measurable completion criteria.
 Historical phase checkpoints retain their original evidence scope.
-The active plan replaces the former roadmap with workload-based phases, from
-compiled guest boot to separately admitted Xbox compatibility experiments.
 
 ## Architecture and technical design
 
@@ -47,6 +45,7 @@ compiled guest boot to separately admitted Xbox compatibility experiments.
 
 ## Testing, validation, and benchmarks
 
+- [Migrated pull-request integration review](testing/migration-pr-review.md) — Merge decisions, integration fixes, native verification and excluded concurrent work.
 - [Testing and acceptance index](testing/README.md) — Entry point for test procedures, evidence and review records.
 - [AMD RDNA2 desktop GPU (gfx1030) form acceptance](testing/shader-form-acceptance.md) — Independence, command, log and promotion rules for fixture-verified instruction forms.
 - [Engineering progress](progress.md) — Verification commands, metric definitions, and open release gates.
@@ -54,14 +53,14 @@ compiled guest boot to separately admitted Xbox compatibility experiments.
 - [Test inventory comparison](testing/test-inventory.md) — Detect missing or newly ignored Cargo tests across commits.
 - [Persistent resource and translated rendering acceptance](testing/x9-acceptance.md) — Pinned upstream tests, native ARM64 results and unsupported cases.
 - [Baseline acceptance](testing/phase-02-baseline.md), [Phase 01 assurance](testing/phase01-assurance.md), and [independent reviews](testing/review-log.md) — Candidate-specific results and release findings.
-- [Gate A: a compiled C program](testing/gate-a.md) — The two milestones, what the A1 test checks and what it does not show.
+- [Gate A: a compiled C program](testing/gate-a.md) — The two milestones, what the A1 and A2 tests check and what they do not show.
 - [Mutation testing](testing/mutation.md) and [benchmark protocol](testing/benchmarks.md) — Test sensitivity, benchmark inputs, and timing requirements.
 
 ## Research and engineering decisions
 
-- [PortWatch projects and the native macOS plan](research/portwatch-native-macos.md) — Complete pinned tracker screen, native ARM64 gaps, contributor issues and revised phase dependencies; external claims remain unverified.
 - [Public sources](research/sources.md), [RDNA 2 notes](research/rdna2.md), and [Xbox GPU evidence](research/xbox-gpu.md) — Specifications, evidence scope, and unknown console behavior.
 - [Shader inputs](research/shader-containers.md) and [risk register](risk-register.md) — Input provenance and unresolved engineering risks.
+- [PortWatch native macOS research](research/portwatch-native-macos.md) — Screening of public Xbox-on-Windows port projects for native macOS planning; discovery only.
 - [Synthetic integration and upstream evidence](research/synthetic-integration.md) — Audited source snapshots and remaining commercial startup prerequisites.
 
 ## Security, licensing, and contributions
