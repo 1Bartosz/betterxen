@@ -8,9 +8,16 @@ then read the [interface contracts](interfaces.md). Reproduce an
 [independent validation suite](../tests/validation/README.md) before changing
 either path. The [changelog](../CHANGELOG.md) records notable changes.
 
-Use the [BetterXen development phases](development-phases.md) for current work
-order, existing issue/PR dependencies and measurable completion criteria.
-Historical phase checkpoints retain their original evidence scope.
+Use the [roadmap](roadmap.md) for the active CrossOver-based hybrid plan, phases,
+critical path and completion criteria; see [ADR 0005](adr/0005-crossover-hybrid-direction.md)
+for the decision and [project board setup](planning/project-board.md). Native work is
+paused: [deferred native roadmap](research/native-roadmap.md) and the archived
+[native-first plan](archive/development-phases-native-first.md) with
+[retired milestones](archive/native-first-milestones.json), the
+[native issue archive](research/native-issue-archive.md) and the retired
+[H0 to H7 breakdown](archive/hybrid-phases-h0-h7.md). Research inputs: the [upstream research registry](research/upstream-registry.md) and
+[component reuse matrix](research/component-reuse-matrix.md). Historical phase
+checkpoints retain their original evidence scope.
 
 ## Architecture and technical design
 
@@ -64,6 +71,8 @@ Historical phase checkpoints retain their original evidence scope.
 - [Texture format inventory](research/texture-formats.md) — Formats and layouts by stage (decode, layout, native upload, sampling, guest), their public specifications, unknowns and ranked follow-ups.
 - [PortWatch native macOS research](research/portwatch-native-macos.md) — Screening of public Xbox-on-Windows port projects for native macOS planning; discovery only.
 - [Synthetic integration and upstream evidence](research/synthetic-integration.md) — Audited source snapshots and remaining commercial startup prerequisites.
+- [Hybrid backlog research record](research/hybrid-backlog-research-2026-11-25.md) — Findings, registry candidates and the issues they produced (2026-11-25); not verified on hardware.
+- [Primary-source verification](research/primary-source-verification-2026-11-25.md) — Which hybrid-research claims were confirmed, contradicted or left unverified against vendor documentation.
 
 ## Security, licensing, and contributions
 
