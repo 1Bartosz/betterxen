@@ -7,6 +7,13 @@ The current [instruction registry](instruction-registry.md) rejects VEX prefixes
 the SIMD floating-point control and status register. The synthetic `CPUID`
 advertises basic leaves through 1 and reports no AVX or extended-state support.
 
+The architectural expectations come from the public Intel Software Developer's
+Manual and apply to BetterXen's synthetic x86-64 guest profile. Which AVX and
+AVX2 features Xbox Series X|S CPUs expose, and which extended register state
+the console OS enables for applications, remain open research questions.
+Resolving them requires public platform documentation or authorized hardware
+evidence.
+
 ## Architectural state and encoding
 
 In 64-bit mode, XMM0–XMM15 alias bits 127:0 of YMM0–YMM15. A legacy SSE
@@ -14,8 +21,8 @@ instruction that writes an XMM destination preserves bits 255:128. For the
 packed VEX.128 forms in this proposal, writing an XMM destination clears that
 register's upper 128 bits. A VEX.256 register destination replaces all 256 bits.
 A store to memory leaves its source vector register intact. The proposed moves
-and integer add leave RFLAGS and MXCSR unchanged. [Intel SDM, Vol. 1, §14.8;
-Vol. 2, MOVDQU and PADDD](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html).
+and integer add leave RFLAGS and MXCSR unchanged. [Intel SDM Vol. 1, §14.8,
+Accessing YMM Registers][sdm-ymm]. [Intel SDM Vol. 2B, MOVDQU and PADDD][sdm-2b].
 
 The shared [decoder](../../crates/loader/src/x86_decode.rs) should retain the
 prefix family, opcode map, mandatory prefix, operand width and register
@@ -39,8 +46,8 @@ both valid prefix lengths for them. Reject reserved maps and encodings,
 including a physical `LOCK`, `66`, `F2`, `F3` or REX prefix before VEX, through
 the existing illegal-instruction path. Legal forms outside the implemented
 subset also stop explicitly. Keep the existing register and effective-address
-rules and 15-byte fetch limit. [Intel SDM, Vol. 2, §2.3 and individual
-opcode entries](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html).
+rules and 15-byte fetch limit. [Intel SDM Vol. 2A, §2.3, VEX encoding][sdm-2a].
+[Intel SDM Vol. 2B, MOVDQU and PADDD][sdm-2b].
 
 ## First implementation increments
 
@@ -74,11 +81,19 @@ Rust helpers.
 guest span before publishing a load result or writing a store. A split
 span across adjacent permitted mappings succeeds. A missing or protected
 mapping produces the existing guest memory fault at the first inaccessible
-byte. A non-canonical address produces `GeneralProtection`. For a later
-`VMOVDQA` form, a memory operand must be aligned to its width (16 or 32
-bytes), with a misaligned operand raising `GeneralProtection`. These checks
-use guest addresses and permissions. [Intel SDM, Vol. 2, MOVDQU and
-MOVDQA](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html).
+byte. For a later `VMOVDQA` form, a memory operand must be aligned to its
+width (16 or 32 bytes), with a misaligned operand raising
+`GeneralProtection`. [Intel SDM Vol. 2B, MOVDQU and MOVDQA][sdm-2b].
+
+Intel's Type 4 rules for `VMOVDQU` specify `#SS(0)` when a memory reference
+through the stack segment (SS) has a noncanonical address and `#GP(0)`
+for other noncanonical references. The initial BetterXen profile uses the
+[existing 48-bit guest address check](../../crates/loader/src/x86_exec.rs)
+and reports `GeneralProtection` for either segment case, including a span
+whose first byte is canonical and whose last byte is noncanonical. Check
+canonicality before guest memory lookup and before committing the move.
+Distinct stack-segment exception reporting remains outside this profile.
+[Intel SDM Vol. 2A, Table 2-21, Type 4 exceptions][sdm-2a].
 
 Before adding masked moves, use a separate per-lane access contract. For
 `VPMASKMOVD`, only lanes with the high mask bit set may access memory or
@@ -86,8 +101,7 @@ report a memory fault. A clear bit zeroes a load lane and leaves a store
 lane untouched. A test with lane 4 on an unmapped page must pass with that
 lane disabled and fault with it enabled. A full-width span check would
 incorrectly reject the disabled case. Specify store commit behavior before
-admitting that form. [Intel SDM, Vol. 2,
-VPMASKMOV](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html).
+admitting that form. [Intel SDM Vol. 2C, VPMASKMOV][sdm-2c].
 
 Require interpreter and DBT parity for the exit reason, fault address when
 reported, RIP, instruction count and complete guest register and memory
@@ -109,6 +123,14 @@ and per-thread ownership must agree. Verify the exception behavior for
 disabled state and invalid `XGETBV` selectors before exposing the facility.
 AVX2 separately requires `CPUID.(7,0):EBX[5]` and the same OS state. Gate
 each advertised feature on its full instruction and state contract,
-with probes for enabled and disabled combinations. [Intel SDM, Vol. 1,
-§14.3 and §14.7.1; Vol. 2, CPUID, XGETBV, XSAVE and
-XRSTOR](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html).
+with probes for enabled and disabled combinations. [Intel SDM Vol. 1,
+§14.3, AVX detection][sdm-avx]. [Intel SDM Vol. 1, §14.7.1, AVX2 detection][sdm-avx2].
+[Intel SDM Vol. 2A, CPUID][sdm-2a]. [Intel SDM Vol. 2D, XGETBV, XSAVE and XRSTOR][sdm-2d].
+
+[sdm-ymm]: https://cdrdv2-public.intel.com/843827/253665-sdm-vol-1-dec-24.pdf#page=376
+[sdm-avx]: https://cdrdv2-public.intel.com/843827/253665-sdm-vol-1-dec-24.pdf#page=359
+[sdm-avx2]: https://cdrdv2-public.intel.com/843827/253665-sdm-vol-1-dec-24.pdf#page=375
+[sdm-2a]: https://cdrdv2-public.intel.com/929353/253666-093-sdm-vol-2a.pdf
+[sdm-2b]: https://cdrdv2-public.intel.com/929354/253667-093-sdm-vol-2b.pdf
+[sdm-2c]: https://cdrdv2-public.intel.com/929355/326018-093-sdm-vol-2c.pdf
+[sdm-2d]: https://cdrdv2-public.intel.com/929356/334569-093-sdm-vol-2d.pdf
