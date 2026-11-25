@@ -40,6 +40,13 @@ remains unsupported.
 - Added a Python 3 fallback for `timeout` in `scripts/test-gpu.sh`, so the native Metal suite runs on stock macOS without GNU coreutils while preserving bounded execution and the usual timeout exit status.
 
 ### Added
+- Added `xenora-bench startup` (#178), which measures Metal startup in fresh processes and in repeated
+  submissions within one process, phase by phase (launch, device and queue, translation, library, pipeline,
+  submission, GPU, readback), with median, p90, p99 and maximum. Every sample must produce the fixture's
+  expected output, or the run stops without writing results. `docs/testing/benchmarks.md` records one
+  release run on an Apple M4: a fresh process took about 43 ms (median), 36 ms of it creating the Metal
+  device and queue, while repeated runs in one process needed about 0.2 ms of host submission. Measurement
+  only; nothing was optimized.
 - Added an opt-in, budgeted staged upload for RGBA8 textures (#144). `MetalRgba8Texture::upload_staged` fills a
   Private-storage texture through one reused Shared staging buffer that never exceeds a `StagingBudget`. It
   copies whole-row bands with a blit encoder and reuses the buffer only after the previous command buffer has
