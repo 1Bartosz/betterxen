@@ -62,3 +62,37 @@ Ask skakwy only for shareable, general information: Mac model, macOS and CrossOv
 ## Remaining blockers
 
 CrossOver is not installed here, so criteria 2 and 6 of Phase 1 cannot progress on this machine; `docs/research/primary-source-verification-2026-11-25.md` lists documents still to read. The Rust toolchain default (`stable`, 1.94.1) is older than the workspace's 1.100; use `rustup run 1.100.0 cargo`.
+
+## skakwy/victory-mac: component-level review (second pass)
+
+skakwy, the repository's maintainer and a BetterXen contributor, authorized integrating his independently developed work. His permission cannot cover third-party material, and the repository's purpose fixes what most of it is. Reviewed: full history (302 commits, 65 by skakwy, 194 tracked files at `22b3f8e45a59`, `main` on 2026-11-25), every file he authored under `mac/` and `tools/macos/`, and the headers and authorship of the game-facing crates. Nothing was executed; the checkout stayed outside this repository with git hooks disabled.
+
+### What the reported result is
+
+From his own `mac/PROGRESS.md` and `mac/run-victory.sh` (his statements, unverified): the workload is an unpacked Xbox Series X dump of a commercial game, about 209 GB, run through VIctory under a CrossOver Preview bottle with Rosetta 2 and D3DMetal 4.0b2 on an Apple M3 Max with 36 GB and macOS 27.2.1. "About 1 fps" is 1 to 1.9 seconds per frame in the game world over a 17-minute run ("run 31, ~1.1 fps"), with 5,000 to 7,000 draws per frame and a GPU share of 0.15 to 0.5 s of each frame, taken from VIctory's own per-frame log line. So it is real presented frames from a program VIctory drives, measured by that program, on an input that BetterXen's rules forbid. It is **not** reproducible here, was not measured with independent instrumentation, and says nothing about authorized workloads. It does indicate, as an unverified observation, that a Rust-built Windows x86-64 program using D3D12 can reach D3DMetal under CrossOver on macOS 27. BetterXen has no evidence of that yet; the original D3D11 workload built on this branch is the authorized way to test it once CrossOver is installed.
+
+### Component record
+
+Original repository for every row: https://github.com/skakwy/victory-mac (GPL-3.0, file `LICENSE`). Author: skakwy unless stated. Permission: granted by skakwy through the maintainer, not recorded in the repository itself.
+
+| Component | Source path (commit) | Provenance | Classification | BetterXen destination and method | Validation | Limits |
+| --- | --- | --- | --- | --- | --- | --- |
+| Memory guard: do not start below N % free, stop a workload below M % | `mac/run-victory.sh` (`22b3f8e45a59`) | skakwy only; logic is general | **Integrated, adapted** | `crates/hybrid/src/memory.rs` and the `guard` command, reimplemented in Rust, SIGTERM then SIGKILL, unreadable memory is an error | 6 unit tests including a child stopped on a simulated drop; end-to-end runs of refuse, pass-through and stop; real `memory_pressure -Q` parsed on macOS 27.0 | Output format of `memory_pressure -Q` is not a documented stable interface; one machine |
+| Windows cross-link wrapper for the gnullvm target | `tools/macos/gnullvm-cc.sh` (`22b3f8e45a59`) | skakwy only | **Unnecessary here** | Evaluated; not functional with Homebrew `llvm@17`; superseded by llvm-mingw (see hybrid-toolchain.md). Awaiting clarification of the LLVM version he uses | Link failure reproduced | Not integrated |
+| Build wrapper for the victory exe | `mac/build.sh` | skakwy only | Unnecessary | Three lines around `cargo build`; `scripts/hybrid/build-windows-workloads.sh` replaces the idea | n/a | n/a |
+| CrossOver launch conventions: `bin/wine --bottle B --cx-app EXE run`, `wineserver -k`, prefix at `~/Library/Application Support/CrossOver/Bottles/B`, `CX_GRAPHICS_BACKEND` and `_VERSION` | `mac/run-victory.sh` | skakwy only; observations of "CrossOver Preview" | **Awaiting clarification** / reference | Recorded for #350 as undocumented third-party observations. Not coded: they are not documented interfaces. His note that backend version 3 gave a black screen and 4 worked is game-specific evidence | none | Undocumented; version unknown beyond "Preview" |
+| Rosetta observations: AVX masked stores and `vcvtps2ph` stores to write-watched memory hung on macOS 26, handled on 27; `ROSETTA_ADVERTISE_AVX` | `mac/PROGRESS.md`, `mac/run-victory.sh` | skakwy only | Reference | Hypotheses to test with an original workload; no code adopted | none | Unverified; tied to his loader |
+| Native helpers: `mach_vm_remap` aliases as a Wine unixlib (`valias`), Metal zero-copy swizzle | `mac/unixlib/*` | skakwy only; the swizzle credits UTM's d3dmetal-native | **Rejected** | The swizzle acts on D3DMetal internals; Apple's licence section 2D forbids reverse engineering and his notes give D3DMetal struct offsets (`+0x58`, `+0x28c`) found that way. The alias code serves game-memory copy-back | none | Awaiting clarification only for `valias` as a generic Wine unixlib example |
+| Instruction and shader scanner | `mac/scan/*` | skakwy only | **Rejected** | Parses the game's shader pack format and a Rosetta-unsafe instruction census of its image | none | Game-specific |
+| Game-specific loader patches: watchdog stepping, masked-store and MWAIT patching, BCPack placeholder fills | `crates/victory-loader/*`, `mac/PROGRESS.md` | skakwy and others | **Rejected** | Defeats a title's own self-protection and patches a leaked image; never adopted | none | n/a |
+| GPU layer, shader emitters, HLE (`victory-gpu`, `victory-shader`, `victory-hle`, `victory-loader`, `victory-core`) | skakwy commits `ea9da87` to `22b3f8e45a59` on top of Marvis, fxceless, Duff and others (about 260 inherited commits) | Mixed: inherited files carry other authors, and the content is console-game recompilation | **Rejected / requires provenance** | His share is real but inseparable from a runtime whose input is unauthorized; the console-shader work is also native-paused scope | none | File-level provenance would be needed for any future reuse |
+| Run notes (`mac/PROGRESS.md`, `mac/new_agent.md`) | same | skakwy only | Reference | Source of the context above; not copied | none | Contains game-specific detail, not republished |
+
+Counts for this pass: 11 component groups reviewed; 1 integrated (adapted); 0 integrated verbatim; 3 reference or awaiting clarification; 2 unnecessary; 5 rejected (some groups overlap categories above).
+
+### Other repositories, completed
+
+- **VIctory-macOS** (`pragyaangaur/VIctory-macOS`, 215 files): a fork whose README describes running "the Xbox Series build" of one game; PortWatch calls the efforts it tracks builds of a "leaked Xbox Series build". Workflow files `fleet-*.yml` orchestrate an agent fleet, not build or test infrastructure of value here. Its README says it was built "with Claude on a free Claude Pro plan" and asks for sponsorship; irrelevant to reuse. Rejected, unchanged.
+- **PortWatch VI** (portwatch-vi.xyz): its own description says "leaked Xbox Series build of GTA VI". Reference for discovery only, unchanged.
+- **MacBox, ScarlettMac:** see above; unchanged.
+- **ossover CI** (`.github/workflows/ci.yml`): a macOS arm64 runner running `bash -n` over shell scripts, a standard-library Python manifest check with `python3 -I`, and `swift build`/`test`. The two cheap ideas (shell syntax check, isolated-interpreter script) match what `docs_hygiene.py` already does; a `bash -n` step for `scripts/hybrid/*.sh` is a candidate follow-up, not added.
