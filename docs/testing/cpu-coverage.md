@@ -209,9 +209,7 @@ with the following command. This excludes section directives, format comments
 and Rust match arms.
 
 ```sh
-rg -c '^[a-zA-Z0-9_]+:.* =>' crates/loader/tests/cpu_known_answers.rs
-]* =>[^
-]*$' crates/loader/tests/cpu_known_answers.rs
+rg -c '^[A-Za-z0-9_]+:.*=>' crates/loader/tests/cpu_known_answers.rs
 ```
 
 The cache revalidation change in [PR #269](https://github.com/MacosPorters/betterxen/pull/269)
