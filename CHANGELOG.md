@@ -40,6 +40,16 @@ remains unsupported.
 - Added a Python 3 fallback for `timeout` in `scripts/test-gpu.sh`, so the native Metal suite runs on stock macOS without GNU coreutils while preserving bounded execution and the usual timeout exit status.
 
 ### Added
+- Added an opt-in, budgeted staged upload for RGBA8 textures (#144). `MetalRgba8Texture::upload_staged` fills a
+  Private-storage texture through one reused Shared staging buffer that never exceeds a `StagingBudget`. It
+  copies whole-row bands with a blit encoder and reuses the buffer only after the previous command buffer has
+  completed with status Completed. `plan_staged_upload` rejects missing, duplicate or out-of-range mip levels,
+  wrong mip sizes, short row pitches or byte buffers, and budgets smaller than one row, all before any Metal
+  object is created. A blit `read_back` returns any mip as tight RGBA8 bytes. On one Apple M4 under Metal API
+  validation, readback matched independently built patterns for every level of a padded 37×19, six-level
+  texture under four budgets, and matched the existing direct `upload`. Staging is slower than the direct path
+  (2048² with 12 mips, release build: 2.1 ms direct, 2.7 ms with a 4 MiB budget, 17.8 ms with 256 KiB), so
+  `upload` and its callers are unchanged. Not yet independently accepted.
 - The gfx1030 identification benchmark fixture now runs as an ordinary integration test, so workspace tests check LLVM-derived names, families, lengths and byte boundaries without invoking a timing run.
 - Added a CPU benchmark for gfx1030 metadata identification (#173). It verifies instruction boundaries on a mixed-family stream assembled with LLVM and reports first-pass and repeated-pass throughput.
 - Added a Win64 ABI regression showing that a service may write the caller-allocated shadow space. Existing negative controls cover nonvolatile XMM-register corruption; the unchanged-home-slot test now describes its handler rather than implying an ABI preservation requirement.
