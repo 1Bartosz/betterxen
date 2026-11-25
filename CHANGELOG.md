@@ -10,6 +10,7 @@ Guest execution uses original, purpose-built test programs. Commercial Xbox game
 remains unsupported.
 
 ### Changed
+- Removed the contributor avatar section from the README.
 - Added `.github/CODEOWNERS` so pull requests request review from the `MacosPorters/maintainers` team. With the `main` branch rule that requires code-owner review, a maintainer must approve each change before it merges.
 - Repaired destination issue links in 20 migrated PR descriptions while retaining the imported text, attribution and contributor certifications. Template and review requirements remain in place.
 - Moved 163 unused migration PR refs from branches to verified archive tags, retaining the 22 open-PR branches. Historical refs no longer clutter the branch list or produce recent-push PR prompts.

@@ -361,10 +361,6 @@ See the [roadmap table](#development-milestones) for proposed milestones, and th
 
 ---
 
-### Contributors
-
-[![Contributors](https://contrib.rocks/image?repo=MacosPorters/betterxen)](https://github.com/MacosPorters/betterxen/graphs/contributors)
-
 ## License
 
 BetterXen is licensed under the [GNU General Public License v3 or later](LICENSE).
