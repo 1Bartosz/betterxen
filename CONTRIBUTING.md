@@ -44,7 +44,7 @@ Before incorporating third-party code, verify per-file license compatibility wit
 ## Pull requests
 
 - Branch from the current main branch, keep commits focused, and link relevant issues.
-- Fill in every section of the pull request template, keep `Closes #<number>` (or write `No linked issue: <reason>`). Tick the claimed-first and DCO checkboxes only if they are true.
+- Describe what changes and why, link the issue you claimed with `Closes #<number>`, state which checks you actually ran, and disclose material AI assistance. Separate unverified work from supported behavior.
 - Include a clear explanation, tests and any documentation/status updates. Separate unverified work from supported behavior.
 - Disclose material AI assistance and personally review generated changes. AI output is not an authoritative source, test oracle or substitute for independent review.
 - Never include secrets, personal paths, credentials or private data in patches or logs.

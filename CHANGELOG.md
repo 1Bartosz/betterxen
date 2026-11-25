@@ -10,7 +10,7 @@ Guest execution uses original, purpose-built test programs. Commercial Xbox game
 remains unsupported.
 
 ### Removed
-- Removed the "PR template" check (`.github/workflows/pr-template.yml`, `scripts/pr_template_check.py` and its tests) and its CI test step. Pull request descriptions are no longer validated automatically; the template and the claim-first rule in CONTRIBUTING.md still apply to reviewers.
+- Removed the "PR template" check (`.github/workflows/pr-template.yml`, `scripts/pr_template_check.py` and its tests) and its CI test step. Also removed `.github/PULL_REQUEST_TEMPLATE.md`. Pull request descriptions are no longer validated or pre-filled; CONTRIBUTING.md still asks for the same information and the claim-first rule still applies.
 
 ### Changed
 - Replaced our own references to a specific commercial game title (README non-affiliation line, research and integration notes, ignored diagnostics folder names) with generic "commercial title" wording. The ignored folder names are now `diagnostics/title-candidate-*` and `diagnostics/title-check`. Third-party repository names, URLs and code-span paths in research notes are unchanged so their provenance stays accurate. Our own prose references to the upstream project formerly named in the research notes now read "PE-Vulkan project". Added the PortWatch native-macOS research notes. No behavior change.
