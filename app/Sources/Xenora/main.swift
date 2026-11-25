@@ -640,11 +640,42 @@ final class InspectionModel: ObservableObject {
     @Published var busy = false
     @Published var importing = false
 
+    /// Reads and reports one file off the main thread. Replaceable only for the
+    /// `--smoke-inspection-order` check.
+    private let reader: @Sendable (URL) -> (Int32, String)
+    /// Number of the latest `inspect` call. Only that call may publish a result.
+    private var latestRequest: UInt64 = 0
+    /// Reads that have finished, whether their result was published or discarded.
+    /// `--smoke-inspection-order` waits on it instead of on a fixed delay.
+    private(set) var finishedReads: UInt64 = 0
+
+    init(reader: @escaping @Sendable (URL) -> (Int32, String) = InspectionModel.run) {
+        self.reader = reader
+    }
+
+    var failed: Bool { !busy && fileName != nil && status != Int32(XENORA_OK) }
+
     func inspect(_ url: URL) {
+        latestRequest &+= 1
+        let request = latestRequest
         fileName = url.lastPathComponent
+        report = ""
+        status = Int32(XENORA_OK)
         busy = true
+        let reader = reader
         Task {
-            let (newStatus, newReport) = await Task.detached { InspectionModel.run(url) }.value
+            // The read blocks on file I/O (and, in `--smoke-inspection-order`, on
+            // its gate), so it runs on a Dispatch queue instead of occupying a
+            // Swift concurrency worker that other tasks may need.
+            let (newStatus, newReport) = await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(returning: reader(url))
+                }
+            }
+            finishedReads &+= 1
+            // A newer selection owns the published state, including `busy`;
+            // an older read that finishes late is discarded.
+            guard request == latestRequest else { return }
             status = newStatus
             report = newReport
             busy = false
@@ -696,6 +727,10 @@ struct InspectorView: View {
             }
             if let name = model.fileName {
                 LabeledContent("File", value: model.busy ? "\(name) (inspecting…)" : name)
+                if model.failed {
+                    Text("Inspection of \(name) failed (status \(model.status)).")
+                        .foregroundStyle(.red)
+                }
                 ScrollView {
                     Text(model.report)
                         .font(.system(.caption, design: .monospaced))
@@ -1007,6 +1042,93 @@ if CommandLine.arguments.contains("--smoke-frame") {
     let frame = GuestFrame.run()
     print(frame.summary)
     exit(frame.status == XENORA_OK ? 0 : 1)
+}
+
+// `--smoke-inspection-order` checks that only the latest selection publishes an
+// inspection result. Files are never read: an injected reader blocks until the check
+// releases that file, so the check, not timing, decides which read finishes first.
+// It needs no GPU.
+if CommandLine.arguments.contains("--smoke-inspection-order") {
+    final class ReadGates: @unchecked Sendable {
+        private let lock = NSLock()
+        private var gates: [String: DispatchSemaphore] = [:]
+        func gate(_ name: String) -> DispatchSemaphore {
+            lock.lock()
+            defer { lock.unlock() }
+            if let gate = gates[name] { return gate }
+            let gate = DispatchSemaphore(value: 0)
+            gates[name] = gate
+            return gate
+        }
+        func release(_ name: String) { gate(name).signal() }
+    }
+    let gates = ReadGates()
+    // "<scenario>-<a|b>-<ok|fail>"; a gate that is never released times out
+    // instead of hanging, and the check then fails on its own deadline.
+    let reader: @Sendable (URL) -> (Int32, String) = { url in
+        let name = url.lastPathComponent
+        _ = gates.gate(name).wait(timeout: .now() + 10)
+        let status = name.hasSuffix("-ok") ? Int32(XENORA_OK) : Int32(XENORA_INVALID_ARGUMENT)
+        return (status, "report \(name)")
+    }
+    func file(_ name: String) -> URL { URL(fileURLWithPath: "/nonexistent/\(name)") }
+
+    Task { @MainActor in
+        var failures: [String] = []
+        // Waits for the model to finish `count` reads. The deadline only bounds the
+        // check; the order of completions is set by releasing gates.
+        @MainActor func settle(_ model: InspectionModel, _ count: UInt64, _ label: String) async -> Bool {
+            let deadline = Date().addingTimeInterval(5)
+            while model.finishedReads < count {
+                if Date() > deadline {
+                    failures.append("\(label): read \(count) did not finish")
+                    return false
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000)
+            }
+            return true
+        }
+        @MainActor func expect(_ model: InspectionModel, _ name: String, busy: Bool, report: String, ok: Bool, _ label: String) {
+            let actual = "file=\(model.fileName ?? "-") busy=\(model.busy) status=\(model.status) report=\(model.report)"
+            if model.fileName != name || model.busy != busy || model.report != report
+                || (model.status == Int32(XENORA_OK)) != ok {
+                failures.append("\(label): \(actual)")
+            }
+        }
+        // The newer read finishes first; the older one finishes afterwards and must
+        // change nothing, whatever its outcome.
+        for (scenario, first, second, ok) in [("s1", "a-ok", "b-ok", true), ("s2", "a-fail", "b-ok", true),
+                                              ("s3", "a-ok", "b-fail", false)] {
+            let (older, newer) = ("\(scenario)-\(first)", "\(scenario)-\(second)")
+            let model = InspectionModel(reader: reader)
+            model.inspect(file(older))
+            model.inspect(file(newer))
+            gates.release(newer)
+            if await settle(model, 1, "\(older) then \(newer)") {
+                expect(model, newer, busy: false, report: "report \(newer)", ok: ok, "\(newer) finished")
+            }
+            gates.release(older)
+            if await settle(model, 2, "\(older) then \(newer)") {
+                expect(model, newer, busy: false, report: "report \(newer)", ok: ok, "stale \(older) finished")
+            }
+        }
+        // The older read finishes first and must not clear the newer request's busy state.
+        let model = InspectionModel(reader: reader)
+        model.inspect(file("s4-a-ok"))
+        model.inspect(file("s4-b-fail"))
+        gates.release("s4-a-ok")
+        if await settle(model, 1, "s4") {
+            expect(model, "s4-b-fail", busy: true, report: "", ok: true, "stale s4-a-ok finished first")
+        }
+        gates.release("s4-b-fail")
+        if await settle(model, 2, "s4") {
+            expect(model, "s4-b-fail", busy: false, report: "report s4-b-fail", ok: false, "s4-b-fail finished")
+        }
+        for failure in failures { print("smoke-inspection-order: FAILED \(failure)") }
+        print("smoke-inspection-order: \(failures.isEmpty ? "ok" : "\(failures.count) failed")")
+        exit(failures.isEmpty ? 0 : 1)
+    }
+    dispatchMain()
 }
 
 // `--smoke` prints the probe and exits without opening a window, for scripts and CI.
