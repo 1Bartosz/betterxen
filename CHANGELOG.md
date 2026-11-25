@@ -9,6 +9,9 @@ exact revision and known limitations.
 Guest execution uses original, purpose-built test programs. Commercial Xbox game execution
 remains unsupported.
 
+### Added
+- Added a fast "Repository hygiene" check (`.github/workflows/hygiene.yml`, `scripts/audit/docs_hygiene.py`). It runs on Ubuntu without a Rust toolchain or network access and fails only on merge-conflict markers, broken relative Markdown links and invalid workflow YAML in tracked files. A separate advisory step warns, without failing, when source or script changes have no changelog entry. A local run over the 626 tracked files found no problems, and planted failures of each kind were caught; it has not yet run on GitHub.
+
 ### Removed
 - Removed the "PR template" check (`.github/workflows/pr-template.yml`, `scripts/pr_template_check.py` and its tests) and its CI test step. Also removed `.github/PULL_REQUEST_TEMPLATE.md`. Pull request descriptions are no longer validated or pre-filled; CONTRIBUTING.md still asks for the same information and the claim-first rule still applies.
 
