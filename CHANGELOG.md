@@ -10,6 +10,7 @@ Guest execution uses original, purpose-built test programs. Commercial Xbox game
 remains unsupported.
 
 ### Changed
+- Added `.github/CODEOWNERS` so pull requests request review from the `MacosPorters/maintainers` team. With the `main` branch rule that requires code-owner review, a maintainer must approve each change before it merges.
 - Moved 163 unused migration PR refs from branches to verified archive tags, retaining the 22 open-PR branches. Historical refs no longer clutter the branch list or produce recent-push PR prompts.
 - Renamed the project branding and native app and primary CLI package/binary to BetterXen (`betterxen`), and updated active repository links to `MacosPorters/betterxen`. Legacy `xenora-*` library packages and synthetic guest ABI names remain for compatibility. Upstream licenses, notices and historical evidence are retained.
 - Guest `strlen`, `strnlen`, `wcslen` and `wcsnlen` scan memory in 256-unit blocks, falling back to single units at mapping boundaries so faults still report the first inaccessible unit. On Apple M2 Pro the 63-byte `strlen` workload went from 1,990 ns to 223 ns per call (median of 10 batches, on a machine that was not idle).
