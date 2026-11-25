@@ -1,14 +1,3 @@
-## Agent Spawning
-
-When asked to spawn agents or perform multi-agent tasks, use the Swarm MCP extension:
-
-- `mcp__Swarm__Spawn` - Spawn agents (codex, cursor, claude)
-- `mcp__Swarm__Status` - Check agent status
-- `mcp__Swarm__Read` - Read agent output
-- `mcp__Swarm__Stop` - Stop agents
-
-Do NOT use built-in Claude Code agents (Task tool with Explore/Plan subagent_type) when Swarm agents are requested.
-
 # BetterXen engineering rules
 
 These rules apply to every contributor and coding agent. They were rewritten on the `planning/hybrid-first-transition` branch when BetterXen moved from native-first to CrossOver-based hybrid development. `CLAUDE.md` is a symlink to this file. The decision is recorded in `docs/adr/0005-crossover-hybrid-direction.md`; the plan is `docs/roadmap.md`.
