@@ -113,22 +113,25 @@ repeated here except where the map adds evidence.
 
 All commands ran on Apple M5, macOS 26.6.2, native arm64, Rust
 `1.100.0-aarch64-apple-darwin` (the revision CI pins), `CARGO_BUILD_JOBS=2`,
-in one run against source at `d26af53` (2026-11-25). The table below
-preserves the counts from that revision. Recorded evidence commands:
+one run, on the branch holding this change, based on upstream `main` at
+`b2654e9` (2026-11-25, including the merged DBT cache-identity fix).
+Recorded evidence commands:
 
 ```sh
 python3 crates/loader/generate_x86.py validate   # 213 operations, 403 forms, 498 opcode slots
 python3 crates/loader/generate_x86.py --check    # x86_table.rs is fresh
 PYTHONPATH=scripts python3 -m qa cpu-inventory   # advisory partitions, cross-checked below
-cargo test --locked --workspace                  # 113 result lines: 971 passed, 0 failed, 35 ignored
+cargo test --locked --workspace                  # 116 result lines: 1015 passed, 0 failed, 34 ignored
 ```
 
 The registry numbers are the generator's own count, not a hand count. The
 advisory `qa cpu-inventory` output was cross-checked against the code before
 use, and one stale row is called out under "Intentionally rejected forms".
-Ignored tests are not passes; every ignore in the run is a Metal-gated test
-(run by `scripts/test-gpu.sh`), a manual timing profile, or the one known DBT
-defect test, named below.
+Ignored tests are not passes; at this revision every ignore is one of three
+kinds, each named by its own ignore message: a Metal-gated test (run by
+`scripts/test-gpu.sh`), an LLVM-gated test (`requires LLVM with the gfx1030
+AMDGPU target`, five of them), or a manual timing/profile run that demands an
+idle host (three of them).
 
 ## Declared instruction inventory
 
@@ -151,21 +154,21 @@ are covered form by form in `tests/cpu_rep.rs` and the loop tests).
 
 ## Engine path per operation
 
-Of the 213 declared operations, **93 have an ARM64 lowering** for at least
-one form and **119 use the shared interpreter semantics for every translated
-form**. Calls to those semantics count toward
-`DbtMetrics::interpreter_fallbacks`. The remaining operation, `SYSCALL`,
-decodes but `is_translatable` refuses it in the DBT. For operations with an
-ARM64 lowering, `is_native` in `crates/loader/src/dbt.rs` applies these
-form-specific rules:
+Every one of the 213 operations runs in exactly one primary path in the native
+DBT: **93 are lowered to ARM64** by `is_native` in
+`crates/loader/src/dbt.rs`, and **120 use the shared interpreter semantics**
+through a helper call, counted in `DbtMetrics::interpreter_fallbacks`.
+`SYSCALL` is decoded but the DBT refuses to translate it (`is_translatable`),
+so it ends translated execution. The conditional gates inside `is_native`
+matter when reading the split:
 
 - `ADD`, `SUB`, `CMP`, `AND`, `OR`, `XOR`, `TEST`, `INC`, `DEC`, `NEG`, `NOT`
   and `CMOV` are native only at 32- and 64-bit width; 8- and 16-bit forms use
   the shared semantics.
 - `ADC` and `SBB` are native only for register and immediate operands; a memory
   destination stays on the helper path.
-- `BT` is native only in the `0F A3` register-index form. The `0F BA /4`
-  immediate-index form uses the helper and can read a memory operand.
+- `BT` is native only in the `0F A3` register-index form; the `0F BA`
+  immediate-index form can write memory and stays on the helper path.
 - `BSF` and `BSR` are native at 16/32/64-bit width.
 - `POP` is native only in the opcode-register form.
 
@@ -183,7 +186,7 @@ passed/ignored). Expectation sources are named so independence can be judged.
 | `x86_integer.rs` + `x86/integer.txt` (1230 fixture lines) | LLVM-assembled encodings; byte-level references written from the SDM/APM operation text, independent of the production semantics | 16 passed, 0 failed |
 | `x86_vector.rs` + `x86/vector.txt` (374 lines) | same method, SSE2 packed forms | 9 passed |
 | `x86_float.rs` + `x86/float.txt` (172), `x86/float_vectors.txt` (6824), `x86/float_reference.py` | exact-fraction reference computed by script, following SDM Vol. 1 floating-point rules | 9 passed |
-| `cpu_known_answers.rs` (50 tests, 1019 case lines) | Intel SDM and AMD APM sections cited per case; both engines run each case | 49 passed, 1 ignored |
+| `cpu_known_answers.rs` (50 tests, 1019 case lines) | Intel SDM and AMD APM sections cited per case; both engines run each case | 50 passed, 0 ignored |
 | `movsxd.rs` | SDM operation text; modular arithmetic in the test; LLVM-assembled encodings | 9 passed |
 | `x86_atomic.rs` | SDM LOCK/XADD/CMPXCHG rules; both compare outcomes, unaligned operands, faults | 5 passed |
 | `x86_carry_chain.rs` | widening `u128`/`i128` reference arithmetic on 256-bit chains | 8 passed |
@@ -196,13 +199,16 @@ passed/ignored). Expectation sources are named so independence can be judged.
 | `memory_page_boundaries.rs`, `memory_validation.rs` | mapping/permission/boundary contracts | 8 + 9 passed |
 | `generated_conformance.rs`, `bootstrap.rs`, `gate_a1.rs`, `gate_a2.rs`, `indirect_control.rs`, `bswap.rs`, `dbt_render.rs`, `process_exit.rs` | per-file documented contracts (generated conformance vectors, startup gates, control flow) | all passed except one Metal-gated ignore in `dbt_render.rs` |
 
-At `d26af53`, the one ignore in `cpu_known_answers.rs` was
-`defect_dbt_executes_modified_code_after_a_jump`, the known DBT defect that
-kept a translated block after the guest rewrote its code. The cache
-revalidation change in [PR #269](https://github.com/MacosPorters/betterxen/pull/269)
-restored the test as `dbt_executes_modified_code_after_a_jump`. The other
-loader ignores in the recorded run were Metal-gated tests and one manual TLS
-timing profile.
+The former defect test `defect_dbt_executes_modified_code_after_a_jump` —
+`dbt_executes_modified_code_after_a_jump` since the fix — used to be the one
+ignored test in `cpu_known_answers.rs`, recording that the DBT kept a stale
+translation after the guest rewrites its code. The cache-identity change has
+merged (issue #79, pull #269), and in this run the test executes and passes in
+both DBT engines, so the target reports 50 passed and 0 ignored. The loader
+package's
+remaining ignores are the Metal-gated tests named above plus three manual
+timing/profile runs (TLS template, relocation, warm data memory); none is
+counted as a pass.
 
 ## Operations covered by model tests instead of the fixture corpus
 
