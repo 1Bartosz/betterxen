@@ -13,7 +13,9 @@ critical path and completion criteria; see [ADR 0005](adr/0005-crossover-hybrid-
 for the decision and [project board setup](planning/project-board.md). Native work is
 paused: [deferred native roadmap](research/native-roadmap.md) and the archived
 [native-first plan](archive/development-phases-native-first.md) with
-[retired milestones](archive/native-first-milestones.json). Research inputs: the [upstream research registry](research/upstream-registry.md) and
+[retired milestones](archive/native-first-milestones.json), the
+[native issue archive](research/native-issue-archive.md) and the retired
+[H0 to H7 breakdown](archive/hybrid-phases-h0-h7.md). Research inputs: the [upstream research registry](research/upstream-registry.md) and
 [component reuse matrix](research/component-reuse-matrix.md). Historical phase
 checkpoints retain their original evidence scope.
 

@@ -1,6 +1,6 @@
 name: Hybrid engineering task
 description: Integration, configuration, diagnostics or tooling around CrossOver.
-title: "[H?] "
+title: "task: "
 labels: [track: hybrid]
 body:
   - type: markdown
