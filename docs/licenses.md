@@ -120,12 +120,12 @@ The hybrid direction relies on an externally installed CrossOver. Nothing below 
 
 | Component | License read | Distribution model | Notes |
 |---|---|---|---|
-| CrossOver (product) | Proprietary; the EULA text was not located | External install | The FOSS source page publishes the 26.3.0 tarball and lists the open-source projects, not the product terms |
+| CrossOver (product) | Proprietary EULA; FOSS components keep their licenses | External install | [EULA](https://www.codeweavers.com/crossover/eula) §2 permits building alternate Wine and does not supersede FOSS licenses; §3 restricts reverse engineering and redistribution. The source page lists Wine, Vkd3d, DXVK and MoltenVK, not DXMT or VKD3D-Proton |
 | Wine | LGPL-2.1-or-later | External | `either version 2.1 … or any later version` |
-| DXMT | LGPL-2.1-or-later | External | Copyright 2023–2026 Feifan He for CodeWeavers |
+| DXMT | LGPL-2.1-or-later; releases up to v0.80 were MIT (`LICENSE.OLD`) | External | Copyright 2023-2026 Feifan He for CodeWeavers |
 | DXVK | zlib | External | Retain the notice if ever distributed |
 | VKD3D-Proton | LGPL-2.1-or-later | External | Source headers carry the `or later` grant |
-| MoltenVK | Apache-2.0 | External | Compatible with GPL-3.0, not GPL-2.0; `NOTICE` obligations if distributed |
+| MoltenVK | Apache-2.0 | External | Compatible with GPL-3.0, not GPL-2.0; no `NOTICE` file at the pinned revision |
 | D3DMetal | Unverified: a third-party copy of the 4.0 `License.pdf` was reported; Apple's own copy was not read | User-supplied only; never bundled | The reported terms are non-commercial and no reverse engineering; the Apache-2.0 Game Porting Toolkit repository is not the D3DMetal license |
 | Rosetta 2 | Unknown; Apple's license text was not read | External OS component | Never redistributed |
 
