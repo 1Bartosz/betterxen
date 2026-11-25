@@ -16,7 +16,8 @@ paused: [deferred native roadmap](research/native-roadmap.md) and the archived
 [retired milestones](archive/native-first-milestones.json), the
 [native issue archive](research/native-issue-archive.md) and the retired
 [H0 to H7 breakdown](archive/hybrid-phases-h0-h7.md). Research inputs: the [upstream research registry](research/upstream-registry.md) and
-[component reuse matrix](research/component-reuse-matrix.md). Historical phase
+[component reuse matrix](research/component-reuse-matrix.md), with their
+[independent review](research/upstream-registry-review.md). Historical phase
 checkpoints retain their original evidence scope.
 
 ## Architecture and technical design
