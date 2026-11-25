@@ -9,6 +9,9 @@ exact revision and known limitations.
 Guest execution uses original, purpose-built test programs. Commercial Xbox game execution
 remains unsupported.
 
+### Removed
+- Removed the "PR template" check (`.github/workflows/pr-template.yml`, `scripts/pr_template_check.py` and its tests) and its CI test step. Pull request descriptions are no longer validated automatically; the template and the claim-first rule in CONTRIBUTING.md still apply to reviewers.
+
 ### Changed
 - Replaced our own references to a specific commercial game title (README non-affiliation line, research and integration notes, ignored diagnostics folder names) with generic "commercial title" wording. The ignored folder names are now `diagnostics/title-candidate-*` and `diagnostics/title-check`. Third-party repository names, URLs and code-span paths in research notes are unchanged so their provenance stays accurate. Our own prose references to the upstream project formerly named in the research notes now read "PE-Vulkan project". Added the PortWatch native-macOS research notes. No behavior change.
 - TLS setup now copies templates from 64 KiB up to 1 MiB straight into the zeroed thread data block, after checking that every template byte is readable, instead of staging them in a second buffer (#111). The pointer array and data block layout, the TLS index write and the error for an unreadable template are unchanged, and nothing is mapped when the template cannot be read. On an Apple M2 Pro, median setup time for original synthetic templates over 31 interleaved samples fell by 21.7 % at 64 KiB, 19.0 % at 256 KiB and 14.2 % at 768 KiB. Smaller and larger templates keep the single staged read and showed no change beyond run-to-run variation.
