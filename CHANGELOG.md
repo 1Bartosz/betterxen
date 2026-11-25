@@ -33,6 +33,7 @@ remains unsupported.
 - Extended the read-only RDNA2 planning CLI (`python3 -m qa rdna2`) with family/status filters, compact summaries, Codex-ready manifests under `artifacts/`, active-claim exclusion (family claims exclude those families; path-only claims block overlapping permitted files), coverage reconcile against `semantic_coverage` without inflating counts, and inventory diffs. Covered by `tests/qa/test_rdna2_plan.py`; planning only, no GPU production edits.
 
 ### Fixed
+- Gate A2 checks the cross-compiler driver before invoking it, then checks its helpers before fixture compilation. CI also verifies the driver architecture before requesting its version.
 - Non-canonical 64-bit guest data addresses now raise `#GP` instead of a memory fault in both the interpreter and native DBT, including accesses that cross the canonical-address boundary. The synthetic architectural test is enabled again.
 - An instruction longer than 15 bytes now stops both engines with a general-protection fault instead of an illegal-instruction exit (#384; Intel SDM Vol. 3A, 7.15). The decoder still stops before fetching a 16th byte, and the DBT translates the faulting instruction on its own so the instructions before it in a block complete first. The `defect_overlong_instruction` known answer from #155 is now verified, with three more cases.
 - Made the native semantic-review timeout in `scripts/test-gpu.sh` configurable with `XENORA_SEMANTIC_TIMEOUT` and raised its default from 120 to 300 seconds, so cold Apple Silicon runs do not fail while the expanded Metal known-answer suite is still progressing.
@@ -128,6 +129,8 @@ remains unsupported.
 - Added closed-file moves and file and directory attribute queries on the synthetic guest drive.
 
 - Added nested guest directories and checked file deletion on the synthetic drive.
+
+- Added the second Gate A milestone, A2 (#419): an original hosted C program, `tests/compat_fixtures/gate_a2.c`, built from source by the new test `crates/loader/tests/gate_a2.rs` with the mingw-w64 C runtime (UCRT) and run through the loader, the standard services and the ARM64 DBT. The runtime's own startup code runs before `main`. The program takes `argc` and `argv`, sorts heap data with `qsort`, prints with `printf`, writes a report with `fprintf` and reads it back with `fgets`, registers a function with `atexit` and returns from `main`. At `-O0`, `-O1`, `-O2` and `-Os` it ends with exit status 0, and its captured output and its report match, byte for byte, text recomputed in Rust. Seven more tests cover other arguments, four wrong command lines, a step budget that is too small, and control variants that end in a failed check, in `exit(42)` and in `abort()`. The test needs mingw-w64 on the host and fails, not skips, without it, so the CI workflow now installs it. Nothing from mingw-w64 is stored in the repository. Local runs used mingw-w64 14.0.0 with GCC 16.2.0. This is one program and one C runtime, compared by hand with a native build of the same source and not with Windows or x86 hardware; `docs/testing/gate-a.md` lists what it does not show. Awaiting independent review.
 
 - Added file seeking and end-of-file resizing on the synthetic guest drive.
 
