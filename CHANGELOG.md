@@ -38,6 +38,8 @@ remains unsupported.
 - Added a Python 3 fallback for `timeout` in `scripts/test-gpu.sh`, so the native Metal suite runs on stock macOS without GNU coreutils while preserving bounded execution and the usual timeout exit status.
 
 ### Added
+- The gfx1030 identification benchmark fixture now runs as an ordinary integration test, so workspace tests check LLVM-derived names, families, lengths and byte boundaries without invoking a timing run.
+- Added a CPU benchmark for gfx1030 metadata identification (#173). It verifies instruction boundaries on a mixed-family stream assembled with LLVM and reports first-pass and repeated-pass throughput.
 - Added a Win64 ABI regression showing that a service may write the caller-allocated shadow space. Existing negative controls cover nonvolatile XMM-register corruption; the unchanged-home-slot test now describes its handler rather than implying an ABI preservation requirement.
 - Added a BetterXen development phase plan based on current source, pending PRs and existing acceptance records, linked from both contributor entry points. It separates baseline reconciliation, hosted C execution, guest threading, translated rendering, application integration and measured optimization; no new runtime or compatibility acceptance is claimed.
 - Added `tests/runtime_clock.rs`, which reads the performance counter, its frequency, both tick counts, the unbiased interrupt time and the system time from one injected clock and checks that they report the same elapsed time in their own units, after a host advance and after a guest `Sleep`, and that none of them decreases up to and past the end of the clock (#204). Expected values are worked out by hand from the documented units. Timed waits still return without consuming clock time.
