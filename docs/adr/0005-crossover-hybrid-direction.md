@@ -15,7 +15,7 @@ BetterXen was developed native-first: an independent x86-64 decoder, interpreter
 
 ## Proposed technical architecture (not accepted)
 
-BetterXen provides integration, configuration, environment management, diagnostics, reproducible testing, benchmarking and measured optimization around CrossOver. Within CrossOver, the intended layers are Wine-based runtime APIs, Rosetta 2 for x86-64 translation and D3DMetal or DXMT for graphics, on Apple Silicon (ARM64, Metal, unified memory). The exact responsibility boundary is decided in #351.
+BetterXen provides integration, configuration, environment management, diagnostics, reproducible testing, benchmarking and measured optimization around CrossOver. Within CrossOver, the intended layers are Wine-based runtime APIs, Rosetta 2 for x86-64 translation and D3DMetal or DXMT for graphics, on Apple Silicon (ARM64, Metal, unified memory). The exact responsibility boundary is decided in #351, at the end of Phase 1.
 
 ## Unverified integration assumptions
 
@@ -27,6 +27,10 @@ BetterXen provides integration, configuration, environment management, diagnosti
 ## Verified implementation capabilities
 
 None for the hybrid architecture. Verified native-research capabilities (synthetic evidence only) are unchanged and listed in `docs/progress.md`.
+
+## Planning consequence
+
+Planning is progressive: Phase 1 (research, feasibility and baseline) is the only active phase; later phases are provisional and defined from its findings. Native work is paused indefinitely.
 
 ## Consequences
 

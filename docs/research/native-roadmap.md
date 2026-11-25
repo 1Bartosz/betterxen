@@ -1,6 +1,6 @@
 # Native research roadmap
 
-**Deferred — not part of the active development roadmap.** The active direction is the [CrossOver-based hybrid roadmap](../roadmap.md). Native work resumes only after an explicit maintainer decision, with no date.
+**Deferred — not part of the active development roadmap, and paused indefinitely.** The active direction is the [CrossOver-based hybrid roadmap](../roadmap.md). Native work resumes only after an explicit maintainer decision, with no date. Native tasks needed by hybrid work are filed as focused hybrid issues instead.
 
 ## Existing implementation (preserved in the workspace)
 
@@ -16,7 +16,7 @@ See the archived [native-first plan](../archive/development-phases-native-first.
 
 ## Previously planned work
 
-The native-first phases 1 to 6 (trustworthy baseline, hosted C application, threaded behavior, translated rendering, integrated interactive application, measured bottlenecks) and the X1 to X25 capability map, kept in the archive. About 110 open GitHub issues carry `track: native` and `status: deferred`.
+The native-first phases 1 to 6 (trustworthy baseline, hosted C application, threaded behavior, translated rendering, integrated interactive application, measured bottlenecks) and the X1 to X25 capability map, kept in the archive. The issue backlog was closed as not planned and is indexed, with preserved findings, in the [native issue archive](native-issue-archive.md).
 
 ## Potential future architecture
 
