@@ -132,14 +132,12 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn mixed_llvm_fixture_preserves_names_families_lengths_and_boundaries() {
-        let block: Vec<u8> = FIXTURE
+        let block: Vec<u8> = super::FIXTURE
             .iter()
             .flat_map(|(_, _, words)| words.iter().flat_map(|word| word.to_le_bytes()))
             .collect();
-        verify(&block.repeat(COPIES));
+        super::verify(&block.repeat(super::COPIES));
     }
 }
