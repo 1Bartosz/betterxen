@@ -126,7 +126,7 @@ The hybrid direction relies on an externally installed CrossOver. Nothing below 
 | DXVK | zlib | External | Retain the notice if ever distributed |
 | VKD3D-Proton | LGPL-2.1-or-later | External | Source headers carry the `or later` grant |
 | MoltenVK | Apache-2.0 | External | Compatible with GPL-3.0, not GPL-2.0; `NOTICE` obligations if distributed |
-| D3DMetal | Unknown; the framework license was not located | User-supplied only; never bundled | The Apache-2.0 Game Porting Toolkit repository is not the D3DMetal license |
+| D3DMetal | Unverified: a third-party copy of the 4.0 `License.pdf` was reported; Apple's own copy was not read | User-supplied only; never bundled | The reported terms are non-commercial and no reverse engineering; the Apache-2.0 Game Porting Toolkit repository is not the D3DMetal license |
 | Rosetta 2 | Unknown; Apple's license text was not read | External OS component | Never redistributed |
 
 Details, exact sources and the missing documents are in [research/crossover-licensing.md](research/crossover-licensing.md).

@@ -28,7 +28,7 @@ starting point; it does not approve one.
 | VKD3D-Proton | `master`, read 2026-11-25 | LGPL-2.1-or-later | [`LICENSE`](https://raw.githubusercontent.com/HansKristian-Work/vkd3d-proton/master/LICENSE), source headers | Not bundled or linked today | The source headers carry the "either version 2.1 … or any later version" grant; the `LICENSE` file is the LGPL 2.1 text |
 | MoltenVK | `main`, read 2026-11-25 | Apache-2.0 | [`LICENSE`](https://raw.githubusercontent.com/KhronosGroup/MoltenVK/main/LICENSE) | Not bundled or linked today | Apache-2.0 is compatible with GPL-3.0 but not GPL-2.0; `NOTICE` obligations apply if it is ever distributed |
 | Apple Game Porting Toolkit repository | `main`, read 2026-11-25 | Apache-2.0 | [`LICENSE`](https://raw.githubusercontent.com/apple/game-porting-toolkit/main/LICENSE) | Not bundled | This is the repository's license for its porting resources. It is not the license for the separately distributed D3DMetal framework |
-| D3DMetal | Game Porting Toolkit download | Unknown: the framework license text was not located or read | — | User-supplied only; never bundled | Do not treat the repository's Apache-2.0 license as D3DMetal's. The missing document is the license shipped with the Game Porting Toolkit download |
+| D3DMetal | Game Porting Toolkit 4.0, reported | Unconfirmed: a third-party copy of the 4.0 `License.pdf` was read outside this repository; Apple's own download was not read | — | User-supplied only; never bundled | Reported (evidence class D, not confirmed against Apple's copy): a personal licence to install, use and test for developing, testing or evaluating games on Apple hardware, distribution solely for non-commercial purposes, no use on non-Apple hardware, Framework and Redistributables not separable, and no reverse engineering (sections 2A, 2C, 2D). The missing document is Apple's own copy in the Game Porting Toolkit download. Do not treat the repository's Apache-2.0 license as D3DMetal's |
 | Rosetta 2 | macOS feature | Unknown: Apple's applicable software license was not read | [Apple Rosetta documentation](https://developer.apple.com/documentation/apple-silicon/about-the-rosetta-translation-environment) | External OS component; not bundled | The documentation describes the translation environment; it is not the license grant |
 
 ## Compatibility with GPL-3.0-or-later
@@ -44,6 +44,10 @@ Two rows cannot be reasoned about from the licenses available here: the CrossOve
 product terms and D3DMetal. Neither may be bundled, linked or copied until its
 actual license text has been read and recorded.
 
+GPL-2.0-only components cannot be combined into this GPL-3.0-or-later workspace.
+A comment on this issue identified MacBox and ScarlettMac as GPL-2.0; they are
+not part of the component list above and this note does not rely on them.
+
 ## Unknowns and the exact missing documents
 
 - **CrossOver product EULA.** The CodeWeavers legal pages checked on 2026-11-25
@@ -51,8 +55,12 @@ actual license text has been read and recorded.
   cover redistribution, reverse engineering and bundling before relying on any
   product-level permission.
 - **D3DMetal license.** It ships with the Game Porting Toolkit download; that
-  download was not made. The `apple/game-porting-toolkit` repository is
-  Apache-2.0 and does not establish the framework's terms.
+  download was not made. A third-party copy of the 4.0 `License.pdf` was
+  reported to this issue with a section-level summary, but it is not Apple's
+  copy and stays evidence class D. The `apple/game-porting-toolkit` repository is
+  Apache-2.0 and does not establish the framework's terms. Confirm the summary
+  against Apple's own copy before relying on it; until then D3DMetal is
+  user-supplied and never bundled.
 - **Rosetta 2 terms.** Apple's license text was not read. Rosetta 2 stays an
   external macOS component and is never redistributed by BetterXen.
 - **Exact revisions.** Upstream files were read at `master`/`main` on
