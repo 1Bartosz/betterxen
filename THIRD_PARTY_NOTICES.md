@@ -2,6 +2,8 @@
 
 The active BetterXen Rust workspace (`Cargo.toml` / `Cargo.lock`) currently has **zero external crates.io dependencies** and is original `GPL-3.0-or-later` source.
 
+`bx-cli` links the unmodified `libc` 0.2.191 crate (`ccc2ff4aaab962f7fde7b8edda7379c045b1ca12`) for POSIX process groups and signals, under its MIT option. Preserve the Rust Project Developers notice and permission text.
+
 ## External Host Tools & Runtime Dependencies (Never Bundled)
 
 | Component | Role | Licensing & Provenance |

@@ -1,19 +1,27 @@
 //! Track A (M1-A1): Native ARM64 macOS CLI for BetterXen hybrid execution.
 
+mod supervise;
+
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use bx_probe::{ShimTrack, classify_dll, probe_pe32_plus};
 use bx_telemetry::summarize_jsonl;
 use dxbc_accc::inspect_dxbc;
+use supervise::{Outcome, Stop};
 
 const SHIM_DLL_OVERRIDES: &str = "bx_runtime_veh,d3d12_xs,xg_xs,xmem,XCRDAPI,xgameruntime,AcpHal,xapu,chad,GameInput,\
 api-ms-win-core-psm-appnotify-l1-1-0,api-ms-win-core-psm-appnotify-l1-1-1,\
 ext-ms-win-rtcore-ntuser-message-l1-1-0,ext-ms-win-rtcore-ntuser-message-ansi-l1-1-0,\
 ext-ms-win-rtcore-ntuser-window-l1-1-0,ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0=n,b";
+
+/// Accepted `--backend` values. CrossOver ignores an unknown value silently, so one is refused.
+const BACKENDS: [&str; 4] = ["d3dmetal", "dxmt", "dxvk", "wined3d"];
 
 const SAFE_CHILD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
@@ -39,7 +47,8 @@ fn print_usage() {
            bx-cli probe <pe32+_path>             Classify PE32+ imports by BetterXen track (A-E)\n\
            bx-cli shader <dxbc_blob_path>        Classify a DXBC shader container (DXIL vs ACCC/FSPX)\n\
            bx-cli trace <log.jsonl>              Summarize bx_runtime_veh JSONL diagnostics\n\
-           bx-cli run --exe <path> [--shims <dir>] [--bottle <name> | --prefix <dir>] [--profile lockhart|anaconda] [--log <path>] [--inherit-env]\n"
+           bx-cli run --exe <path> [--shims <dir>] [--bottle <name> | --prefix <dir>] [--profile lockhart|anaconda] [--log <path>] [--inherit-env] [--timeout <secs>] [--backend d3dmetal|dxmt|dxvk|wined3d (needs --bottle)]\n\
+           (shims default to build-shims/bin; a timeout or signal stops the whole bottle or prefix)\n"
     );
 }
 
@@ -171,20 +180,29 @@ fn cmd_trace(path: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let summary = summarize_jsonl(&text);
-    println!("Trace events     : {}", summary.total_lines);
-    println!(
+    print!("{}", render_trace(&text));
+    ExitCode::SUCCESS
+}
+
+fn render_trace(text: &str) -> String {
+    let mut out = String::new();
+    let summary = summarize_jsonl(text);
+    let _ = writeln!(out, "Trace events     : {}", summary.total_lines);
+    let _ = writeln!(
+        out,
         "{}",
         format_clwb_line(summary.clwb_events, summary.clwb_trap_lower_bound)
     );
-    println!("ADX illegal ops  : {}", summary.adx_errors);
+    let _ = writeln!(out, "ADX illegal ops  : {}", summary.adx_errors);
     if !summary.unhandled_exceptions.is_empty() {
-        println!(
+        let _ = writeln!(
+            out,
             "\nUnhandled exceptions ({}):",
             summary.unhandled_exceptions.len()
         );
         for crash in summary.unhandled_exceptions {
-            println!(
+            let _ = writeln!(
+                out,
                 "  code={} module_base={} + RVA={} RIP={}",
                 crash.exception_code.as_deref().unwrap_or("unknown"),
                 crash.module_base.as_deref().unwrap_or("unknown"),
@@ -194,18 +212,18 @@ fn cmd_trace(path: &str) -> ExitCode {
         }
     }
     if !summary.unimpl_apis.is_empty() {
-        println!("\nUnimplemented APIs:");
+        let _ = writeln!(out, "\nUnimplemented APIs:");
         for (api, count) in summary.unimpl_apis {
-            println!("  {count:5}x  {api}");
+            let _ = writeln!(out, "  {count:5}x  {api}");
         }
     }
     if !summary.unimpl_vtables.is_empty() {
-        println!("\nUnimplemented COM vtable slots:");
+        let _ = writeln!(out, "\nUnimplemented COM vtable slots:");
         for (slot, count) in summary.unimpl_vtables {
-            println!("  {count:5}x  {slot}");
+            let _ = writeln!(out, "  {count:5}x  {slot}");
         }
     }
-    ExitCode::SUCCESS
+    out
 }
 
 fn unix_to_wine_z_path(path: &Path) -> String {
@@ -227,7 +245,20 @@ where
     env_map
 }
 
-fn cmd_run(args: &[String]) -> ExitCode {
+#[derive(Debug)]
+struct RunArgs {
+    exe: PathBuf,
+    shims_dir: PathBuf,
+    profile: String,
+    bottle: Option<String>,
+    prefix: Option<PathBuf>,
+    log: Option<PathBuf>,
+    inherit_env: bool,
+    timeout: Option<Duration>,
+    backend: Option<String>,
+}
+
+fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut exe_path: Option<PathBuf> = None;
     let mut shims_dir = PathBuf::from("build-shims/bin");
     let mut profile = String::from("lockhart");
@@ -235,6 +266,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut wine_prefix: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
     let mut inherit_env = false;
+    let mut timeout = None;
+    let mut backend: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -263,21 +296,164 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 log_file = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--timeout" if i + 1 < args.len() => {
+                let seconds: u64 = args[i + 1]
+                    .parse()
+                    .ok()
+                    .filter(|s| *s > 0)
+                    .ok_or("--timeout needs a whole number of seconds above 0")?;
+                timeout = Some(Duration::from_secs(seconds));
+                i += 2;
+            }
+            "--backend" if i + 1 < args.len() => {
+                let name = args[i + 1].clone();
+                if !BACKENDS.contains(&name.as_str()) {
+                    return Err(format!(
+                        "unknown backend {name:?}; use one of {}",
+                        BACKENDS.join(", ")
+                    ));
+                }
+                backend = Some(name);
+                i += 2;
+            }
             "--inherit-env" => {
                 inherit_env = true;
                 i += 1;
             }
-            other => {
-                eprintln!("unknown argument: {other}");
-                return ExitCode::FAILURE;
-            }
+            other => return Err(format!("unknown argument: {other}")),
         }
     }
 
-    let Some(exe) = exe_path else {
-        eprintln!("error: --exe <path> is required");
-        return ExitCode::FAILURE;
+    if let Some(name) = &bottle
+        && (name.is_empty() || name.starts_with(['-', '.']) || name.contains('/'))
+    {
+        return Err(format!("invalid bottle name {name:?}"));
+    }
+    if backend.is_some() && bottle.is_none() {
+        // A bare prefix loads Wine's own D3D12 whatever CX_GRAPHICS_BACKEND says (observed on
+        // CrossOver 26.3), so accepting it would claim a backend that is not in use.
+        return Err("--backend needs --bottle; a bare prefix cannot be made to use it".into());
+    }
+    Ok(RunArgs {
+        exe: exe_path.ok_or("error: --exe <path> is required")?,
+        shims_dir,
+        profile,
+        bottle,
+        prefix: wine_prefix,
+        log: log_file,
+        inherit_env,
+        timeout,
+        backend,
+    })
+}
+
+/// Asks CrossOver's installed `CXBottle` module where `--bottle` points, so cleanup targets the
+/// prefix the launch uses. `bin/wine` searches `CX_BOTTLE_PATH`, configured paths and managed
+/// bottles, so a fixed directory would be wrong for some bottles.
+const BOTTLE_PREFIX_QUERY: &str = r#"
+use lib "$ENV{CX_ROOT}/lib/perl";
+require CXBottle;
+CXBottle::get_crossover_config();
+my ($scope, $found) = CXBottle::setup_bottle_wineprefix(undef);
+die "$@\n" unless defined $scope;
+print $ENV{WINEPREFIX};
+"#;
+
+/// The environment `bin/wine` starts from, shared by the launch and the bottle lookup.
+fn apply_host_env(command: &mut Command, inherit_env: bool) {
+    if !inherit_env {
+        command.env_clear();
+        for (k, v) in collect_isolated_host_env(|k| env::var(k).ok()) {
+            command.env(k, v);
+        }
+    }
+    // Inherited values must not point the launcher at a different bottle than cleanup does.
+    command.env_remove("WINEPREFIX").env_remove("CX_BOTTLE");
+}
+
+fn resolve_bottle_prefix(
+    cx_root: &Path,
+    mut command: Command,
+    name: &str,
+) -> Result<PathBuf, String> {
+    let output = command
+        .env("CX_ROOT", cx_root)
+        .env("CX_BOTTLE", name)
+        .args(["-e", BOTTLE_PREFIX_QUERY])
+        .output()
+        .map_err(|e| format!("cannot ask CrossOver where bottle {name:?} is: {e}"))?;
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if !output.status.success() || !path.is_absolute() || !path.is_dir() {
+        return Err(format!(
+            "CrossOver cannot locate bottle {name:?}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(path)
+}
+
+fn resolve_bottle_prefix_with_host_env(
+    cx_root: &Path,
+    name: &str,
+    inherit_env: bool,
+) -> Result<PathBuf, String> {
+    let mut query = Command::new("/usr/bin/perl");
+    apply_host_env(&mut query, inherit_env);
+    resolve_bottle_prefix(cx_root, query, name)
+}
+
+/// Collects the prefixes that cleanup must stop. Re-resolving a named bottle after launch catches
+/// the case where a managed-only bottle caused CrossOver's `bin/wine` to create and launch inside
+/// a new private stub bottle.
+fn cleanup_prefixes_for_stop<F>(
+    initial_prefix: &Path,
+    bottle: Option<&str>,
+    mut re_resolve: F,
+) -> Result<Vec<PathBuf>, String>
+where
+    F: FnMut(&str) -> Result<PathBuf, String>,
+{
+    let mut prefixes = Vec::new();
+    if let Some(name) = bottle {
+        let current = re_resolve(name)?;
+        prefixes.push(current);
+    }
+    if !prefixes.iter().any(|p| p == initial_prefix) {
+        prefixes.push(initial_prefix.to_path_buf());
+    }
+    Ok(prefixes)
+}
+
+/// `bin/wine` deletes an inherited `WINEDLLOVERRIDES` and applies the bottle's
+/// `[EnvironmentVariables]` over what it is given, so bottle mode passes both as options.
+fn bottle_options(backend: Option<&str>) -> Vec<String> {
+    let mut options = vec!["--dll".to_string(), SHIM_DLL_OVERRIDES.to_string()];
+    if let Some(backend) = backend {
+        options.push("--env".to_string());
+        options.push(format!("CX_GRAPHICS_BACKEND={backend}"));
+    }
+    options
+}
+
+fn cmd_run(args: &[String]) -> ExitCode {
+    let run = match parse_run_args(args) {
+        Ok(run) => run,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
     };
+    let RunArgs {
+        exe,
+        shims_dir,
+        profile,
+        bottle,
+        prefix: wine_prefix,
+        log: log_file,
+        inherit_env,
+        timeout,
+        backend,
+    } = run;
 
     let cx_root = Path::new("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver");
     let wine_wrapper = cx_root.join("bin/wine");
@@ -294,9 +470,23 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let resolved_prefix =
         wine_prefix.unwrap_or_else(|| PathBuf::from("/tmp/betterxen-wine-prefix"));
 
+    // The environment a timeout or signal has to stop.
+    let environment_dir = match &bottle {
+        Some(name) => match resolve_bottle_prefix_with_host_env(cx_root, name, inherit_env) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => resolved_prefix.clone(),
+    };
+
     let mut cmd = if let Some(ref bname) = bottle {
         let mut c = Command::new(&wine_wrapper);
-        c.args(["--bottle", bname]).arg(&abs_exe);
+        c.args(["--bottle", bname])
+            .args(bottle_options(backend.as_deref()))
+            .arg(&abs_exe);
         c
     } else {
         let _ = fs::create_dir_all(&resolved_prefix);
@@ -305,12 +495,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         c
     };
 
-    if !inherit_env {
-        cmd.env_clear();
-        for (k, v) in collect_isolated_host_env(|k| env::var(k).ok()) {
-            cmd.env(k, v);
-        }
-    }
+    apply_host_env(&mut cmd, inherit_env);
 
     if bottle.is_none() {
         cmd.env("WINEPREFIX", &resolved_prefix)
@@ -340,26 +525,80 @@ fn cmd_run(args: &[String]) -> ExitCode {
         .env("BX_PROFILE", &profile)
         .env("WINEDEBUG", "-all");
 
-    if let Some(ref lf) = log_file {
-        let abs_log = if lf.is_absolute() {
-            lf.clone()
+    let abs_log = log_file.map(|lf| {
+        if lf.is_absolute() {
+            lf
         } else {
             env::current_dir().unwrap_or_default().join(lf)
-        };
-        cmd.env("BX_LOG_FILE", unix_to_wine_z_path(&abs_log));
+        }
+    });
+    if let Some(log) = &abs_log {
+        cmd.env("BX_LOG_FILE", unix_to_wine_z_path(log));
+    }
+    let log_size = |log: &PathBuf| fs::metadata(log).map_or(0, |m| m.len());
+    let log_size_before = abs_log.as_ref().map_or(0, log_size);
+
+    supervise::install_signal_handlers();
+    let outcome = supervise::supervise(cmd, timeout, supervise::received_signal);
+    let code = match &outcome {
+        Ok(outcome) => outcome.exit_code(),
+        Err(e) => {
+            eprintln!("failed to run CrossOver wine: {e}");
+            1
+        }
+    };
+    let mut cleanup_failed = false;
+    match &outcome {
+        Ok(Outcome::Exited(status)) if !status.success() => {
+            eprintln!("guest exited with status: {status}");
+        }
+        Ok(Outcome::Stopped(stop)) => {
+            match stop {
+                Stop::TimedOut => eprintln!("timed out; stopping the environment"),
+                Stop::Signalled(signal) => {
+                    eprintln!("received signal {signal}; stopping the environment");
+                }
+            }
+            let server_env: Vec<(String, String)> = collect_isolated_host_env(|k| env::var(k).ok())
+                .into_iter()
+                .collect();
+            let prefixes_to_stop =
+                match cleanup_prefixes_for_stop(&environment_dir, bottle.as_deref(), |name| {
+                    resolve_bottle_prefix_with_host_env(cx_root, name, inherit_env)
+                }) {
+                    Ok(prefixes) => prefixes,
+                    Err(e) => {
+                        eprintln!("cleanup failed to re-resolve bottle prefix: {e}");
+                        cleanup_failed = true;
+                        vec![environment_dir.clone()]
+                    }
+                };
+            for prefix in &prefixes_to_stop {
+                if let Err(e) =
+                    supervise::stop_server(&cx_root.join("bin/wineserver"), prefix, &server_env)
+                {
+                    eprintln!("cleanup failed, programs may still be running: {e}");
+                    cleanup_failed = true;
+                }
+            }
+        }
+        _ => {}
     }
 
-    match cmd.status() {
-        Ok(st) if st.success() => ExitCode::SUCCESS,
-        Ok(st) => {
-            eprintln!("guest exited with status: {st}");
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("failed to launch CrossOver wine: {e}");
-            ExitCode::FAILURE
-        }
+    // Printed for failed and stopped runs too, which is when it matters most.
+    if let Some(log) = &abs_log
+        && log_size(log) > log_size_before
+        && let Ok(bytes) = fs::read(log)
+    {
+        // Guest text may not be valid UTF-8; a summary is still worth printing.
+        print!(
+            "\nTrace summary of {}:\n{}",
+            log.display(),
+            render_trace(&String::from_utf8_lossy(&bytes))
+        );
     }
+    // The reason for the stop is kept; a failed cleanup only turns success into failure.
+    ExitCode::from(if cleanup_failed { code.max(1) } else { code })
 }
 
 fn cmd_shader(path: &str) -> ExitCode {
@@ -415,6 +654,197 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_run_arguments() {
+        for bare in [&["--prefix", "/tmp/p"][..], &[]] {
+            let mut list = args(&["--exe", "a.exe", "--backend", "d3dmetal"]);
+            list.extend(args(bare));
+            let error = parse_run_args(&list).unwrap_err();
+            assert!(error.contains("--backend needs --bottle"), "{error}");
+        }
+        let run = parse_run_args(&args(&[
+            "--exe",
+            "a.exe",
+            "--bottle",
+            "b",
+            "--timeout",
+            "30",
+            "--backend",
+            "d3dmetal",
+        ]))
+        .unwrap();
+        assert_eq!(run.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(run.backend.as_deref(), Some("d3dmetal"));
+        assert_eq!(run.shims_dir, PathBuf::from("build-shims/bin"));
+        assert_eq!(run.profile, "lockhart");
+        let plain = parse_run_args(&args(&["--exe", "a.exe"])).unwrap();
+        assert!(plain.timeout.is_none() && plain.bottle.is_none() && plain.prefix.is_none());
+        for bad in [
+            &["--exe", "a.exe", "--timeout", "0"][..],
+            &["--exe", "a.exe", "--timeout", "soon"],
+            &["--exe", "a.exe", "--backend", "dmxt2"],
+            &["--exe", "a.exe", "--bottle", "../x"],
+            &["--exe", "a.exe", "--timeout"],
+            &["--bottle", "b"],
+        ] {
+            assert!(parse_run_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    // A stub CXBottle stands in for CrossOver's: this checks the lookup's environment and that
+    // a timeout's cleanup is aimed at the prefix it returns, not at the default directory.
+    #[test]
+    fn a_timeout_cleans_up_a_bottle_outside_the_default_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = env::temp_dir().join(format!("bx-cli-altbottle-{}", std::process::id()));
+        let bottle = root.join("elsewhere/mine");
+        fs::create_dir_all(&bottle).unwrap();
+        fs::create_dir_all(root.join("cx/lib/perl")).unwrap();
+        fs::write(
+            root.join("cx/lib/perl/CXBottle.pm"),
+            r#"package CXBottle;
+sub get_crossover_config {}
+sub setup_bottle_wineprefix {
+    my $p = "$ENV{CX_BOTTLE_PATH}/$ENV{CX_BOTTLE}";
+    return (undef, undef) unless -d $p;
+    $ENV{WINEPREFIX} = $p;
+    return ('private', $p);
+}
+1;
+"#,
+        )
+        .unwrap();
+        let query = |name: &str| {
+            let mut command = Command::new("/usr/bin/perl");
+            command.env("CX_BOTTLE_PATH", root.join("elsewhere"));
+            resolve_bottle_prefix(&root.join("cx"), command, name)
+        };
+        assert!(query("absent").is_err());
+        let prefix = query("mine").unwrap();
+        assert_eq!(prefix, bottle);
+
+        let server = root.join("wineserver");
+        let seen = root.join("seen");
+        fs::write(
+            &server,
+            format!(
+                "#!/bin/sh\necho \"$1 $WINEPREFIX\" >> '{}'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut sleeper = Command::new("/bin/sh");
+        sleeper.args(["-c", "sleep 30"]);
+        let outcome =
+            supervise::supervise(sleeper, Some(Duration::from_millis(200)), || 0).unwrap();
+        assert!(matches!(outcome, Outcome::Stopped(Stop::TimedOut)));
+        supervise::stop_server(&server, &prefix, &[]).unwrap();
+        let expected = format!("-k {0}\n-w {0}\n", bottle.display());
+        assert_eq!(fs::read_to_string(&seen).unwrap(), expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Regression test starting with only a managed bottle and no private stub: the launch creates
+    // the private stub, and timeout cleanup re-resolves via CXBottle so wineserver stops the stub.
+    #[test]
+    fn a_timeout_cleans_up_a_managed_bottle_private_stub_created_on_first_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = env::temp_dir().join(format!("bx-cli-managed-stub-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let managed = root.join("managed/corp");
+        let private_dir = root.join("private");
+        let private_stub = private_dir.join("corp");
+        fs::create_dir_all(&managed).unwrap();
+        fs::create_dir_all(&private_dir).unwrap();
+        fs::create_dir_all(root.join("cx/lib/perl")).unwrap();
+        fs::write(
+            root.join("cx/lib/perl/CXBottle.pm"),
+            r#"package CXBottle;
+sub get_crossover_config {}
+sub setup_bottle_wineprefix {
+    my $priv = "$ENV{CX_BOTTLE_PATH}/$ENV{CX_BOTTLE}";
+    if (-f "$priv/system.reg") {
+        $ENV{WINEPREFIX} = $priv;
+        return ('private', $priv);
+    }
+    my $mgmt = "$ENV{CX_MANAGED_BOTTLE_PATH}/$ENV{CX_BOTTLE}";
+    if (-d $mgmt) {
+        $ENV{WINEPREFIX} = $mgmt;
+        return ('managed', $mgmt);
+    }
+    return (undef, undef);
+}
+1;
+"#,
+        )
+        .unwrap();
+
+        let query = |name: &str| {
+            let mut command = Command::new("/usr/bin/perl");
+            command
+                .env("CX_BOTTLE_PATH", &private_dir)
+                .env("CX_MANAGED_BOTTLE_PATH", root.join("managed"));
+            resolve_bottle_prefix(&root.join("cx"), command, name)
+        };
+
+        // Before launch there is no private stub, so CXBottle reports the managed bottle.
+        assert!(!private_stub.exists());
+        let initial = query("corp").unwrap();
+        assert_eq!(initial, managed);
+
+        // Simulated first launch creates the private stub before hanging until timeout.
+        let mut launcher = Command::new("/bin/sh");
+        launcher.args([
+            "-c",
+            &format!(
+                "mkdir -p '{0}' && touch '{0}/system.reg' && exec sleep 30",
+                private_stub.display()
+            ),
+        ]);
+        let outcome =
+            supervise::supervise(launcher, Some(Duration::from_millis(300)), || 0).unwrap();
+        assert!(matches!(outcome, Outcome::Stopped(Stop::TimedOut)));
+
+        let prefixes = cleanup_prefixes_for_stop(&initial, Some("corp"), query).unwrap();
+        assert_eq!(prefixes, vec![private_stub.clone(), managed.clone()]);
+
+        let server = root.join("wineserver");
+        let seen = root.join("seen");
+        fs::write(
+            &server,
+            format!(
+                "#!/bin/sh\necho \"$1 $WINEPREFIX\" >> '{}'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+        for prefix in &prefixes {
+            supervise::stop_server(&server, prefix, &[]).unwrap();
+        }
+        let expected = format!(
+            "-k {0}\n-w {0}\n-k {1}\n-w {1}\n",
+            private_stub.display(),
+            managed.display()
+        );
+        assert_eq!(fs::read_to_string(&seen).unwrap(), expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bottle_mode_passes_overrides_and_backend_as_launcher_options() {
+        assert_eq!(bottle_options(None), ["--dll", SHIM_DLL_OVERRIDES]);
+        assert_eq!(
+            bottle_options(Some("dxvk"))[2..],
+            ["--env", "CX_GRAPHICS_BACKEND=dxvk"]
+        );
+    }
 
     #[test]
     fn isolated_env_strips_secrets_and_pins_path() {
