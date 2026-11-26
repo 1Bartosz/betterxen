@@ -10,6 +10,7 @@ Guest execution uses original, purpose-built test programs. Commercial Xbox game
 remains unsupported.
 
 ### Added
+- Implemented synthetic APU heap mappings, per-connection APU and DSP queues, and the GameInput ordinal 1 COM stub. Added an audio/input conformance executable covering all four shim DLLs (#419).
 - Added structured unhandled exception logging with module-relative addresses and x64 registers, and expanded the CLWB conformance test to require six traps across ModRM, SIB, REX and RIP-relative operands (#409).
 - Enforced the configured title memory cap for default heap allocations and virtual commits in `xmem.dll`. Added working-set accounting and a synthetic fixture for alignment, commit overlap, decommit, release, and memory transfer (#411).
 - Added a BetterXen-only DirectStorage conformance interface for asynchronous uncompressed file and memory transfers, status arrays, and completion events in `XCRDAPI.dll` (#413).
