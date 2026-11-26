@@ -3,6 +3,9 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <type_traits>
+
+#include "presentx.h"
 
 /* {6B1D5C0E-2F4A-4E0B-9A57-3C0E5D7B1A42}: private to this DLL, never handed to a host object. */
 const GUID IID_BxProxyHost = {0x6b1d5c0e, 0x2f4a, 0x4e0b, {0x9a, 0x57, 0x3c, 0x0e, 0x5d, 0x7b, 0x1a, 0x42}};
@@ -457,6 +460,11 @@ HRESULT STDMETHODCALLTYPE BxChildProxy<Gen>::QueryInterface(REFIID riid, void** 
         AddRef();
         *ppv = static_cast<Gen*>(this);
         return S_OK;
+    }
+    if constexpr (std::is_same_v<Gen, BxCommandQueueProxyImpl>) {
+        if (IsEqualGUID(riid, IID_IBxPresentQueue)) {
+            return bx_present_query_queue(this, ppv); /* BetterXen's presentation bridge, presentx.h */
+        }
     }
     return query_host_unproxied(host_identity_, Gen::kLeafName, riid, ppv);
 }
