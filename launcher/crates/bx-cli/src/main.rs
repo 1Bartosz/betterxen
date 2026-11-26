@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use bx_telemetry::summarize_jsonl;
 use dxbc_accc::inspect_dxbc;
 use supervise::{Outcome, Stop};
 
-const SHIM_DLL_OVERRIDES: &str = "bx_runtime_veh,d3d12_xs,xg_xs,xmem,XCRDAPI,xgameruntime,AcpHal,xapu,chad,GameInput,\
+const SHIM_DLL_OVERRIDES: &str = "bx_runtime_veh,d3d12_xs,xg_xs,xmem,xcrdapi,XCRDAPI,xgameruntime,acphal,AcpHal,xapu,chad,gameinput,GameInput,\
 api-ms-win-core-psm-appnotify-l1-1-0,api-ms-win-core-psm-appnotify-l1-1-1,\
 ext-ms-win-rtcore-ntuser-message-l1-1-0,ext-ms-win-rtcore-ntuser-message-ansi-l1-1-0,\
 ext-ms-win-rtcore-ntuser-window-l1-1-0,ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0=n,b";
@@ -499,7 +500,37 @@ fn apply_prefix_env(command: &mut Command, cx_root: &Path, prefix: &Path, winelo
         );
 }
 
-/// Reports a timeout or signal and stops the environment's `wineserver`. True if cleanup failed.
+/// Writes one diagnostic line to stderr. A closed pipe or hung-up terminal is ignored: unlike
+/// `eprintln!`, this cannot panic and so cannot cut a run's cleanup short (#461).
+fn diag(message: impl std::fmt::Display) {
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
+/// Runs `cleanup` and only then reports the stop and any cleanup failures to `out`, ignoring
+/// write errors. True if cleanup reported a failure.
+///
+/// Cleanup comes first so that nothing about the diagnostic stream (Ctrl-C through `| tee`, a
+/// closed terminal) can prevent the environment from being stopped (#461).
+fn report_stop(
+    stop: Stop,
+    cleanup: impl FnOnce() -> Vec<String>,
+    out: &mut dyn std::io::Write,
+) -> bool {
+    let failures = cleanup();
+    let _ = match stop {
+        Stop::TimedOut => writeln!(out, "timed out; stopped the environment"),
+        Stop::Signalled(signal) => {
+            writeln!(out, "received signal {signal}; stopped the environment")
+        }
+    };
+    for failure in &failures {
+        let _ = writeln!(out, "{failure}");
+    }
+    !failures.is_empty()
+}
+
+/// Stops the environment's `wineserver` after a timeout or signal, then reports it. True if
+/// cleanup failed.
 fn stop_environment(
     stop: Stop,
     cx_root: &Path,
@@ -507,34 +538,96 @@ fn stop_environment(
     bottle: Option<&str>,
     inherit_env: bool,
 ) -> bool {
-    match stop {
-        Stop::TimedOut => eprintln!("timed out; stopping the environment"),
-        Stop::Signalled(signal) => {
-            eprintln!("received signal {signal}; stopping the environment");
+    let cleanup = || {
+        let server_env: Vec<(String, String)> = collect_isolated_host_env(|k| env::var(k).ok())
+            .into_iter()
+            .collect();
+        let mut failures = Vec::new();
+        let prefixes_to_stop = match cleanup_prefixes_for_stop(environment_dir, bottle, |name| {
+            resolve_bottle_prefix_with_host_env(cx_root, name, inherit_env)
+        }) {
+            Ok(prefixes) => prefixes,
+            Err(e) => {
+                failures.push(format!("cleanup failed to re-resolve bottle prefix: {e}"));
+                vec![environment_dir.to_path_buf()]
+            }
+        };
+        for prefix in &prefixes_to_stop {
+            if let Err(e) =
+                supervise::stop_server(&cx_root.join("bin/wineserver"), prefix, &server_env)
+            {
+                failures.push(format!(
+                    "cleanup failed, programs may still be running: {e}"
+                ));
+            }
         }
-    }
-    let server_env: Vec<(String, String)> = collect_isolated_host_env(|k| env::var(k).ok())
-        .into_iter()
-        .collect();
-    let mut cleanup_failed = false;
-    let prefixes_to_stop = match cleanup_prefixes_for_stop(environment_dir, bottle, |name| {
-        resolve_bottle_prefix_with_host_env(cx_root, name, inherit_env)
-    }) {
-        Ok(prefixes) => prefixes,
-        Err(e) => {
-            eprintln!("cleanup failed to re-resolve bottle prefix: {e}");
-            cleanup_failed = true;
-            vec![environment_dir.to_path_buf()]
-        }
+        failures
     };
-    for prefix in &prefixes_to_stop {
-        if let Err(e) = supervise::stop_server(&cx_root.join("bin/wineserver"), prefix, &server_env)
-        {
-            eprintln!("cleanup failed, programs may still be running: {e}");
-            cleanup_failed = true;
-        }
-    }
-    cleanup_failed
+    report_stop(stop, cleanup, &mut std::io::stderr())
+}
+
+/// How many trailing bytes of a log are remembered to recognize it again after the run.
+const LOG_MARK_TAIL: u64 = 256;
+
+/// What a trace log was before the run: which file, how long, and how it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogMark {
+    /// Device and inode of the file.
+    identity: (u64, u64),
+    len: u64,
+    /// The last bytes before `len` (up to [`LOG_MARK_TAIL`]).
+    tail: Vec<u8>,
+}
+
+/// The mark of the log at `path`, or `None` if there is no readable log yet.
+fn log_mark(path: &Path) -> Option<LogMark> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::MetadataExt;
+    let mut file = fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    let len = meta.len();
+    let tail_len = len.min(LOG_MARK_TAIL);
+    file.seek(SeekFrom::Start(len - tail_len)).ok()?;
+    let mut tail = Vec::new();
+    file.take(tail_len).read_to_end(&mut tail).ok()?;
+    Some(LogMark {
+        identity: (meta.dev(), meta.ino()),
+        len,
+        tail,
+    })
+}
+
+/// A log's identity and contents, read through one open file so the two cannot disagree.
+fn read_log(path: &Path) -> Option<((u64, u64), Vec<u8>)> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let mut file = fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(((meta.dev(), meta.ino()), bytes))
+}
+
+/// The part of a trace log that this run added, given the log's mark from before the run.
+///
+/// The old length is used as an offset only when the log is still the same file and still holds
+/// the same bytes just before that offset. A log that was replaced or rewritten during the run,
+/// whatever its new size, is new in full, as is a log that did not exist before.
+fn appended_since<'a>(bytes: &'a [u8], identity: (u64, u64), before: Option<&LogMark>) -> &'a [u8] {
+    let Some(mark) = before else {
+        return bytes;
+    };
+    let appended = usize::try_from(mark.len).ok().and_then(|start| {
+        let old_end = bytes.get(..start)?;
+        (mark.identity == identity && old_end.ends_with(&mark.tail)).then(|| &bytes[start..])
+    });
+    appended.unwrap_or(bytes)
+}
+
+/// The part of `elapsed` wall-clock time that counts against `--timeout`: everything except the
+/// `suspended` time spent stopped by Ctrl-Z, whichever phase of the run that fell in.
+fn active_time(elapsed: Duration, suspended: Duration) -> Duration {
+    elapsed.saturating_sub(suspended)
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
@@ -601,10 +694,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
         match supervise::supervise(boot, timeout, supervise::received_signal) {
             Ok(Outcome::Exited(st)) if st.success() => {}
             Ok(Outcome::Exited(st)) => {
-                eprintln!(
+                diag(format_args!(
                     "error: wineboot --init failed for {}: {st}",
                     resolved_prefix.display()
-                );
+                ));
                 return ExitCode::FAILURE;
             }
             Ok(outcome @ Outcome::Stopped(stop)) => {
@@ -613,10 +706,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 return ExitCode::from(if failed { code.max(1) } else { code });
             }
             Err(e) => {
-                eprintln!(
+                diag(format_args!(
                     "error: cannot run wineboot for {}: {e}",
                     resolved_prefix.display()
-                );
+                ));
                 return ExitCode::FAILURE;
             }
         }
@@ -627,12 +720,13 @@ fn cmd_run(args: &[String]) -> ExitCode {
             for item in &staged {
                 if let stage::Staged::Copied(path)
                 | stage::Staged::Replaced(path)
+                | stage::Staged::ReplacedWineStub(path)
                 | stage::Staged::Unchanged(path) = item
                     && let Some(name) = path.file_name()
                 {
                     staged_names.push(name.to_string_lossy().into_owned());
                 }
-                eprintln!("bx-cli: {}", item.describe());
+                diag(format_args!("bx-cli: {}", item.describe()));
             }
         }
         Err(e) => {
@@ -641,7 +735,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
             } else {
                 ""
             };
-            eprintln!("error: cannot stage system32 shims: {e}{hint}");
+            diag(format_args!(
+                "error: cannot stage system32 shims: {e}{hint}"
+            ));
             return ExitCode::FAILURE;
         }
     }
@@ -681,14 +777,15 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if let Some(log) = &abs_log {
         cmd.env("BX_LOG_FILE", unix_to_wine_z_path(log));
     }
-    let log_size = |log: &PathBuf| fs::metadata(log).map_or(0, |m| m.len());
-    let log_size_before = abs_log.as_ref().map_or(0, log_size);
+    let log_before = abs_log.as_deref().and_then(log_mark);
 
-    // `--timeout` bounds the whole run, including any prefix initialization above.
-    let remaining = match guest_time_left(timeout, started.elapsed()) {
+    // `--timeout` bounds the whole run, including any prefix initialization above, but not
+    // time the run spent suspended in either phase.
+    let active = active_time(started.elapsed(), supervise::suspended_time());
+    let remaining = match guest_time_left(timeout, active) {
         Ok(remaining) => remaining,
         Err(e) => {
-            eprintln!("timed out during initialization: {e}");
+            diag(format_args!("timed out during initialization: {e}"));
             return ExitCode::from(124);
         }
     };
@@ -696,14 +793,14 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let code = match &outcome {
         Ok(outcome) => outcome.exit_code(),
         Err(e) => {
-            eprintln!("failed to run CrossOver wine: {e}");
+            diag(format_args!("failed to run CrossOver wine: {e}"));
             1
         }
     };
     let mut cleanup_failed = false;
     match &outcome {
         Ok(Outcome::Exited(status)) if !status.success() => {
-            eprintln!("guest exited with status: {status}");
+            diag(format_args!("guest exited with status: {status}"));
         }
         Ok(Outcome::Stopped(stop)) => {
             cleanup_failed = stop_environment(
@@ -717,17 +814,22 @@ fn cmd_run(args: &[String]) -> ExitCode {
         _ => {}
     }
 
-    // Printed for failed and stopped runs too, which is when it matters most.
+    // Printed for failed and stopped runs too, which is when it matters most. The log is
+    // appended to across runs, so only what this run added is summarized.
     if let Some(log) = &abs_log
-        && log_size(log) > log_size_before
-        && let Ok(bytes) = fs::read(log)
+        && let Some((identity, bytes)) = read_log(log)
     {
-        // Guest text may not be valid UTF-8; a summary is still worth printing.
-        print!(
-            "\nTrace summary of {}:\n{}",
-            log.display(),
-            render_trace(&String::from_utf8_lossy(&bytes))
-        );
+        let fresh = appended_since(&bytes, identity, log_before.as_ref());
+        if !fresh.is_empty() {
+            // Guest text may not be valid UTF-8; a summary is still worth printing. A closed
+            // stdout must not turn into a panic after the run.
+            let _ = write!(
+                std::io::stdout(),
+                "\nTrace summary of this run in {}:\n{}",
+                log.display(),
+                render_trace(&String::from_utf8_lossy(fresh))
+            );
+        }
     }
     // #474: the shims were staged into the prefix resolved before launch. If CrossOver launched
     // the bottle from a different prefix that does not expose them, the guest never saw them,
@@ -746,14 +848,14 @@ fn cmd_run(args: &[String]) -> ExitCode {
                     &staged_names,
                 );
                 if missing.is_empty() {
-                    eprintln!(
+                    diag(format_args!(
                         "bx-cli: bottle launched in {}; the shims staged in {} are visible there",
                         launched.display(),
                         environment_dir.display()
-                    );
+                    ));
                 } else {
                     staged_elsewhere = true;
-                    eprintln!(
+                    diag(format_args!(
                         "error: system32 shims were staged in {} but CrossOver launched the \
                          bottle in {}, where {} cannot be found as staged; the guest did not \
                          see them. Run again: staging will now use the prefix the bottle \
@@ -761,13 +863,13 @@ fn cmd_run(args: &[String]) -> ExitCode {
                         environment_dir.display(),
                         launched.display(),
                         missing.join(", ")
-                    );
+                    ));
                 }
             }
-            Err(e) => eprintln!(
+            Err(e) => diag(format_args!(
                 "warning: cannot confirm which prefix the bottle launched in, so the staged \
                  system32 shims may not have been used: {e}"
-            ),
+            )),
         }
     }
     // The reason for the stop is kept; a failed cleanup or misplaced staging only turns success
@@ -832,6 +934,175 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stream whose reader is gone: every write fails, as with EPIPE or EIO.
+    struct ClosedStream<'a> {
+        cleanup_done: &'a std::cell::Cell<bool>,
+        writes_before_cleanup: usize,
+        writes: usize,
+    }
+
+    impl std::io::Write for ClosedStream<'_> {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if !self.cleanup_done.get() {
+                self.writes_before_cleanup += 1;
+            }
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn a_closed_diagnostic_stream_cannot_skip_cleanup() {
+        for stop in [Stop::Signalled(libc::SIGINT), Stop::TimedOut] {
+            let cleanup_done = std::cell::Cell::new(false);
+            let mut closed = ClosedStream {
+                cleanup_done: &cleanup_done,
+                writes_before_cleanup: 0,
+                writes: 0,
+            };
+            let failed = report_stop(
+                stop,
+                || {
+                    cleanup_done.set(true);
+                    vec!["cleanup failed, programs may still be running: stub".to_string()]
+                },
+                &mut closed,
+            );
+            assert!(cleanup_done.get(), "cleanup did not run for {stop:?}");
+            assert!(failed, "the cleanup failure was lost for {stop:?}");
+            assert!(closed.writes > 0, "nothing was reported for {stop:?}");
+            assert_eq!(
+                closed.writes_before_cleanup, 0,
+                "output came before cleanup"
+            );
+        }
+        let mut text = Vec::new();
+        assert!(!report_stop(Stop::Signalled(2), Vec::new, &mut text));
+        assert_eq!(
+            String::from_utf8(text).unwrap(),
+            "received signal 2; stopped the environment\n"
+        );
+    }
+
+    fn mark(identity: (u64, u64), contents: &str) -> LogMark {
+        let bytes = contents.as_bytes();
+        let tail_start = bytes.len().saturating_sub(LOG_MARK_TAIL as usize);
+        LogMark {
+            identity,
+            len: bytes.len() as u64,
+            tail: bytes[tail_start..].to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_trace_summary_covers_only_what_this_run_appended() {
+        let file = (1, 100);
+        let earlier = "{\"event\":\"unimpl_api\",\"detail\":\"old.dll!Earlier\"}\n";
+        let this_run = "{\"event\":\"unimpl_api\",\"detail\":\"new.dll!ThisRun\"}\n";
+        let log = format!("{earlier}{this_run}");
+        let before = mark(file, earlier);
+        let fresh = appended_since(log.as_bytes(), file, Some(&before));
+        assert_eq!(fresh, this_run.as_bytes());
+        let rendered = render_trace(&String::from_utf8_lossy(fresh));
+        assert!(rendered.contains("new.dll!ThisRun"), "{rendered}");
+        assert!(!rendered.contains("old.dll!Earlier"), "{rendered}");
+        // Nothing appended: nothing to summarize.
+        assert!(appended_since(earlier.as_bytes(), file, Some(&before)).is_empty());
+        // No log before the run: everything in it is from this run.
+        assert_eq!(
+            appended_since(this_run.as_bytes(), file, None),
+            this_run.as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_replaced_log_is_summarized_in_full_whatever_its_size() {
+        let old_file = (1, 100);
+        let new_file = (1, 200);
+        let old = "{\"event\":\"unimpl_api\",\"detail\":\"old.dll!Earlier\"}\n";
+        let before = mark(old_file, old);
+        let record = "{\"event\":\"unimpl_api\",\"detail\":\"new.dll!A\"}\n";
+        // Shorter, exactly as long, and longer than the old log: the old length must never be
+        // used as an offset into a different file.
+        let shorter = &record[..record.len() - 1];
+        let same_size = format!("{:<width$}\n", record.trim_end(), width = old.len() - 1);
+        let longer = format!("{record}{record}{record}");
+        assert!(shorter.len() < old.len() && same_size.len() == old.len());
+        assert!(longer.len() > old.len());
+        for replacement in [shorter, same_size.as_str(), longer.as_str()] {
+            let fresh = appended_since(replacement.as_bytes(), new_file, Some(&before));
+            assert_eq!(fresh, replacement.as_bytes(), "{} bytes", replacement.len());
+        }
+        // Rewritten in place (same file, different contents before the old end).
+        let fresh = appended_since(longer.as_bytes(), old_file, Some(&before));
+        assert_eq!(fresh, longer.as_bytes());
+        assert_eq!(
+            summarize_jsonl(&String::from_utf8_lossy(fresh)).total_lines,
+            3
+        );
+    }
+
+    #[test]
+    fn log_marks_follow_the_file_on_disk() {
+        let dir = env::temp_dir().join(format!("bx-cli-logmark-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("trace.jsonl");
+        assert_eq!(log_mark(&log), None);
+        let old = "{\"event\":\"unimpl_api\",\"detail\":\"old.dll!Earlier\"}\n";
+        fs::write(&log, old).unwrap();
+        let before = log_mark(&log).unwrap();
+        assert_eq!(before.len, old.len() as u64);
+        assert_eq!(before.tail, old.as_bytes());
+
+        // Appended to, as bx_runtime_veh does: only the new record is this run's.
+        let added = "{\"event\":\"unimpl_api\",\"detail\":\"new.dll!ThisRun\"}\n";
+        fs::write(&log, format!("{old}{added}")).unwrap();
+        let (identity, bytes) = read_log(&log).unwrap();
+        assert_eq!(
+            appended_since(&bytes, identity, Some(&before)),
+            added.as_bytes()
+        );
+
+        // Replaced by a new, longer file during the run: all of it is this run's.
+        let replacement = dir.join("replacement");
+        let longer = format!("{added}{added}{added}");
+        fs::write(&replacement, &longer).unwrap();
+        fs::rename(&replacement, &log).unwrap();
+        let (identity, bytes) = read_log(&log).unwrap();
+        assert_ne!(identity, before.identity);
+        let fresh = appended_since(&bytes, identity, Some(&before));
+        assert_eq!(
+            summarize_jsonl(&String::from_utf8_lossy(fresh)).total_lines,
+            3
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_pause_in_an_earlier_phase_is_not_charged_to_the_guest() {
+        let limit = Some(Duration::from_secs(2));
+        let ms = Duration::from_millis;
+        // As reviewed: paused 2.5 s during wineboot with --timeout 2, 0.3 s actually running.
+        assert_eq!(
+            guest_time_left(limit, active_time(ms(2800), ms(2500))),
+            Ok(Some(ms(1700)))
+        );
+        // Without a pause the wall clock counts in full.
+        assert_eq!(
+            guest_time_left(limit, active_time(ms(500), Duration::ZERO)),
+            Ok(Some(ms(1500)))
+        );
+        // Initialization that really ran for the whole timeout still stops the launch.
+        assert!(guest_time_left(limit, active_time(ms(5000), ms(2500))).is_err());
+        // More suspension than elapsed time cannot go negative.
+        assert_eq!(active_time(ms(100), ms(900)), Duration::ZERO);
+    }
 
     #[test]
     fn staging_into_a_prefix_the_bottle_did_not_launch_in_is_reported() {
