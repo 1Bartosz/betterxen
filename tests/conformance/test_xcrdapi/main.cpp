@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 using namespace bx::storage;
 
@@ -32,6 +33,33 @@ struct TemporaryFile {
 struct Event {
     HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     ~Event() { if (handle) CloseHandle(handle); }
+};
+
+struct ForeignStatus final : Status {
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void**) override { return E_NOINTERFACE; }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE GetResult(UINT) override { return E_NOTIMPL; }
+};
+
+struct MockFence final : ID3D12Fence {
+    LONG refs = 1;
+    UINT64 value = 0;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void**) override { return E_NOINTERFACE; }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
+    ULONG STDMETHODCALLTYPE Release() override { return InterlockedDecrement(&refs); }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void**) override { return E_NOTIMPL; }
+    UINT64 STDMETHODCALLTYPE GetCompletedValue() override { return value; }
+    HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64, HANDLE) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Signal(UINT64 v) override {
+        value = v;
+        return S_OK;
+    }
 };
 
 int main() {
@@ -115,6 +143,36 @@ int main() {
     CHECK(queue->EnqueueRequest(&copy) == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE));
     QueueInfo info{};
     CHECK(queue->Query(&info) == S_OK && info.capacity == 5 && info.available == 5);
+
+    // Validation edge cases and Close()-without-Submit() drain coverage.
+    Com<Queue> edge_queue;
+    CHECK(factory->CreateQueue(4, queue_iid, edge_queue.out()) == S_OK);
+    CHECK(edge_queue->EnqueueRequest(nullptr) == E_INVALIDARG);
+    Request overflow{file.value, static_cast<UINT64>(std::numeric_limits<LONGLONG>::max()), nullptr, first.data(), 1, 0};
+    CHECK(edge_queue->EnqueueRequest(&overflow) == E_INVALIDARG);
+    Request ambiguous{file.value, 0, first.data(), copied.data(), 4, 0};
+    CHECK(edge_queue->EnqueueRequest(&ambiguous) == E_INVALIDARG);
+    ForeignStatus foreign_status;
+    CHECK(edge_queue->EnqueueStatus(&foreign_status, 0) == E_INVALIDARG);
+    CHECK(edge_queue->EnqueueStatus(status.value, 2) == E_INVALIDARG);
+    CHECK(edge_queue->EnqueueSignal(nullptr, 1) == E_POINTER);
+
+    std::array<char, 5> src_close{"WXYZ"};
+    std::array<char, 5> dst_close{};
+    Request close_copy{nullptr, 0, src_close.data(), dst_close.data(), 4, 0};
+    MockFence mock_fence;
+    Event close_event;
+    CHECK(close_event.handle);
+    CHECK(edge_queue->EnqueueRequest(&close_copy) == S_OK);
+    CHECK(edge_queue->EnqueueSignal(&mock_fence, 42) == S_OK);
+    CHECK(edge_queue->EnqueueStatus(status.value, 0) == S_OK);
+    CHECK(edge_queue->EnqueueStatus(status.value, 0) == HRESULT_FROM_WIN32(ERROR_BUSY));
+    CHECK(edge_queue->EnqueueSetEvent(close_event.handle) == S_OK);
+    CHECK(edge_queue->Close() == S_OK);
+    CHECK(std::strcmp(dst_close.data(), "WXYZ") == 0);
+    CHECK(mock_fence.value == 42 && mock_fence.refs == 1);
+    CHECK(status->GetResult(0) == S_OK);
+    CHECK(WaitForSingleObject(close_event.handle, 0) == WAIT_OBJECT_0);
 
     std::puts("test_xcrdapi: passed");
 }

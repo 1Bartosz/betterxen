@@ -19,12 +19,16 @@ struct File : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetHandle(HANDLE*) = 0;
 };
 
+// Status entries are queue-position scoped: each slot reports the first error
+// among entries submitted before it since the previous status entry, and is
+// not bound to a specific request handle.
 struct Status : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetResult(UINT index) = 0;
 };
 
 // Requests keep source and destination buffers borrowed until completion.
 // File requests retain a duplicate of the file handle when enqueued.
+// Exactly one of `file` or `source` may be non-null; setting both returns E_INVALIDARG.
 struct Request {
     File* file;
     UINT64 file_offset;
@@ -59,6 +63,7 @@ struct Factory : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE OpenFile(PCWSTR, REFIID, void**) = 0;
     virtual HRESULT STDMETHODCALLTYPE CreateQueue(UINT capacity, REFIID, void**) = 0;
     virtual HRESULT STDMETHODCALLTYPE CreateStatusArray(UINT count, REFIID, void**) = 0;
+    // 0 succeeds as a no-op; non-zero sizes log and return E_NOTIMPL.
     virtual HRESULT STDMETHODCALLTYPE SetStagingBufferSize(UINT size) = 0;
 };
 } // namespace bx::storage

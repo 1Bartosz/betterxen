@@ -77,6 +77,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetFileInformation(BY_HANDLE_FILE_INFORMATION* info) override {
         if (!info) return E_POINTER;
         Lock lock(mutex_);
+        if (handle_ == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE);
         return GetFileInformationByHandle(handle_, info) ? S_OK : win32_error();
     }
 
@@ -171,6 +172,7 @@ HRESULT read_request(HANDLE file, const Request& request) {
     return result;
 }
 
+// Each queue is drained serially, in FIFO order, by a single threadpool work item.
 class WorkQueue final : public Object<Queue, queue_iid> {
 public:
     WorkQueue(Entry* entries, UINT capacity) : entries_(entries), capacity_(capacity) {}
@@ -182,8 +184,8 @@ public:
 
     HRESULT STDMETHODCALLTYPE EnqueueRequest(const Request* request) override {
         constexpr UINT64 max_file_offset = std::numeric_limits<LONGLONG>::max();
-        if (!request || (request->size && (!request->destination
-            || (!request->source && !request->file)))
+        if (!request || (request->file && request->source)
+            || (request->size && (!request->destination || (!request->source && !request->file)))
             || (request->file && (request->file_offset > max_file_offset - request->size))) {
             return E_INVALIDARG;
         }
