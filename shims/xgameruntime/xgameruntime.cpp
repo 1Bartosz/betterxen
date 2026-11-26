@@ -2,6 +2,7 @@
 
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <mutex>
@@ -315,6 +316,71 @@ HRESULT create_storage(const wchar_t* path) {
     return FAILED(hr) ? hr : ensure_directory(path);
 }
 
+// Caller holds state_mutex. Same transition XGameRuntimeUninitialize uses.
+bool release_runtime_ref() {
+    if (!runtime_refs) return false;
+    if (!--runtime_refs) {
+        users.clear();
+        stores.clear();
+    }
+    return true;
+}
+
+bool runtime_active() {
+    std::lock_guard lock(state_mutex);
+    return runtime_refs != 0;
+}
+
+struct ApiInitOptions {
+    uint32_t unknown;
+    uint8_t is_inline;
+    uint8_t pad[3];
+    const char* game_config;
+};
+static_assert(offsetof(ApiInitOptions, game_config) == 8);
+
+constexpr uint16_t family_data2 = 0x5853;
+constexpr uint16_t family_data3 = 0x4000;
+
+bool synthetic_guid(const GUID* guid) {
+    return guid->Data2 == family_data2 && guid->Data3 == family_data3 && guid->Data4[0] == 0x80 &&
+           guid->Data4[1] == 0 && guid->Data4[2] == 0 && guid->Data4[3] == 0 && guid->Data4[4] == 0 &&
+           guid->Data4[5] == 0 && guid->Data4[6] == 0 && guid->Data4[7] == 1;
+}
+
+void format_guid(char* dst, size_t cap, const GUID* guid) {
+    std::snprintf(dst, cap, "%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                  static_cast<unsigned long>(guid->Data1), static_cast<unsigned>(guid->Data2),
+                  static_cast<unsigned>(guid->Data3), guid->Data4[0], guid->Data4[1], guid->Data4[2],
+                  guid->Data4[3], guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
+}
+
+void append_escaped(char* dst, size_t cap, size_t* used, const char* src) {
+    size_t u = *used;
+    if (!src) src = "(null)";
+    for (size_t i = 0; src[i] && u + 2 < cap; ++i) {
+        const auto c = static_cast<unsigned char>(src[i]);
+        if (c == '"' || c == '\\') {
+            dst[u++] = '\\';
+            dst[u++] = static_cast<char>(c);
+        } else if (c < 0x20) {
+            dst[u++] = ' ';
+        } else {
+            dst[u++] = static_cast<char>(c);
+        }
+    }
+    dst[u < cap ? u : cap - 1] = '\0';
+    *used = u < cap ? u : cap - 1;
+}
+
+HRESULT check_loader_versions(uint32_t gdk_ver, uint32_t gs_ver, const char* event) {
+    if (gdk_ver == 0 || gs_ver == 0) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", event, "invalid_args");
+        return E_INVALIDARG;
+    }
+    return S_OK;
+}
+
 } // namespace
 
 extern "C" {
@@ -339,10 +405,7 @@ HRESULT WINAPI XGameRuntimeInitializeWithOptions(const RuntimeOptions* options) 
 
 void WINAPI XGameRuntimeUninitialize() {
     std::lock_guard lock(state_mutex);
-    if (runtime_refs && !--runtime_refs) {
-        users.clear();
-        stores.clear();
-    }
+    release_runtime_ref();
 }
 
 HRESULT WINAPI XAsyncGetStatus(AsyncBlock* block, bool wait) {
@@ -560,5 +623,165 @@ OFFLINE_STUB(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync, (AsyncBlock*
 OFFLINE_STUB(XNetworkingQuerySecurityInformationForUrlAsync, (const char*, AsyncBlock*))
 
 #undef OFFLINE_STUB
+
+HRESULT WINAPI XTaskQueueCreate(bx::gdk::DispatchMode, bx::gdk::DispatchMode, void**);
+void WINAPI XTaskQueueCloseHandle(void*);
+bool WINAPI XTaskQueueDispatch(void*, bx::gdk::Port, uint32_t);
+HRESULT WINAPI XTaskQueueSubmitCallback(void*, bx::gdk::Port, void*, void (CALLBACK*)(void*, bool));
+bool WINAPI XTaskQueueGetCurrentProcessTaskQueue(void**);
+
+HRESULT WINAPI InitializeApiImpl(uint32_t gdk_ver, uint32_t gs_ver) {
+    const auto hr = check_loader_versions(gdk_ver, gs_ver, "InitializeApiImpl");
+    return FAILED(hr) ? hr : XGameRuntimeInitialize();
+}
+
+HRESULT WINAPI InitializeApiImplEx(uint32_t gdk_ver, uint32_t gs_ver, char /*mode*/) {
+    const auto hr = check_loader_versions(gdk_ver, gs_ver, "InitializeApiImplEx");
+    return FAILED(hr) ? hr : XGameRuntimeInitialize();
+}
+
+HRESULT WINAPI InitializeApiImplEx2(uint32_t gdk_ver, uint32_t gs_ver, char /*mode*/, const ApiInitOptions* options) {
+    const auto hr = check_loader_versions(gdk_ver, gs_ver, "InitializeApiImplEx2");
+    if (FAILED(hr)) return hr;
+    if (options && options->is_inline && !options->game_config) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", "InitializeApiImplEx2", "invalid_args");
+        return E_INVALIDARG;
+    }
+    // Custom game config is the same unimplemented path as XGameRuntimeInitializeWithOptions.
+    if (options && (options->is_inline || options->game_config)) {
+        BX_STUB_LOG("xgameruntime.dll", "InitializeApiImplEx2");
+        return E_NOTIMPL;
+    }
+    return XGameRuntimeInitialize();
+}
+
+HRESULT WINAPI UninitializeApiImpl() {
+    bool released;
+    {
+        std::lock_guard lock(state_mutex);
+        released = release_runtime_ref();
+    }
+    if (!released) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", "UninitializeApiImpl", "not_initialized");
+        return runtime_not_initialized;
+    }
+    return S_OK;
+}
+
+HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) {
+    char detail[480];
+    const auto prefix = std::snprintf(detail, sizeof(detail), "hr=0x%08lX msg=",
+                                      static_cast<unsigned long>(static_cast<uint32_t>(hr)));
+    size_t used = prefix > 0 ? static_cast<size_t>(prefix) : 0;
+    if (used >= sizeof(detail)) used = sizeof(detail) - 1;
+    append_escaped(detail, sizeof(detail), &used, message);
+    bx_log_emit(BX_LOG_ERROR, "xgameruntime", "XErrorReport", detail);
+    return S_OK;
+}
+
+struct TaskQueueDispatch {
+    decltype(&XTaskQueueCreate) create;
+    decltype(&XTaskQueueCloseHandle) close_handle;
+    decltype(&XTaskQueueDispatch) dispatch;
+    decltype(&XTaskQueueSubmitCallback) submit;
+    decltype(&XTaskQueueGetCurrentProcessTaskQueue) current;
+};
+struct AsyncDispatch {
+    decltype(&XAsyncGetStatus) get_status;
+    decltype(&XAsyncGetResultSize) get_result_size;
+    decltype(&XAsyncCancel) cancel;
+};
+struct UserDispatch {
+    decltype(&XUserAddAsync) add_async;
+    decltype(&XUserAddResult) add_result;
+    decltype(&XUserGetId) get_id;
+    decltype(&XUserGetGamertag) get_gamertag;
+};
+struct StoreDispatch {
+    decltype(&XStoreCreateContext) create_context;
+    decltype(&XStoreQueryGameLicenseAsync) query_license_async;
+    decltype(&XStoreQueryGameLicenseResult) query_license_result;
+};
+struct SystemDispatch {
+    decltype(&XSystemGetDeviceType) get_device_type;
+    decltype(&XSystemGetConsoleId) get_console_id;
+    decltype(&XSystemGetXboxLiveSandboxId) get_sandbox_id;
+};
+struct StorageDispatch {
+    decltype(&XPersistentLocalStorageGetPathSize) get_path_size;
+    decltype(&XPersistentLocalStorageGetPath) get_path;
+    decltype(&XPersistentLocalStorageGetSpaceInfo) get_space_info;
+};
+
+const TaskQueueDispatch task_queue_api{&XTaskQueueCreate, &XTaskQueueCloseHandle, &XTaskQueueDispatch,
+                                       &XTaskQueueSubmitCallback, &XTaskQueueGetCurrentProcessTaskQueue};
+const AsyncDispatch async_api{&XAsyncGetStatus, &XAsyncGetResultSize, &XAsyncCancel};
+const UserDispatch user_api{&XUserAddAsync, &XUserAddResult, &XUserGetId, &XUserGetGamertag};
+const StoreDispatch store_api{&XStoreCreateContext, &XStoreQueryGameLicenseAsync, &XStoreQueryGameLicenseResult};
+const SystemDispatch system_api{&XSystemGetDeviceType, &XSystemGetConsoleId, &XSystemGetXboxLiveSandboxId};
+const StorageDispatch storage_api{&XPersistentLocalStorageGetPathSize, &XPersistentLocalStorageGetPath,
+                                  &XPersistentLocalStorageGetSpaceInfo};
+
+struct Family {
+    uint32_t clsid;
+    uint32_t iid;
+    const char* name;
+    const void* table;
+};
+
+// Synthetic BetterXen dispatch keys, not Microsoft CLSIDs.
+// Data2 = 0x5853, Data3 = 0x4000, Data4 = 80 00 00 00 00 00 00 01.
+const Family families[] = {
+    {0xB7581001, 0xB7581002, "xtaskqueue", &task_queue_api},
+    {0xB7581101, 0xB7581102, "xasync", &async_api},
+    {0xB7581201, 0xB7581202, "xuser", &user_api},
+    {0xB7581301, 0xB7581302, "xstore", &store_api},
+    {0xB7581401, 0xB7581402, "xsystem", &system_api},
+    {0xB7581501, 0xB7581502, "xpersistentlocalstorage", &storage_api},
+};
+
+const Family* find_family(const GUID* clsid) {
+    if (!synthetic_guid(clsid)) return nullptr;
+    for (const auto& family : families) {
+        if (clsid->Data1 == family.clsid) return &family;
+    }
+    return nullptr;
+}
+
+HRESULT WINAPI QueryApiImpl(const GUID* clsid, const GUID* iid, void** out) {
+    if (!out) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", "invalid_args");
+        return E_POINTER;
+    }
+    if (!clsid || !iid) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", "invalid_args");
+        return E_INVALIDARG;
+    }
+    if (!runtime_active()) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", "not_initialized");
+        return runtime_not_initialized;
+    }
+
+    const auto* family = find_family(clsid);
+    if (family && synthetic_guid(iid) && iid->Data1 == family->iid) {
+        *out = const_cast<void*>(family->table);
+        char detail[64];
+        std::snprintf(detail, sizeof(detail), "dispatch family=%s", family->name);
+        bx_log_emit(BX_LOG_INFO, "xgameruntime", "QueryApiImpl", detail);
+        return S_OK;
+    }
+
+    char clsid_text[48], iid_text[48], detail[192];
+    format_guid(clsid_text, sizeof(clsid_text), clsid);
+    format_guid(iid_text, sizeof(iid_text), iid);
+    if (family) {
+        std::snprintf(detail, sizeof(detail), "iid_mismatch family=%s clsid=%s iid=%s", family->name, clsid_text,
+                      iid_text);
+    } else {
+        std::snprintf(detail, sizeof(detail), "unsupported clsid=%s iid=%s", clsid_text, iid_text);
+    }
+    bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", detail);
+    return E_NOINTERFACE;
+}
 
 } // extern "C"

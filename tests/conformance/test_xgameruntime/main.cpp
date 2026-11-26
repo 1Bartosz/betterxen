@@ -277,6 +277,168 @@ int main() {
     check_storage();
     XGameRuntimeUninitialize();
     CHECK(FAILED(XUserAddAsync(1, &uninitialized)));
+
+    // Dynamic loader entry points. Synthetic family GUIDs match xgameruntime.cpp:
+    // Data2 = 0x5853, Data3 = 0x4000, Data4 = 80 00 00 00 00 00 00 01.
+    HMODULE module = GetModuleHandleA("xgameruntime.dll");
+    CHECK(module);
+    const char* names[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2",
+                           "UninitializeApiImpl", "QueryApiImpl", "XErrorReport"};
+    FARPROC procs[6]{};
+    for (int i = 0; i < 6; ++i) {
+        procs[i] = GetProcAddress(module, names[i]);
+        CHECK(procs[i]);
+    }
+    const auto load = [](FARPROC proc, auto& fn) { std::memcpy(&fn, &proc, sizeof(fn)); };
+    using InitFn = HRESULT(WINAPI*)(uint32_t, uint32_t);
+    using InitExFn = HRESULT(WINAPI*)(uint32_t, uint32_t, char);
+    using InitEx2Fn = HRESULT(WINAPI*)(uint32_t, uint32_t, char, const void*);
+    using UninitFn = HRESULT(WINAPI*)();
+    using QueryFn = HRESULT(WINAPI*)(const GUID*, const GUID*, void**);
+    using ErrorFn = HRESULT(WINAPI*)(HRESULT, const char*);
+    InitFn init_api{};
+    InitExFn init_ex{};
+    InitEx2Fn init_ex2{};
+    UninitFn uninit_api{};
+    QueryFn query_api{};
+    ErrorFn error_report{};
+    load(procs[0], init_api);
+    load(procs[1], init_ex);
+    load(procs[2], init_ex2);
+    load(procs[3], uninit_api);
+    load(procs[4], query_api);
+    load(procs[5], error_report);
+
+    struct ApiInitOptions {
+        uint32_t unknown;
+        uint8_t is_inline;
+        uint8_t pad[3];
+        const char* game_config;
+    };
+    static_assert(offsetof(ApiInitOptions, game_config) == 8);
+    const auto family_guid = [](uint32_t data1) {
+        GUID guid{};
+        guid.Data1 = data1;
+        guid.Data2 = 0x5853;
+        guid.Data3 = 0x4000;
+        guid.Data4[0] = 0x80;
+        guid.Data4[7] = 0x01;
+        return guid;
+    };
+    const GUID xsystem = family_guid(0xB7581401);
+    const GUID xsystem_iid = family_guid(0xB7581402);
+    const GUID wrong_iid = family_guid(0xB75814FF);
+    GUID bogus{};
+    bogus.Data1 = 0xDEADBEEF;
+    bogus.Data4[0] = 0x11;
+    constexpr HRESULT not_initialized = static_cast<HRESULT>(0x89240100u);
+    auto* sentinel = reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+    void* api = sentinel;
+
+    CHECK(query_api(&xsystem, &xsystem_iid, nullptr) == E_POINTER);
+    CHECK(api == sentinel);
+    CHECK(query_api(nullptr, &xsystem_iid, &api) == E_INVALIDARG);
+    CHECK(query_api(&xsystem, nullptr, &api) == E_INVALIDARG);
+    CHECK(query_api(&xsystem, &xsystem_iid, &api) == not_initialized);
+    CHECK(init_api(0, 1) == E_INVALIDARG);
+    CHECK(init_ex(1, 0, 2) == E_INVALIDARG);
+    const ApiInitOptions broken{1u, 1u, {0, 0, 0}, nullptr};
+    CHECK(init_ex2(1, 1, 2, &broken) == E_INVALIDARG);
+    const ApiInitOptions file_opt{1u, 0u, {0, 0, 0}, "C:\\bx_synthetic\\MicrosoftGame.config"};
+    CHECK(init_ex2(1, 1, 2, &file_opt) == E_NOTIMPL);
+    void* probe = nullptr;
+    CHECK(XStoreCreateContext(nullptr, &probe) == not_initialized);
+
+    CHECK(init_api(1, 1) == S_OK);
+    CHECK(XGameRuntimeInitialize() == S_OK);
+    CHECK(uninit_api() == S_OK);
+    CHECK(XStoreCreateContext(nullptr, &probe) == S_OK && probe);
+    XStoreCloseContextHandle(probe);
+    XGameRuntimeUninitialize();
+    CHECK(XStoreCreateContext(nullptr, &probe) == not_initialized);
+    CHECK(uninit_api() == not_initialized);
+
+    CHECK(init_ex(1, 1, 2) == S_OK);
+    CHECK(init_ex2(1, 1, 6, nullptr) == S_OK);
+    CHECK(uninit_api() == S_OK);
+    CHECK(XStoreCreateContext(nullptr, &probe) == S_OK && probe);
+    XStoreCloseContextHandle(probe);
+    XGameRuntimeUninitialize();
+    CHECK(XStoreCreateContext(nullptr, &probe) == not_initialized);
+
+    CHECK(init_api(1, 1) == S_OK);
+    api = nullptr;
+    CHECK(query_api(&xsystem, &xsystem_iid, &api) == S_OK && api);
+    struct SystemHead {
+        uint32_t(WINAPI* get_device_type)();
+    };
+    CHECK(static_cast<SystemHead*>(api)->get_device_type() == XSystemGetDeviceType());
+    api = sentinel;
+    CHECK(query_api(&xsystem, &wrong_iid, &api) == E_NOINTERFACE && api == sentinel);
+
+    struct LogSpan {
+        bool from_file = false;
+        char path[512]{};
+        long mark = 0;
+        HANDLE pipe_read = nullptr;
+        HANDLE pipe_write = nullptr;
+        HANDLE saved_err = nullptr;
+        char text[64 * 1024]{};
+
+        bool start() {
+            const auto n = GetEnvironmentVariableA("BX_LOG_FILE", path, sizeof(path));
+            if (n > 0 && n < sizeof(path)) {
+                from_file = true;
+                if (auto* file = std::fopen(path, "rb")) {
+                    std::fseek(file, 0, SEEK_END);
+                    mark = std::ftell(file);
+                    std::fclose(file);
+                }
+                return true;
+            }
+            if (!CreatePipe(&pipe_read, &pipe_write, nullptr, sizeof(text))) return false;
+            saved_err = GetStdHandle(STD_ERROR_HANDLE);
+            return SetStdHandle(STD_ERROR_HANDLE, pipe_write) != 0;
+        }
+
+        void finish() {
+            size_t got = 0;
+            if (from_file) {
+                if (auto* file = std::fopen(path, "rb")) {
+                    std::fseek(file, mark, SEEK_SET);
+                    got = std::fread(text, 1, sizeof(text) - 1, file);
+                    std::fclose(file);
+                }
+            } else if (pipe_read) {
+                SetStdHandle(STD_ERROR_HANDLE, saved_err);
+                CloseHandle(pipe_write);
+                DWORD chunk = 0;
+                while (got + 1 < sizeof(text) &&
+                       ReadFile(pipe_read, text + got, static_cast<DWORD>(sizeof(text) - 1 - got), &chunk, nullptr) &&
+                       chunk) {
+                    got += chunk;
+                }
+                CloseHandle(pipe_read);
+            }
+            text[got] = '\0';
+        }
+
+        bool has(const char* needle) const { return std::strstr(text, needle) != nullptr; }
+    } span;
+    CHECK(span.start());
+    const auto unsupported = query_api(&bogus, &bogus, &api);
+    const auto reported = error_report(E_FAIL, "synthetic-gdk-error");
+    const auto reported_null = error_report(E_FAIL, nullptr);
+    span.finish();
+    CHECK(unsupported == E_NOINTERFACE && api == sentinel);
+    CHECK(reported == S_OK && reported_null == S_OK);
+    CHECK(span.has("\"sub\":\"xgameruntime\",\"event\":\"QueryApiImpl\"") && span.has("unsupported clsid=DEADBEEF"));
+    CHECK(span.has("\"sub\":\"xgameruntime\",\"event\":\"XErrorReport\"") &&
+          span.has("hr=0x80004005 msg=synthetic-gdk-error"));
+    CHECK(span.has("hr=0x80004005 msg=(null)"));
+    XGameRuntimeUninitialize();
+    CHECK(XStoreCreateContext(nullptr, &probe) == not_initialized);
+
     std::printf("xgameruntime conformance passed (%s, synthetic license %s)\n",
                 profile, entitled ? "active" : "inactive");
     return 0;
