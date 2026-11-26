@@ -6,6 +6,7 @@
 
 #include "bx_log.h"
 #include "bx_xmem_internal.h"
+#include "xmem_accounting.h"
 
 namespace {
 constexpr SIZE_T small_page = 64 * 1024;
@@ -38,7 +39,6 @@ SRWLOCK memory_lock = SRWLOCK_INIT;
 PageBlock* blocks = nullptr;
 View* views = nullptr;
 ULONG_PTR next_tag = 1;
-uint64_t physical_bytes = 0;
 
 struct Lock {
     Lock() { AcquireSRWLockExclusive(&memory_lock); }
@@ -116,6 +116,9 @@ bool remove_view(View** link) {
     return true;
 }
 
+// Require every page slot in [base, base + count * size) to be actively mapped
+// with matching page size before unmapping; empty or partial spans fail without
+// modifying any existing views.
 PVOID unmap_span(BYTE* base, SIZE_T count, SIZE_T size) {
     if (!base) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -123,6 +126,19 @@ PVOID unmap_span(BYTE* base, SIZE_T count, SIZE_T size) {
     }
     const auto begin = reinterpret_cast<uintptr_t>(base);
     const auto end = begin + count * size;
+
+    SIZE_T matched = 0;
+    for (const View* view = views; view; view = view->next) {
+        const auto address = reinterpret_cast<uintptr_t>(view->address);
+        if (address >= begin && address < end && view->page->block->size == size) {
+            ++matched;
+        }
+    }
+    if (matched != count) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
     for (View** link = &views; *link;) {
         View* view = *link;
         const auto address = reinterpret_cast<uintptr_t>(view->address);
@@ -135,6 +151,8 @@ PVOID unmap_span(BYTE* base, SIZE_T count, SIZE_T size) {
     return base;
 }
 
+// Duplicate tags in `tags` are intentionally permitted so a single virtual span
+// can alias one physical page at multiple offsets (e.g. ring buffers / tiles).
 PVOID map_pages(PVOID address, SIZE_T count, uint64_t flags, const ULONG_PTR* tags) {
     const SIZE_T size = page_size(flags);
     if (!valid_span(address, count, size)) {
@@ -221,6 +239,9 @@ PVOID map_pages(PVOID address, SIZE_T count, uint64_t flags, const ULONG_PTR* ta
 }
 } // namespace
 
+// Clean-room synthetic signatures modeled after public Win32 AWE
+// AllocateUserPhysicalPages / FreeUserPhysicalPages (memoryapi.h, [in, out]
+// page count pointer), pending a public console flags/signature ABI.
 extern "C" BOOL WINAPI XMemAllocatePhysicalPages(SIZE_T* num_pages, PULONG_PTR page_array,
                                                uint64_t flags) {
     const SIZE_T size = page_size(flags);
@@ -231,26 +252,28 @@ extern "C" BOOL WINAPI XMemAllocatePhysicalPages(SIZE_T* num_pages, PULONG_PTR p
 
     Lock lock;
     const SIZE_T count = *num_pages;
-    const auto* config = bx_get_runtime_config();
-    const uint64_t limit = config ? config->title_memory_limit_bytes : (8ULL << 30);
-    if (physical_bytes > limit || count > (limit - physical_bytes) / size
-        || count > std::numeric_limits<ULONG_PTR>::max() - next_tag) {
+    if (count > std::numeric_limits<ULONG_PTR>::max() - next_tag
+        || count > std::numeric_limits<SIZE_T>::max() / sizeof(Page)
+        || count > std::numeric_limits<uint64_t>::max() / size) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+    const uint64_t total_bytes = static_cast<uint64_t>(count) * size;
+    if (!bx_xmem::try_reserve_physical(total_bytes)) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return FALSE;
     }
 
-    if (count > std::numeric_limits<SIZE_T>::max() / sizeof(Page)) {
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return FALSE;
-    }
     auto* entries = new (std::nothrow) Page[count]{};
     if (!entries) {
+        bx_xmem::release_physical(total_bytes);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return FALSE;
     }
     auto* block = new (std::nothrow) PageBlock{next_tag, count, size, count, entries, blocks};
     if (!block) {
         delete[] entries;
+        bx_xmem::release_physical(total_bytes);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return FALSE;
     }
@@ -261,6 +284,7 @@ extern "C" BOOL WINAPI XMemAllocatePhysicalPages(SIZE_T* num_pages, PULONG_PTR p
         if (!section) {
             const DWORD error = GetLastError();
             delete_block(block);
+            bx_xmem::release_physical(total_bytes);
             SetLastError(error);
             return FALSE;
         }
@@ -270,10 +294,11 @@ extern "C" BOOL WINAPI XMemAllocatePhysicalPages(SIZE_T* num_pages, PULONG_PTR p
     blocks = block;
     for (SIZE_T i = 0; i < count; ++i) page_array[i] = next_tag + i;
     next_tag += count;
-    physical_bytes += count * size;
     return TRUE;
 }
 
+// Rejects unknown, wrong-size, or duplicate tags in `page_array` with
+// ERROR_INVALID_PARAMETER without mutating `page_array` or live views.
 extern "C" BOOL WINAPI XMemFreePhysicalPages(SIZE_T* num_pages, PULONG_PTR page_array,
                                            uint64_t flags) {
     const SIZE_T size = page_size(flags);
@@ -325,7 +350,7 @@ extern "C" BOOL WINAPI XMemFreePhysicalPages(SIZE_T* num_pages, PULONG_PTR page_
             delete_block(block);
         }
     }
-    physical_bytes -= count * size;
+    bx_xmem::release_physical(static_cast<uint64_t>(count) * size);
     return TRUE;
 }
 
