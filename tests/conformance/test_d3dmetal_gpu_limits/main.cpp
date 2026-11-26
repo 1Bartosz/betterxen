@@ -19,7 +19,7 @@
  *
  * Output: one "OBSERVED: <check> <outcome>" line per observation, "FAIL:" lines for
  * required checks, and a final summary. Exit 0 when every required check passed,
- * 1 otherwise, 77 when no D3D12 device can be created.
+ * 1 otherwise, 77 when no D3D12 device can be created or it lacks shader model 6.6.
  */
 #ifndef WIDL_EXPLICIT_AGGREGATE_RETURNS
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS /* call struct-returning COM methods with the real x64 ABI */
@@ -130,10 +130,15 @@ bool submit(Gpu& g, const char* what) {
     }
     ID3D12CommandList* lists[] = {g.list};
     g.queue->ExecuteCommandLists(1, lists);
-    g.queue->Signal(g.fence, ++g.fence_value);
+    hr = g.queue->Signal(g.fence, ++g.fence_value);
+    if (FAILED(hr)) {
+        observed("%s queue Signal failed hr=0x%08lx", what, ul(hr));
+        g.lost = true;
+        return false;
+    }
     if (g.fence->GetCompletedValue() < g.fence_value) {
-        g.fence->SetEventOnCompletion(g.fence_value, g.event);
-        if (WaitForSingleObject(g.event, kGpuTimeoutMs) != WAIT_OBJECT_0) {
+        hr = g.fence->SetEventOnCompletion(g.fence_value, g.event);
+        if (FAILED(hr) || WaitForSingleObject(g.event, kGpuTimeoutMs) != WAIT_OBJECT_0) {
             observed("%s GPU work did not finish within %lu ms (queue considered hung; later checks skipped)", what,
                      static_cast<unsigned long>(kGpuTimeoutMs));
             g.lost = true;
@@ -145,9 +150,33 @@ bool submit(Gpu& g, const char* what) {
         g.lost = true;
         return false;
     }
-    g.alloc->Reset();
-    g.list->Reset(g.alloc, nullptr);
+    hr = g.alloc->Reset();
+    if (SUCCEEDED(hr)) hr = g.list->Reset(g.alloc, nullptr);
+    if (FAILED(hr)) {
+        observed("%s allocator or command list Reset failed hr=0x%08lx", what, ul(hr));
+        g.lost = true;
+        return false;
+    }
     return true;
+}
+
+/* Discards whatever is recorded in the open list without executing it (used when a
+ * check fails partway through recording), so the next check starts from an empty list. */
+void abandon(Gpu& g) {
+    if (g.lost) return;
+    g.list->Close();
+    if (FAILED(g.alloc->Reset()) || FAILED(g.list->Reset(g.alloc, nullptr))) g.lost = true;
+}
+
+/* Releases a resource the GPU may have used. After a hung or removed queue the GPU may
+ * still reference it, so it is deliberately leaked instead. */
+template <typename T>
+void drop(const Gpu& g, T*& p) {
+    if (g.lost) {
+        p = nullptr;
+        return;
+    }
+    release(p);
 }
 
 ID3D12Resource* make_buffer(Gpu& g, D3D12_HEAP_TYPE heap, UINT64 size, D3D12_RESOURCE_STATES state,
@@ -289,9 +318,9 @@ bool run_buffer_kernel(Gpu& g, const char* what, ID3D12PipelineState* pso, ID3D1
     } else {
         observed("%s buffer creation or upload failed", what);
     }
-    release(up);
-    release(buf);
-    release(rb);
+    drop(g, up);
+    drop(g, buf);
+    drop(g, rb);
     return ok;
 }
 
@@ -307,7 +336,9 @@ void check_wave64(Gpu& g) {
     ID3D12RootSignature* rs = make_root(g, "wave", params, 1);
     if (!require(rs != nullptr, "wave root signature")) return;
 
-    const std::vector<uint32_t> init(64, kSentinel);
+    /* Two words per thread: (wave width << 16) | lane index, then the dispatch index of the
+     * wave's first active lane, which names the wave the thread ran in. */
+    const std::vector<uint32_t> init(128, kSentinel);
     struct Case {
         const char* name;
         const unsigned char* code;
@@ -339,14 +370,31 @@ void check_wave64(Gpu& g) {
             if (c.control) require(false, "%s: control kernel must write its output", c.name);
             continue;
         }
-        /* Wave width as reported by lane 0; every thread must agree and lanes must count 0..W-1. */
+        /* What D3D12 guarantees: every thread reports the same width, and within each wave the
+         * lane indices are a permutation of 0..W-1. Threads are grouped into waves by the
+         * dispatch index of the wave's first lane; no particular thread-to-lane order is assumed. */
         const uint32_t width = out[0] >> 16;
-        bool layout_ok = width >= 1 && width <= 128;
+        bool layout_ok = width >= 1 && width <= 64 && 64 % width == 0;
+        std::vector<std::vector<uint32_t>> waves(64);
         for (uint32_t i = 0; layout_ok && i < 64; ++i) {
-            layout_ok = (out[i] >> 16) == width && (out[i] & 0xFFFFu) == i % width;
+            const uint32_t lanes = out[2 * i], leader = out[2 * i + 1];
+            layout_ok = (lanes >> 16) == width && leader < 64;
+            if (layout_ok) waves[leader].push_back(lanes & 0xFFFFu);
         }
+        uint32_t wave_count = 0;
+        for (auto& w : waves) {
+            if (!layout_ok || w.empty()) continue;
+            wave_count++;
+            std::vector<bool> seen(width, false);
+            layout_ok = w.size() == width;
+            for (uint32_t lane : w) {
+                layout_ok = layout_ok && lane < width && !seen[lane];
+                if (layout_ok) seen[lane] = true;
+            }
+        }
+        layout_ok = layout_ok && wave_count * width == 64;
         observed("%s ran with wave width %u, lane layout %s", c.name, width, layout_ok ? "consistent" : "INCONSISTENT");
-        if (c.control) require(layout_ok, "%s: lane indices must count 0..W-1 within each wave", c.name);
+        if (c.control) require(layout_ok, "%s: each wave's lane indices must be a permutation of 0..W-1", c.name);
         if (!c.control && layout_ok && width != 64) {
             observed("%s WaveSize(64) not honoured: ran at width %u instead of being rejected", c.name, width);
         }
@@ -456,14 +504,16 @@ uint32_t texel_word(const std::vector<uint8_t>& data, const TexCopy& t, UINT x, 
 }
 
 struct ImageSet {
+    explicit ImageSet(const Gpu& gpu) : g(gpu) {}
+    const Gpu& g;
     ID3D12DescriptorHeap* heap = nullptr;
     std::vector<ID3D12Resource*> tex;
     std::vector<TexCopy> copy;
     std::vector<ID3D12Resource*> rb;
     ~ImageSet() {
-        release(heap);
-        for (auto*& r : tex) release(r);
-        for (auto*& r : rb) release(r);
+        drop(g, heap);
+        for (auto*& r : tex) drop(g, r);
+        for (auto*& r : rb) drop(g, r);
     }
 };
 
@@ -507,8 +557,12 @@ bool make_images(Gpu& g, const char* what, ImageSet& s, const UINT (*dims)[2], c
         D3D12_CPU_DESCRIPTOR_HANDLE h = {cpu.ptr + static_cast<SIZE_T>(i) * inc};
         g.dev->CreateUnorderedAccessView(t, nullptr, &ud, h);
     }
-    ok = ok && submit(g, what);
-    for (auto*& u : uploads) release(u);
+    if (ok) {
+        ok = submit(g, what);
+    } else {
+        abandon(g);
+    }
+    for (auto*& u : uploads) drop(g, u);
     return ok;
 }
 
@@ -558,7 +612,7 @@ void check_atomic64_image(Gpu& g) {
         return;
     }
     {
-        ImageSet s;
+        ImageSet s(g);
         const UINT dims[][2] = {{kTexels, 3}};
         const DXGI_FORMAT fmt[] = {DXGI_FORMAT_R32G32_UINT};
         std::vector<std::vector<uint8_t>> data;
@@ -615,15 +669,16 @@ void check_lock64(Gpu& g, UINT cap, bool required) {
         return;
     }
     {
-        ImageSet s;
+        ImageSet s(g);
         const UINT dims[][2] = {{2 * kTexels, 2}, {kTexels, 2}};
         const DXGI_FORMAT fmt[] = {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_UINT};
         ID3D12Resource* stats = nullptr;
         ID3D12Resource* stats_rb = nullptr;
+        ID3D12Resource* up = nullptr; /* kept alive until the list that copies from it has run */
         bool ok = make_images(g, name, s, dims, fmt, 2);
         if (ok) {
             const uint32_t zeros[2] = {0, 0};
-            ID3D12Resource* up = make_buffer(g, D3D12_HEAP_TYPE_UPLOAD, 8, D3D12_RESOURCE_STATE_GENERIC_READ);
+            up = make_buffer(g, D3D12_HEAP_TYPE_UPLOAD, 8, D3D12_RESOURCE_STATE_GENERIC_READ);
             stats = make_buffer(g, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_STATE_COMMON,
                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
             stats_rb = make_buffer(g, D3D12_HEAP_TYPE_READBACK, 8, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -640,11 +695,13 @@ void check_lock64(Gpu& g, UINT cap, bool required) {
                 uav_barrier(g);
                 transition(g, stats, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 g.list->CopyBufferRegion(stats_rb, 0, stats, 0, 8);
+            } else {
+                abandon(g);
             }
-            release(up);
         }
         std::vector<std::vector<uint8_t>> data;
         ok = ok && read_images(g, name, s, data);
+        drop(g, up);
         uint32_t st[2] = {0, 0};
         ok = ok && map_read(stats_rb, st, sizeof(st));
         if (ok) {
@@ -671,8 +728,8 @@ void check_lock64(Gpu& g, UINT cap, bool required) {
         } else if (required) {
             require(false, "%s: dispatch and readback must complete", name);
         }
-        release(stats);
-        release(stats_rb);
+        drop(g, stats);
+        drop(g, stats_rb);
     }
     release(pso);
     release(rs);
@@ -696,10 +753,16 @@ int main() {
         std::printf("SKIP: D3D12CreateDevice failed hr=0x%08lx\n", ul(hr));
         return 77;
     }
+    /* Every kernel is cs_6_6: below that (or when the query fails) the fixture cannot say
+     * anything about these limits, so it skips instead of reporting a failure. */
     D3D12_FEATURE_DATA_SHADER_MODEL sm = {D3D_SHADER_MODEL_6_6};
-    if (SUCCEEDED(g.dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
-        observed("device.shader_model 0x%x", static_cast<unsigned>(sm.HighestShaderModel));
+    if (FAILED(g.dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) ||
+        sm.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
+        std::printf("SKIP: shader model 6.6 is not available\n");
+        release(g.dev);
+        return 77;
     }
+    observed("device.shader_model 0x%x", static_cast<unsigned>(sm.HighestShaderModel));
 
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -724,6 +787,7 @@ int main() {
     if (g.lost) require(false, "GPU work must finish and the device must stay alive");
 
     std::printf("SUMMARY: %d required checks, %d failed\n", g_required, g_failures);
+    if (g.lost) return 1; /* leave the device and queue alone: the GPU may still be using them */
     release(g.fence);
     release(g.list);
     release(g.alloc);

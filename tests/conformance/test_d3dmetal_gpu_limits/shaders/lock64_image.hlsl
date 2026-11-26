@@ -44,9 +44,13 @@ void locked_update(uint p, uint row, uint64_t operand)
         uint prev;
         InterlockedCompareExchange(Lock[uint2(p, row)], 0u, 1u, prev);
         if (prev == 0u) {
+            // Acquire: order the data reads after taking the lock, so they see the previous
+            // holder's writes (globallycoherent gives visibility, not ordering).
+            DeviceMemoryBarrier();
             uint64_t old = load64(p, row);
             uint64_t now = row == 0u ? old + operand : max(old, operand);
             store64(p, row, now);
+            // Release: the data writes become visible before the lock is freed.
             DeviceMemoryBarrier();
             uint ignored;
             InterlockedExchange(Lock[uint2(p, row)], 0u, ignored);
