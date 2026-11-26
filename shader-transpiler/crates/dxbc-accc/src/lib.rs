@@ -21,11 +21,12 @@
 //! (`include/dxc/DxilContainer/DxilContainer.h`). That is `ProgramVersion`,
 //! `SizeInUint32`, then `DxilBitcodeHeader` (`DXIL` magic, version, bitcode
 //! offset, bitcode size). `SizeInUint32 * 4` must be at least that 24-byte
-//! header and no larger than the chunk. The bitcode size must be non-zero.
-//! The bitcode offset is from the program start, must begin at or after the
-//! header, and offset plus size must fit in `SizeInUint32 * 4`. A zero-length
-//! bitcode is [`ParseError::BadDxilHeader`], matching DXC's
-//! `IsValidDxilProgramHeader`, so preparation does not copy it.
+//! header and no larger than the chunk. `BitcodeOffset` is relative to the
+//! start of `DxilBitcodeHeader`, which begins at program byte 8, and must be
+//! at least 16. `BitcodeSize` must be non-zero, and `8 + BitcodeOffset +
+//! BitcodeSize` must fit in `SizeInUint32 * 4`. A zero-length bitcode is
+//! [`ParseError::BadDxilHeader`], matching DXC's `IsValidDxilProgramHeader`,
+//! so preparation does not copy it.
 //!
 //! The C entry points in [`c_abi`] match `abi/include/bx_shader_bridge.h`.
 //! `bx_shader_inspect` fills the C struct without logging. `bx_shader_prepare_for_d3dmetal`
@@ -211,18 +212,21 @@ fn record_fspx_stage(
 /// `DxilProgramHeader` check from the public DirectXShaderCompiler container.
 ///
 /// `SizeInUint32 * 4` must cover the 24-byte header and fit in `payload`.
-/// `BitcodeOffset` is from the program start and must begin at or after that
-/// header. `BitcodeSize` must be non-zero, and offset plus size must fit in
-/// the declared program. The bitcode bytes are not decoded.
+/// `BitcodeOffset` is from the start of `DxilBitcodeHeader` at program byte 8
+/// and must be at least 16. `BitcodeSize` must be non-zero, and
+/// `8 + BitcodeOffset + BitcodeSize` must fit in the declared program. The
+/// bitcode bytes are not decoded.
 fn read_dxil_program(payload: &[u8]) -> Result<(ShaderStage, u8, u8), ()> {
-    const HEADER: u64 = 24;
-    if payload.len() < HEADER as usize {
+    const PROGRAM_PREFIX: u64 = 8;
+    const BITCODE_HEADER: u64 = 16;
+    const MIN_PROGRAM: u64 = PROGRAM_PREFIX + BITCODE_HEADER;
+    if payload.len() < MIN_PROGRAM as usize {
         return Err(());
     }
     let program_version = read_u32_le(payload, 0).ok_or(())?;
     let size_in_u32 = read_u32_le(payload, 4).ok_or(())?;
     let program_bytes = u64::from(size_in_u32).checked_mul(4).ok_or(())?;
-    if program_bytes < HEADER || program_bytes > payload.len() as u64 {
+    if program_bytes < MIN_PROGRAM || program_bytes > payload.len() as u64 {
         return Err(());
     }
     if payload.get(8..12) != Some(b"DXIL".as_slice()) {
@@ -231,12 +235,13 @@ fn read_dxil_program(payload: &[u8]) -> Result<(ShaderStage, u8, u8), ()> {
     let _dxil_version = read_u32_le(payload, 12).ok_or(())?;
     let bitcode_offset = read_u32_le(payload, 16).ok_or(())?;
     let bitcode_size = read_u32_le(payload, 20).ok_or(())?;
-    if bitcode_size == 0 || u64::from(bitcode_offset) < HEADER {
+    if bitcode_size == 0 || u64::from(bitcode_offset) < BITCODE_HEADER {
         return Err(());
     }
-    let end = u64::from(bitcode_offset)
+    let from_header = u64::from(bitcode_offset)
         .checked_add(u64::from(bitcode_size))
         .ok_or(())?;
+    let end = PROGRAM_PREFIX.checked_add(from_header).ok_or(())?;
     if end > program_bytes {
         return Err(());
     }
@@ -583,14 +588,15 @@ pub(crate) mod testutil {
     }
 
     /// 28-byte `DxilProgramHeader`: version, size 7, `DXIL`, version 1.0,
-    /// bitcode offset 24, and 4 bytes of bitcode.
+    /// `BitcodeOffset` 16 from `DxilBitcodeHeader`, and 4 bytes of bitcode
+    /// starting at program byte 24.
     pub(crate) fn minimal_dxil_program(program_version: u32) -> [u8; 28] {
         let mut payload = [0u8; 28];
         payload[0..4].copy_from_slice(&program_version.to_le_bytes());
         payload[4..8].copy_from_slice(&7u32.to_le_bytes());
         payload[8..12].copy_from_slice(b"DXIL");
         payload[12..16].copy_from_slice(&0x0100u32.to_le_bytes());
-        payload[16..20].copy_from_slice(&24u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&16u32.to_le_bytes());
         payload[20..24].copy_from_slice(&4u32.to_le_bytes());
         payload[24..28].copy_from_slice(&[0xD1, 0x11, 0xC0, 0xDE]);
         payload
@@ -1206,6 +1212,26 @@ mod tests {
         assert!(out_ptr.is_null());
         assert_eq!(out_len, 0);
         assert!(shader_log_lines().is_empty());
+    }
+
+    #[test]
+    fn dxil_bitcode_offset_is_relative_to_bitcode_header() {
+        let prog = (5u32 << 16) | (6u32 << 4) | 6u32;
+        let accepted = minimal_dxil_program(prog);
+        assert_eq!(&accepted[16..20], &16u32.to_le_bytes());
+        assert_eq!(&accepted[20..24], &4u32.to_le_bytes());
+        let blob = build_synthetic_dxbc(&[(b"DXIL", &accepted)]);
+        let info = inspect_dxbc(&blob).expect("DXC-shaped offset 16");
+        assert_eq!(info.kind, ShaderKind::Dxil);
+        assert_eq!(info.stage, ShaderStage::Compute);
+
+        let mut rejected = accepted;
+        rejected[16..20].copy_from_slice(&15u32.to_le_bytes());
+        let blob = build_synthetic_dxbc(&[(b"DXIL", &rejected)]);
+        assert_eq!(
+            inspect_dxbc(&blob),
+            Err(ParseError::BadDxilHeader { chunk: 0 })
+        );
     }
 
     #[test]
