@@ -404,6 +404,184 @@ int check_batched_buffer_transfers(Factory* factory) {
     return 0;
 }
 
+ULONG live_refs(IUnknown* object) {
+    const ULONG held = object->AddRef();
+    object->Release();
+    return held - 1;
+}
+
+// Proves the post-ExecuteCommandLists timeout path: with a 0 ms wait and the
+// copy queue held until that wait is decided, at least one request returns
+// HRESULT_FROM_WIN32(WAIT_TIMEOUT), the device is not removed, the shim still
+// holds the destination, and the destination bytes match after the GPU drains.
+int check_unconfirmed_staged_copy(Factory* factory) {
+    constexpr unsigned kBytes = 16;
+    constexpr int kAttempts = 4;
+    const HRESULT kTimeout = HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+
+    struct RestoreEnv {
+        ~RestoreEnv() {
+            SetEnvironmentVariableW(L"BX_XCRDAPI_COPY_TIMEOUT_MS", nullptr);
+            SetEnvironmentVariableW(L"BX_XCRDAPI_DEFER_COPY", nullptr);
+        }
+    } restore_env;
+    CHECK(SetEnvironmentVariableW(L"BX_XCRDAPI_COPY_TIMEOUT_MS", L"0"));
+    CHECK(SetEnvironmentVariableW(L"BX_XCRDAPI_DEFER_COPY", L"1"));
+
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    Com<ID3D12Device> device;
+    HRESULT hr = D3D12XboxCreateDevice(nullptr, __uuidof(ID3D12Device), device.out());
+    if (hr != S_OK || !device.value) {
+        std::fprintf(stderr, "xcrdapi: unconfirmed D3D12XboxCreateDevice hr=0x%08lx\n", static_cast<unsigned long>(hr));
+        return 1;
+    }
+    Com<ID3D12Resource> upload;
+    Com<ID3D12Resource> readback;
+    hr = create_buffer(device.value, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, kBytes, &upload.value);
+    if (hr != S_OK || !upload.value) {
+        std::fprintf(stderr, "xcrdapi: unconfirmed upload hr=0x%08lx\n", static_cast<unsigned long>(hr));
+        return 1;
+    }
+    hr = create_buffer(device.value, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, kBytes, &readback.value);
+    if (hr != S_OK || !readback.value) {
+        std::fprintf(stderr, "xcrdapi: unconfirmed readback hr=0x%08lx\n", static_cast<unsigned long>(hr));
+        return 1;
+    }
+    if (map_fill(upload.value, 0x5A, kBytes) != 0) return 1;
+
+    unsigned char file_bytes[kBytes];
+    unsigned char expect[kBytes];
+    for (unsigned i = 0; i < kBytes; ++i) {
+        file_bytes[i] = pattern_byte(i);
+        expect[i] = pattern_byte(i);
+    }
+    CHECK(expect[0] != 0x5A);
+    TemporaryFile temporary;
+    WCHAR directory[MAX_PATH];
+    const DWORD directory_len = GetTempPathW(MAX_PATH, directory);
+    CHECK(directory_len && directory_len < MAX_PATH);
+    CHECK(GetTempFileNameW(directory, L"bxu", 0, temporary.name));
+    const HANDLE writer = CreateFileW(temporary.name, GENERIC_WRITE, 0, nullptr, TRUNCATE_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(writer != INVALID_HANDLE_VALUE);
+    DWORD written = 0;
+    const BOOL wrote = WriteFile(writer, file_bytes, kBytes, &written, nullptr);
+    CloseHandle(writer);
+    CHECK(wrote && written == kBytes);
+    Com<File> file;
+    CHECK(factory->OpenFile(temporary.name, file_iid, file.out()) == S_OK);
+
+    HRESULT last_hr = E_FAIL;
+    ULONG last_before = 0;
+    ULONG last_after = 0;
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        Com<ID3D12Resource> dest;
+        hr = create_buffer(device.value, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, kBytes, &dest.value);
+        if (hr != S_OK || !dest.value) {
+            std::fprintf(stderr, "xcrdapi: unconfirmed dest hr=0x%08lx\n", static_cast<unsigned long>(hr));
+            return 1;
+        }
+        D3D12_HEAP_PROPERTIES heap{};
+        hr = dest->GetHeapProperties(&heap, nullptr);
+        if (hr != S_OK || heap.Type != D3D12_HEAP_TYPE_DEFAULT) {
+            std::fprintf(stderr, "xcrdapi: unconfirmed heap hr=0x%08lx type=%d\n",
+                         static_cast<unsigned long>(hr), static_cast<int>(heap.Type));
+            return 1;
+        }
+        if (copy_region(dest.value, 0, upload.value, 0, kBytes,
+                        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_GENERIC_READ) != 0) {
+            return 1;
+        }
+        const ULONG before = live_refs(dest.value);
+        const HRESULT removed_before = device->GetDeviceRemovedReason();
+        if (removed_before != S_OK) {
+            std::fprintf(stderr, "xcrdapi: device removed before unconfirmed copy hr=0x%08lx\n",
+                         static_cast<unsigned long>(removed_before));
+            return 1;
+        }
+
+        Com<Status> status;
+        CHECK(factory->CreateStatusArray(1, status_iid, status.out()) == S_OK);
+        Com<Queue> queue;
+        CHECK(factory->CreateQueue(4, queue_iid, queue.out()) == S_OK);
+        Event event;
+        CHECK(event.handle);
+        Request request{file.value, 0, nullptr, nullptr, kBytes, compression_none, dest.value, 0};
+        CHECK(queue->EnqueueRequest(&request) == S_OK);
+        CHECK(queue->EnqueueStatus(status.value, 0) == S_OK);
+        CHECK(queue->EnqueueSetEvent(event.handle) == S_OK);
+        CHECK(queue->Submit() == S_OK);
+        CHECK(WaitForSingleObject(event.handle, 5000) == WAIT_OBJECT_0);
+        CHECK(queue->Close() == S_OK);
+
+        last_hr = status->GetResult(0);
+        last_before = before;
+        last_after = live_refs(dest.value);
+        const HRESULT removed = device->GetDeviceRemovedReason();
+        if (removed != S_OK) {
+            std::fprintf(stderr, "xcrdapi: device removed during unconfirmed copy hr=0x%08lx\n",
+                         static_cast<unsigned long>(removed));
+            return 1;
+        }
+        // In-flight driver references can sit on top of the shim's hold. The
+        // count after the GPU drains is the one that has to be exactly one
+        // above the pre-request count.
+        if (last_hr != kTimeout || last_after < before + 1) continue;
+
+        ErrorRecord error{};
+        CHECK(queue->RetrieveErrorRecord(&error) == S_OK);
+        if (error.failure_count != 1 || error.first_error != kTimeout) {
+            std::fprintf(stderr, "xcrdapi: unconfirmed error record count=%llu hr=0x%08lx\n",
+                         static_cast<unsigned long long>(error.failure_count),
+                         static_cast<unsigned long>(error.first_error));
+            return 1;
+        }
+
+        bool bytes_ok = false;
+        unsigned char got[kBytes];
+        for (int spin = 0; spin < 8 && !bytes_ok; ++spin) {
+            Sleep(spin == 0 ? 200 : 100);
+            if (device->GetDeviceRemovedReason() != S_OK) break;
+            if (copy_region(readback.value, 0, dest.value, 0, kBytes,
+                            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE) != 0) {
+                return 1;
+            }
+            if (map_copy(readback.value, got, kBytes) != 0) return 1;
+            bytes_ok = true;
+            for (unsigned i = 0; i < kBytes; ++i) {
+                if (got[i] != expect[i]) bytes_ok = false;
+            }
+            if (!bytes_ok && spin == 7) bytes_match(got, expect, kBytes, "unconfirmed");
+        }
+        if (!bytes_ok) return 1;
+        const HRESULT removed_after = device->GetDeviceRemovedReason();
+        const ULONG still_held = live_refs(dest.value);
+        if (removed_after != S_OK || still_held != before + 1) {
+            std::fprintf(stderr, "xcrdapi: after drain removed=0x%08lx refs=%lu expected=%lu (at timeout %lu)\n",
+                         static_cast<unsigned long>(removed_after),
+                         static_cast<unsigned long>(still_held),
+                         static_cast<unsigned long>(before + 1),
+                         static_cast<unsigned long>(last_after));
+            return 1;
+        }
+        std::printf("test_xcrdapi: unconfirmed copy attempt=%d hr=0x%08lx refs %lu -> %lu device_removed=0x%08lx bytes=%u\n",
+                    attempt,
+                    static_cast<unsigned long>(last_hr),
+                    static_cast<unsigned long>(before),
+                    static_cast<unsigned long>(still_held),
+                    static_cast<unsigned long>(removed_after),
+                    kBytes);
+        return 0;
+    }
+
+    std::fprintf(stderr, "xcrdapi: unconfirmed path not observed in %d attempts (last hr=0x%08lx refs %lu -> %lu)\n",
+                 kAttempts, static_cast<unsigned long>(last_hr),
+                 static_cast<unsigned long>(last_before), static_cast<unsigned long>(last_after));
+    return 1;
+}
+
 int main() {
     void* unsupported = nullptr;
     CHECK(DStorageGetFactory(file_iid, &unsupported) == E_NOINTERFACE && !unsupported);
@@ -518,6 +696,7 @@ int main() {
 
     if (const int compressed = check_compressed_rejection(factory.value)) return compressed;
     if (const int batched = check_batched_buffer_transfers(factory.value)) return batched;
+    if (const int unconfirmed = check_unconfirmed_staged_copy(factory.value)) return unconfirmed;
 
     std::puts("test_xcrdapi: passed");
 }

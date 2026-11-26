@@ -2,11 +2,12 @@
 #define BETTERXEN_SYNTHETIC_STORAGE_H
 
 #include <windows.h>
-// Host d3d12.dll returns large structs through a hidden pointer. The toolchain
-// header only matches that ABI when this macro is set.
-#ifndef WIDL_EXPLICIT_AGGREGATE_RETURNS
-#define WIDL_EXPLICIT_AGGREGATE_RETURNS
-#endif
+// Host d3d12.dll returns large structs such as D3D12_RESOURCE_DESC through a
+// hidden pointer. WIDL_EXPLICIT_AGGREGATE_RETURNS has to be set before <d3d12.h>
+// is parsed. A #define in this header is too late if the translation unit
+// included <d3d12.h> already. The xcrdapi and test_xcrdapi targets pass it as
+// a compile definition. GetHeapProperties is an HRESULT with out-parameters
+// and does not use that aggregate-return ABI.
 #include <d3d12.h>
 #include <unknwn.h>
 
@@ -38,6 +39,12 @@ struct Status : IUnknown {
 // (an ID3D12Resource buffer written at `resource_offset`). CPU-visible heaps are
 // mapped. A default heap is copied on the device GetDevice returns and must be
 // in D3D12_RESOURCE_STATE_COMMON across that copy.
+// BX_XCRDAPI_COPY_TIMEOUT_MS is the staged-copy wait in milliseconds. Unset,
+// empty, or non-numeric values use 10000. Numeric values clamp to 0..60000.
+// BX_XCRDAPI_DEFER_COPY=1 holds the copy queue on a private fence until that
+// wait has been decided, so a 0 ms timeout observes an unconfirmed completion
+// instead of racing a fast GPU, then lets the copy finish. An unconfirmed
+// completion keeps the destination and the copy's GPU objects alive.
 // `compression` values are BetterXen-defined selectors, not an Xbox enum.
 struct Request {
     File* file;
