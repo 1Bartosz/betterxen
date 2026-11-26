@@ -1,7 +1,9 @@
+#include "com_dispatch.h"
 #include "task_queue.h"
 
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <mutex>
@@ -315,6 +317,146 @@ HRESULT create_storage(const wchar_t* path) {
     return FAILED(hr) ? hr : ensure_directory(path);
 }
 
+// Caller holds state_mutex. Same transition XGameRuntimeUninitialize uses.
+bool release_runtime_ref() {
+    if (!runtime_refs) return false;
+    if (!--runtime_refs) {
+        users.clear();
+        stores.clear();
+    }
+    return true;
+}
+
+bool runtime_active() {
+    std::lock_guard lock(state_mutex);
+    return runtime_refs != 0;
+}
+
+/*
+ * Loader export provenance, checked 2026-11-26.
+ *
+ * Public Microsoft Learn pages that were opened:
+ * XGameRuntimeInitialize, XGameRuntimeUninitialize, and
+ * XGameRuntimeInitializeWithOptions (header named there: XGameRuntimeInit.h),
+ * XGameRuntimeOptions { XGameRuntimeGameConfigSource gameConfigSource; const char* gameConfig },
+ * and XGameRuntimeGameConfigSource : uint32_t { Default, Inline, File }.
+ * Those pages also say the DLL init is ref-counted and that an XErrorReport is
+ * emitted when uninit fails with live objects. They do not give a prototype
+ * for XErrorReport. The XError member list names only XErrorCallback,
+ * XErrorSetCallback, and XErrorSetOptions. XErrorCallback is
+ * bool(HRESULT, const char*, void*).
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgameruntimeinit/functions/xgameruntimeinitialize
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgameruntimeinit/functions/xgameruntimeuninitialize
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgameruntimeinit/functions/xgameruntimeinitializewithoptions
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgameruntimeinit/structures/xgameruntimeoptions
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgameruntimeinit/enumerations/xgameruntimegameconfigsource
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xerror/xerror_members
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xerror/functions/xerrorcallback
+ *
+ * InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl,
+ * UninitializeApiImpl, and a callable XErrorReport prototype were not found
+ * on those pages, and https://github.com/microsoft/GDK/main/include/XGameRuntimeInit.h
+ * returned 404. Their names and parameter lists below are BetterXen-defined
+ * so a static loader can resolve the exports. ApiInitOptions is not the
+ * public XGameRuntimeOptions struct. RuntimeOptions above matches that
+ * public two-field layout. No Microsoft source was copied.
+ */
+struct ApiInitOptions {
+    uint32_t unknown;
+    uint8_t is_inline;
+    uint8_t pad[3];
+    const char* game_config;
+};
+static_assert(offsetof(ApiInitOptions, game_config) == 8);
+
+constexpr uint16_t family_data2 = 0x5853;
+constexpr uint16_t family_data3 = 0x4000;
+
+bool synthetic_guid(const GUID* guid) {
+    return guid->Data2 == family_data2 && guid->Data3 == family_data3 && guid->Data4[0] == 0x80 &&
+           guid->Data4[1] == 0 && guid->Data4[2] == 0 && guid->Data4[3] == 0 && guid->Data4[4] == 0 &&
+           guid->Data4[5] == 0 && guid->Data4[6] == 0 && guid->Data4[7] == 1;
+}
+
+void format_guid(char* dst, size_t cap, const GUID* guid) {
+    std::snprintf(dst, cap, "%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                  static_cast<unsigned long>(guid->Data1), static_cast<unsigned>(guid->Data2),
+                  static_cast<unsigned>(guid->Data3), guid->Data4[0], guid->Data4[1], guid->Data4[2],
+                  guid->Data4[3], guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
+}
+
+bool utf8_continuation(unsigned char c) { return (c & 0xC0) == 0x80; }
+
+/* Byte length of one well-formed UTF-8 character at s, or 0 if s is not one. */
+size_t utf8_len(const unsigned char* s) {
+    const unsigned char c = s[0];
+    size_t len = 0;
+    if (c < 0x80) return 1;
+    if (c >= 0xC2 && c <= 0xDF) len = 2;
+    else if (c == 0xE0 || (c >= 0xE1 && c <= 0xEC) || c == 0xED || (c >= 0xEE && c <= 0xEF)) len = 3;
+    else if (c == 0xF0 || (c >= 0xF1 && c <= 0xF3) || c == 0xF4) len = 4;
+    else return 0;
+    for (size_t i = 1; i < len; ++i) {
+        if (s[i] == 0 || !utf8_continuation(s[i])) return 0;
+    }
+    if (c == 0xE0 && s[1] < 0xA0) return 0;
+    if (c == 0xED && s[1] > 0x9F) return 0;
+    if (c == 0xF0 && s[1] < 0x90) return 0;
+    if (c == 0xF4 && s[1] > 0x8F) return 0;
+    return len;
+}
+
+/*
+ * Append src as JSON string content and valid UTF-8.
+ * A quote or backslash is escaped. Bytes below 0x20 and an invalid UTF-8
+ * byte are written as \u00XX, which stays ASCII. A character that does not
+ * fit is left out, so a multi-byte sequence is never split.
+ */
+void append_escaped(char* dst, size_t cap, size_t* used, const char* src) {
+    size_t u = *used;
+    if (!src) src = "(null)";
+    const auto* p = reinterpret_cast<const unsigned char*>(src);
+    while (*p) {
+        auto fits = [&](size_t n) { return u + n < cap; };
+        const unsigned char c = *p;
+        if (c < 0x20 || c == 0x7F) {
+            if (!fits(6)) break;
+            u += static_cast<size_t>(std::snprintf(dst + u, cap - u, "\\u%04X", c));
+            ++p;
+            continue;
+        }
+        if (c == '"' || c == '\\') {
+            if (!fits(2)) break;
+            dst[u++] = '\\';
+            dst[u++] = static_cast<char>(c);
+            ++p;
+            continue;
+        }
+        const size_t len = c < 0x80 ? 1 : utf8_len(p);
+        if (len == 0) {
+            if (!fits(6)) break;
+            u += static_cast<size_t>(std::snprintf(dst + u, cap - u, "\\u%04X", c));
+            ++p;
+            continue;
+        }
+        if (!fits(len)) break;
+        std::memcpy(dst + u, p, len);
+        u += len;
+        p += len;
+    }
+    if (u < cap) dst[u] = '\0';
+    else if (cap) dst[cap - 1] = '\0';
+    *used = u < cap ? u : cap - 1;
+}
+
+HRESULT check_loader_versions(uint32_t gdk_ver, uint32_t gs_ver, const char* event) {
+    if (gdk_ver == 0 || gs_ver == 0) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", event, "invalid_args");
+        return E_INVALIDARG;
+    }
+    return S_OK;
+}
+
 } // namespace
 
 extern "C" {
@@ -339,10 +481,7 @@ HRESULT WINAPI XGameRuntimeInitializeWithOptions(const RuntimeOptions* options) 
 
 void WINAPI XGameRuntimeUninitialize() {
     std::lock_guard lock(state_mutex);
-    if (runtime_refs && !--runtime_refs) {
-        users.clear();
-        stores.clear();
-    }
+    release_runtime_ref();
 }
 
 HRESULT WINAPI XAsyncGetStatus(AsyncBlock* block, bool wait) {
@@ -560,5 +699,174 @@ OFFLINE_STUB(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync, (AsyncBlock*
 OFFLINE_STUB(XNetworkingQuerySecurityInformationForUrlAsync, (const char*, AsyncBlock*))
 
 #undef OFFLINE_STUB
+
+HRESULT WINAPI XTaskQueueCreate(bx::gdk::DispatchMode, bx::gdk::DispatchMode, void**);
+void WINAPI XTaskQueueCloseHandle(void*);
+bool WINAPI XTaskQueueDispatch(void*, bx::gdk::Port, uint32_t);
+HRESULT WINAPI XTaskQueueSubmitCallback(void*, bx::gdk::Port, void*, void (CALLBACK*)(void*, bool));
+bool WINAPI XTaskQueueGetCurrentProcessTaskQueue(void**);
+
+HRESULT WINAPI InitializeApiImpl(uint32_t gdk_ver, uint32_t gs_ver) {
+    const auto hr = check_loader_versions(gdk_ver, gs_ver, "InitializeApiImpl");
+    return FAILED(hr) ? hr : XGameRuntimeInitialize();
+}
+
+HRESULT WINAPI InitializeApiImplEx(uint32_t gdk_ver, uint32_t gs_ver, char /*mode*/) {
+    const auto hr = check_loader_versions(gdk_ver, gs_ver, "InitializeApiImplEx");
+    return FAILED(hr) ? hr : XGameRuntimeInitialize();
+}
+
+HRESULT WINAPI InitializeApiImplEx2(uint32_t gdk_ver, uint32_t gs_ver, char /*mode*/, const ApiInitOptions* options) {
+    const auto hr = check_loader_versions(gdk_ver, gs_ver, "InitializeApiImplEx2");
+    if (FAILED(hr)) return hr;
+    if (options && options->is_inline && !options->game_config) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", "InitializeApiImplEx2", "invalid_args");
+        return E_INVALIDARG;
+    }
+    // Custom game config is the same unimplemented path as XGameRuntimeInitializeWithOptions.
+    if (options && (options->is_inline || options->game_config)) {
+        BX_STUB_LOG("xgameruntime.dll", "InitializeApiImplEx2");
+        return E_NOTIMPL;
+    }
+    return XGameRuntimeInitialize();
+}
+
+HRESULT WINAPI UninitializeApiImpl() {
+    bool released;
+    {
+        std::lock_guard lock(state_mutex);
+        released = release_runtime_ref();
+    }
+    if (!released) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", "UninitializeApiImpl", "not_initialized");
+        return runtime_not_initialized;
+    }
+    return S_OK;
+}
+
+void WINAPI XErrorReport(HRESULT hr, const char* message) {
+    char detail[480];
+    const auto prefix = std::snprintf(detail, sizeof(detail), "hr=0x%08lX msg=",
+                                      static_cast<unsigned long>(static_cast<uint32_t>(hr)));
+    size_t used = prefix > 0 ? static_cast<size_t>(prefix) : 0;
+    if (used >= sizeof(detail)) used = sizeof(detail) - 1;
+    append_escaped(detail, sizeof(detail), &used, message);
+    bx_log_emit(BX_LOG_ERROR, "xgameruntime", "XErrorReport", detail);
+}
+
+struct TaskQueueDispatch {
+    decltype(&XTaskQueueCreate) create;
+    decltype(&XTaskQueueCloseHandle) close_handle;
+    decltype(&XTaskQueueDispatch) dispatch;
+    decltype(&XTaskQueueSubmitCallback) submit;
+    decltype(&XTaskQueueGetCurrentProcessTaskQueue) current;
+};
+struct AsyncDispatch {
+    decltype(&XAsyncGetStatus) get_status;
+    decltype(&XAsyncGetResultSize) get_result_size;
+    decltype(&XAsyncCancel) cancel;
+};
+struct UserDispatch {
+    decltype(&XUserAddAsync) add_async;
+    decltype(&XUserAddResult) add_result;
+    decltype(&XUserGetId) get_id;
+    decltype(&XUserGetGamertag) get_gamertag;
+};
+struct StoreDispatch {
+    decltype(&XStoreCreateContext) create_context;
+    decltype(&XStoreQueryGameLicenseAsync) query_license_async;
+    decltype(&XStoreQueryGameLicenseResult) query_license_result;
+};
+struct SystemDispatch {
+    decltype(&XSystemGetDeviceType) get_device_type;
+    decltype(&XSystemGetConsoleId) get_console_id;
+    decltype(&XSystemGetXboxLiveSandboxId) get_sandbox_id;
+};
+struct StorageDispatch {
+    decltype(&XPersistentLocalStorageGetPathSize) get_path_size;
+    decltype(&XPersistentLocalStorageGetPath) get_path;
+    decltype(&XPersistentLocalStorageGetSpaceInfo) get_space_info;
+};
+
+const TaskQueueDispatch task_queue_api{&XTaskQueueCreate, &XTaskQueueCloseHandle, &XTaskQueueDispatch,
+                                       &XTaskQueueSubmitCallback, &XTaskQueueGetCurrentProcessTaskQueue};
+const AsyncDispatch async_api{&XAsyncGetStatus, &XAsyncGetResultSize, &XAsyncCancel};
+const UserDispatch user_api{&XUserAddAsync, &XUserAddResult, &XUserGetId, &XUserGetGamertag};
+const StoreDispatch store_api{&XStoreCreateContext, &XStoreQueryGameLicenseAsync, &XStoreQueryGameLicenseResult};
+const SystemDispatch system_api{&XSystemGetDeviceType, &XSystemGetConsoleId, &XSystemGetXboxLiveSandboxId};
+const StorageDispatch storage_api{&XPersistentLocalStorageGetPathSize, &XPersistentLocalStorageGetPath,
+                                  &XPersistentLocalStorageGetSpaceInfo};
+
+struct Family {
+    uint32_t clsid;
+    uint32_t iid;
+    const char* name;
+    const void* table;
+};
+
+// Synthetic BetterXen dispatch keys, not Microsoft CLSIDs.
+// Data2 = 0x5853, Data3 = 0x4000, Data4 = 80 00 00 00 00 00 00 01.
+const Family families[] = {
+    {0xB7581001, 0xB7581002, "xtaskqueue", &task_queue_api},
+    {0xB7581101, 0xB7581102, "xasync", &async_api},
+    {0xB7581201, 0xB7581202, "xuser", &user_api},
+    {0xB7581301, 0xB7581302, "xstore", &store_api},
+    {0xB7581401, 0xB7581402, "xsystem", &system_api},
+    {0xB7581501, 0xB7581502, "xpersistentlocalstorage", &storage_api},
+};
+
+const Family* find_family(const GUID* clsid) {
+    if (!synthetic_guid(clsid)) return nullptr;
+    for (const auto& family : families) {
+        if (clsid->Data1 == family.clsid) return &family;
+    }
+    return nullptr;
+}
+
+HRESULT WINAPI QueryApiImpl(const GUID* clsid, const GUID* iid, void** out) {
+    if (!out) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", "invalid_args");
+        return E_POINTER;
+    }
+    *out = nullptr;
+    if (!clsid || !iid) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", "invalid_args");
+        return E_INVALIDARG;
+    }
+    if (!runtime_active()) {
+        bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", "not_initialized");
+        return runtime_not_initialized;
+    }
+
+    bool public_clsid_known = false;
+    if (bx::gdk::query_public_gdk_interface(clsid, iid, out, &public_clsid_known)) {
+        return S_OK;
+    }
+
+    const auto* family = find_family(clsid);
+    if (family && synthetic_guid(iid) && iid->Data1 == family->iid) {
+        *out = const_cast<void*>(family->table);
+        char detail[64];
+        std::snprintf(detail, sizeof(detail), "dispatch family=%s", family->name);
+        bx_log_emit(BX_LOG_INFO, "xgameruntime", "QueryApiImpl", detail);
+        return S_OK;
+    }
+
+    char clsid_text[48], iid_text[48], detail[192], symbol[160];
+    format_guid(clsid_text, sizeof(clsid_text), clsid);
+    format_guid(iid_text, sizeof(iid_text), iid);
+    std::snprintf(symbol, sizeof(symbol), "QueryApiImpl(%s/%s)", clsid_text, iid_text);
+    if (family) {
+        std::snprintf(detail, sizeof(detail), "iid_mismatch family=%s clsid=%s iid=%s", family->name, clsid_text,
+                      iid_text);
+    } else if (public_clsid_known) {
+        std::snprintf(detail, sizeof(detail), "public_iid_mismatch clsid=%s iid=%s", clsid_text, iid_text);
+    } else {
+        std::snprintf(detail, sizeof(detail), "unsupported clsid=%s iid=%s", clsid_text, iid_text);
+    }
+    bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", detail);
+    BX_STUB_LOG("xgameruntime.dll", symbol);
+    return E_NOINTERFACE;
+}
 
 } // extern "C"
