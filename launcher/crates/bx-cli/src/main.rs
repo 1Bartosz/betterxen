@@ -426,6 +426,45 @@ where
     Ok(prefixes)
 }
 
+/// The prefix a named bottle resolves to now, if that is no longer `staged_prefix`.
+///
+/// For a managed-only bottle CrossOver's `bin/wine` may create a private stub bottle and launch
+/// the guest there. Shims staged before launch then sit in a prefix the guest never used; this
+/// detects that so the run can say so instead of reporting "staged" (#474).
+fn staging_prefix_mismatch<F>(
+    staged_prefix: &Path,
+    bottle: Option<&str>,
+    mut re_resolve: F,
+) -> Result<Option<PathBuf>, String>
+where
+    F: FnMut(&str) -> Result<PathBuf, String>,
+{
+    let Some(name) = bottle else {
+        return Ok(None);
+    };
+    let current = re_resolve(name)?;
+    let same = |a: &Path, b: &Path| {
+        a == b || matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
+    };
+    Ok((!same(&current, staged_prefix)).then_some(current))
+}
+
+/// What is left of `--timeout` for the guest after initialization took `used`. `Ok(None)` means
+/// no limit. An error means initialization used all of it: the guest must not be started only to
+/// be reported as timed out, as if it had hung (#474).
+fn guest_time_left(timeout: Option<Duration>, used: Duration) -> Result<Option<Duration>, String> {
+    match timeout {
+        None => Ok(None),
+        Some(limit) if used < limit => Ok(Some(limit - used)),
+        Some(limit) => Err(format!(
+            "initialization (prefix setup and shim staging) took {:.1}s and used the whole \
+             --timeout of {:.1}s; the guest was not started",
+            used.as_secs_f64(),
+            limit.as_secs_f64()
+        )),
+    }
+}
+
 /// `bin/wine` deletes an inherited `WINEDLLOVERRIDES` and applies the bottle's
 /// `[EnvironmentVariables]` over what it is given, so bottle mode passes both as options.
 fn bottle_options(backend: Option<&str>) -> Vec<String> {
@@ -585,14 +624,10 @@ fn appended_since<'a>(bytes: &'a [u8], identity: (u64, u64), before: Option<&Log
     appended.unwrap_or(bytes)
 }
 
-/// What is left of `--timeout` after `elapsed` wall-clock time, of which `suspended` was spent
-/// stopped by Ctrl-Z. Suspended time is not charged, whichever phase of the run it fell in.
-fn remaining_budget(
-    timeout: Option<Duration>,
-    elapsed: Duration,
-    suspended: Duration,
-) -> Option<Duration> {
-    timeout.map(|limit| limit.saturating_sub(elapsed.saturating_sub(suspended)))
+/// The part of `elapsed` wall-clock time that counts against `--timeout`: everything except the
+/// `suspended` time spent stopped by Ctrl-Z, whichever phase of the run that fell in.
+fn active_time(elapsed: Duration, suspended: Duration) -> Duration {
+    elapsed.saturating_sub(suspended)
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
@@ -679,14 +714,22 @@ fn cmd_run(args: &[String]) -> ExitCode {
             }
         }
     }
+    let mut staged_names: Vec<String> = Vec::new();
     match stage::stage_system32(&abs_shims, &system32) {
         Ok(staged) => {
             for item in &staged {
+                if let stage::Staged::Copied(path)
+                | stage::Staged::Replaced(path)
+                | stage::Staged::Unchanged(path) = item
+                    && let Some(name) = path.file_name()
+                {
+                    staged_names.push(name.to_string_lossy().into_owned());
+                }
                 diag(format_args!("bx-cli: {}", item.describe()));
             }
         }
         Err(e) => {
-            let hint = if bottle.is_some() {
+            let hint = if bottle.is_some() && !system32.is_dir() {
                 " (start the bottle once so CrossOver creates it)"
             } else {
                 ""
@@ -737,7 +780,14 @@ fn cmd_run(args: &[String]) -> ExitCode {
 
     // `--timeout` bounds the whole run, including any prefix initialization above, but not
     // time the run spent suspended in either phase.
-    let remaining = remaining_budget(timeout, started.elapsed(), supervise::suspended_time());
+    let active = active_time(started.elapsed(), supervise::suspended_time());
+    let remaining = match guest_time_left(timeout, active) {
+        Ok(remaining) => remaining,
+        Err(e) => {
+            diag(format_args!("timed out during initialization: {e}"));
+            return ExitCode::from(124);
+        }
+    };
     let outcome = supervise::supervise(cmd, remaining, supervise::received_signal);
     let code = match &outcome {
         Ok(outcome) => outcome.exit_code(),
@@ -780,8 +830,54 @@ fn cmd_run(args: &[String]) -> ExitCode {
             );
         }
     }
-    // The reason for the stop is kept; a failed cleanup only turns success into failure.
-    ExitCode::from(if cleanup_failed { code.max(1) } else { code })
+    // #474: the shims were staged into the prefix resolved before launch. If CrossOver launched
+    // the bottle from a different prefix that does not expose them, the guest never saw them,
+    // and the run must not pass quietly. A different prefix alone is not a failure: a private
+    // stub of a managed bottle links its system32 entries back to the managed prefix.
+    let mut staged_elsewhere = false;
+    if !staged_names.is_empty() {
+        match staging_prefix_mismatch(&environment_dir, bottle.as_deref(), |name| {
+            resolve_bottle_prefix_with_host_env(cx_root, name, inherit_env)
+        }) {
+            Ok(None) => {}
+            Ok(Some(launched)) => {
+                let missing = stage::shims_not_visible_in(
+                    &system32,
+                    &stage::system32_dir(&launched),
+                    &staged_names,
+                );
+                if missing.is_empty() {
+                    diag(format_args!(
+                        "bx-cli: bottle launched in {}; the shims staged in {} are visible there",
+                        launched.display(),
+                        environment_dir.display()
+                    ));
+                } else {
+                    staged_elsewhere = true;
+                    diag(format_args!(
+                        "error: system32 shims were staged in {} but CrossOver launched the \
+                         bottle in {}, where {} cannot be found as staged; the guest did not \
+                         see them. Run again: staging will now use the prefix the bottle \
+                         launches in",
+                        environment_dir.display(),
+                        launched.display(),
+                        missing.join(", ")
+                    ));
+                }
+            }
+            Err(e) => diag(format_args!(
+                "warning: cannot confirm which prefix the bottle launched in, so the staged \
+                 system32 shims may not have been used: {e}"
+            )),
+        }
+    }
+    // The reason for the stop is kept; a failed cleanup or misplaced staging only turns success
+    // into failure.
+    ExitCode::from(if cleanup_failed || staged_elsewhere {
+        code.max(1)
+    } else {
+        code
+    })
 }
 
 fn cmd_shader(path: &str) -> ExitCode {
@@ -990,28 +1086,63 @@ mod tests {
     #[test]
     fn a_pause_in_an_earlier_phase_is_not_charged_to_the_guest() {
         let limit = Some(Duration::from_secs(2));
+        let ms = Duration::from_millis;
         // As reviewed: paused 2.5 s during wineboot with --timeout 2, 0.3 s actually running.
         assert_eq!(
-            remaining_budget(
-                limit,
-                Duration::from_millis(2800),
-                Duration::from_millis(2500)
-            ),
-            Some(Duration::from_millis(1700))
+            guest_time_left(limit, active_time(ms(2800), ms(2500))),
+            Ok(Some(ms(1700)))
         );
-        // Without a pause the wall clock counts in full, down to zero.
+        // Without a pause the wall clock counts in full.
         assert_eq!(
-            remaining_budget(limit, Duration::from_millis(500), Duration::ZERO),
-            Some(Duration::from_millis(1500))
+            guest_time_left(limit, active_time(ms(500), Duration::ZERO)),
+            Ok(Some(ms(1500)))
         );
+        // Initialization that really ran for the whole timeout still stops the launch.
+        assert!(guest_time_left(limit, active_time(ms(5000), ms(2500))).is_err());
+        // More suspension than elapsed time cannot go negative.
+        assert_eq!(active_time(ms(100), ms(900)), Duration::ZERO);
+    }
+
+    #[test]
+    fn staging_into_a_prefix_the_bottle_did_not_launch_in_is_reported() {
+        let resolved_before = Path::new("/bottles/managed/corp");
+        let stub = PathBuf::from("/bottles/private/corp");
+        // CrossOver created a private stub during launch: the bottle now resolves there.
+        let moved = staging_prefix_mismatch(resolved_before, Some("corp"), |name| {
+            assert_eq!(name, "corp");
+            Ok(stub.clone())
+        });
+        assert_eq!(moved, Ok(Some(stub)));
+        // The usual case: the bottle still resolves to where the shims went.
+        let same = staging_prefix_mismatch(resolved_before, Some("corp"), |_| {
+            Ok(resolved_before.to_path_buf())
+        });
+        assert_eq!(same, Ok(None));
+        // A bare --prefix is launched exactly where it was staged; nothing is re-resolved.
+        let bare = staging_prefix_mismatch(resolved_before, None, |_| {
+            panic!("a bare prefix must not be re-resolved")
+        });
+        assert_eq!(bare, Ok(None));
+        // A resolver failure is passed on, not mistaken for a match.
+        let failed = staging_prefix_mismatch(resolved_before, Some("corp"), |_| {
+            Err("cannot locate".to_string())
+        });
+        assert_eq!(failed, Err("cannot locate".to_string()));
+    }
+
+    #[test]
+    fn the_guest_is_not_started_when_initialization_used_the_whole_timeout() {
+        let limit = Some(Duration::from_secs(30));
+        assert_eq!(guest_time_left(None, Duration::from_secs(999)), Ok(None));
         assert_eq!(
-            remaining_budget(limit, Duration::from_secs(5), Duration::ZERO),
-            Some(Duration::ZERO)
+            guest_time_left(limit, Duration::from_secs(12)),
+            Ok(Some(Duration::from_secs(18)))
         );
-        assert_eq!(
-            remaining_budget(None, Duration::from_secs(5), Duration::ZERO),
-            None
-        );
+        for used in [Duration::from_secs(30), Duration::from_secs(45)] {
+            let err = guest_time_left(limit, used).unwrap_err();
+            assert!(err.contains("initialization"), "{err}");
+            assert!(err.contains("guest was not started"), "{err}");
+        }
     }
 
     fn args(list: &[&str]) -> Vec<String> {
