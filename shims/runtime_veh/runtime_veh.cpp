@@ -15,6 +15,7 @@ HANDLE g_log_handle = INVALID_HANDLE_VALUE;
 PVOID g_veh_handle = nullptr;
 LPTOP_LEVEL_EXCEPTION_FILTER g_previous_filter = nullptr;
 std::atomic_flag g_crash_logged{};
+std::atomic<bool> g_crash_in_flight{false};
 std::atomic<uint64_t> g_clwb_traps{0};
 bx_runtime_config_t g_config = {
     BX_ABI_VERSION,
@@ -28,6 +29,11 @@ bx_runtime_config_t g_config = {
 };
 
 void write_log_line(const char* line, size_t len) {
+    // Pause regular logging while a terminal crash record is being emitted so
+    // background threads cannot interleave with the unlocked crash WriteFile.
+    if (g_crash_in_flight.load(std::memory_order_acquire)) {
+        return;
+    }
     if (g_log_lock_ready) {
         EnterCriticalSection(&g_log_lock);
     }
@@ -82,7 +88,8 @@ size_t decode_clwb_length(const uint8_t* ip, size_t size) {
         ++idx;
     }
 
-    while (idx < size && (ip[idx] & 0xF0) == 0x40) {
+    // x86-64 allows at most one REX prefix immediately before the opcode.
+    if (idx < size && (ip[idx] & 0xF0) == 0x40) {
         ++idx;
     }
     if (!has_66 || size - idx < 3 || ip[idx] != 0x0F || ip[idx + 1] != 0xAE) {
@@ -124,6 +131,7 @@ bool is_adx_opcode(const uint8_t* ip, size_t size) {
     if (idx < size && (ip[idx] & 0xF0) == 0x40) {
         ++idx;
     }
+    // Require the 3-byte ADCX/ADOX opcode (0F 38 F6) plus at least 1 ModRM byte.
     return size - idx >= 4 && ip[idx] == 0x0F && ip[idx + 1] == 0x38 && ip[idx + 2] == 0xF6;
 }
 
@@ -131,6 +139,7 @@ LONG WINAPI log_unhandled_exception(PEXCEPTION_POINTERS ep) {
     // Wine can invoke the top-level filter again for the same terminal fault.
     if (ep && ep->ExceptionRecord && ep->ContextRecord &&
         !g_crash_logged.test_and_set(std::memory_order_relaxed)) {
+        g_crash_in_flight.store(true, std::memory_order_release);
         const CONTEXT& ctx = *ep->ContextRecord;
         MEMORY_BASIC_INFORMATION region{};
         unsigned long long module_base = 0;
@@ -169,6 +178,7 @@ LONG WINAPI log_unhandled_exception(PEXCEPTION_POINTERS ep) {
 
     const LONG disposition = g_previous_filter ? g_previous_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
     if (disposition == EXCEPTION_CONTINUE_EXECUTION) {
+        g_crash_in_flight.store(false, std::memory_order_release);
         g_crash_logged.clear(std::memory_order_relaxed);
     }
     return disposition;
@@ -310,7 +320,10 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         bx_log_emit(BX_LOG_INFO, "runtime_veh", "attached",
                     g_config.profile == BX_PROFILE_ANACONDA ? "profile=anaconda" : "profile=lockhart");
     } else if (reason == DLL_PROCESS_DETACH) {
-        // Preserve a filter installed by the guest after this DLL attached.
+        // Restore g_previous_filter only when our filter is still the active
+        // top-level filter; if the guest installed its own filter after attach,
+        // put the guest filter back unchanged. (The frozen .def has no separate
+        // uninstall export, so detach performs this bounded pointer swap.)
         const auto current_filter = SetUnhandledExceptionFilter(g_previous_filter);
         if (current_filter != log_unhandled_exception) {
             SetUnhandledExceptionFilter(current_filter);
