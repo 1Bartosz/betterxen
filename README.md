@@ -54,7 +54,7 @@ Legend: 🟢 **Done / Merged** · 🔵 **Active Milestone** · ⚪ **Planned**
 
 | Track | Focus | Visual Status | Live Issues |
 | --- | --- | --- | --- |
-| **Track A** | Reversible `system32` shim staging (`#459`), AMD-only VEH emulation (`#451`), Track A/F runner integration (`#407`) | `🟨🟨🟨` *(PRs #460, #425 open; #451 active)* | [View Track A](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+A%22) |
+| **Track A** | `system32` shim staging (`#457` / PR `#458` merged), AMD-only VEH emulation (`#451`), Track A/F runner integration (`#407`) | `🟩🟨🟨` *(#458 merged; #451, #407 active)* | [View Track A](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+A%22) |
 | **Track B** | `XCRDAPI.dll` DirectStorage GPU-buffer & batch transfers (`#467`) | `⬜` *(1 ready)* | [View Track B](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+B%22) |
 | **Track C** | `d3d12_xs` `D3D12ConfigureVirtualMemoryX` + placed resources (`#464`), `PresentX` swapchain bridge (`#465`), D3D workload fixes (`#450`) | `⬜⬜⬜` *(3 ready)* | [View Track C](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+C%22) |
 | **Track D** | `dxbc-accc` Windows guest bridge (`#445`), M2 Shader Format Gate ADR & PSO hook (`#466`) | `⬜⬜` *(2 ready)* | [View Track D](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+D%22) |
