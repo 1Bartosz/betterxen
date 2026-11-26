@@ -1,0 +1,5 @@
+LIBRARY bx_shader_bridge.dll
+EXPORTS
+    bx_shader_inspect
+    bx_shader_prepare_for_d3dmetal
+    bx_shader_free_buffer

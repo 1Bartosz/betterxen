@@ -18,6 +18,37 @@ cmake -S "$ROOT_DIR/shims" -B "$BUILD_DIR" \
 
 cmake --build "$BUILD_DIR" --parallel "$JOBS"
 
+# bx_shader_bridge.dll (#445, #484): shader-transpiler/crates/dxbc-accc built for x86-64
+# Windows guests, linked with abi/defs/bx_shader_bridge.def so its export list and internal
+# name are the frozen ones. The verifier below then checks it like every other shim.
+# Cargo and rustc are resolved through rustup when present (a cargo earlier on PATH may have
+# no Windows std), and the build always goes to <repo>/target so no stale DLL is staged.
+BRIDGE_TARGET=x86_64-pc-windows-gnu
+if command -v rustup >/dev/null 2>&1; then
+    BRIDGE_CARGO="$(cd "$ROOT_DIR" && rustup which cargo)"
+    BRIDGE_RUSTC="$(cd "$ROOT_DIR" && rustup which rustc)"
+else
+    BRIDGE_CARGO="$(command -v cargo || true)"
+    BRIDGE_RUSTC="$(command -v rustc || true)"
+fi
+if [ -z "$BRIDGE_CARGO" ] || [ -z "$BRIDGE_RUSTC" ]; then
+    echo "error: cargo/rustc not found; bx_shader_bridge.dll needs the Rust toolchain" >&2
+    exit 1
+fi
+BRIDGE_LIBDIR="$("$BRIDGE_RUSTC" --print target-libdir --target "$BRIDGE_TARGET" 2>/dev/null || true)"
+if [ -z "$BRIDGE_LIBDIR" ] || ! ls "$BRIDGE_LIBDIR"/libstd-*.rlib >/dev/null 2>&1; then
+    echo "error: $("$BRIDGE_RUSTC" --version) has no std for $BRIDGE_TARGET, needed for bx_shader_bridge.dll" >&2
+    echo "error: install it with: rustup target add $BRIDGE_TARGET" >&2
+    exit 1
+fi
+echo "=== Building bx_shader_bridge.dll with $("$BRIDGE_RUSTC" --version) ==="
+RUSTC="$BRIDGE_RUSTC" CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+    "$BRIDGE_CARGO" rustc --locked --release -j "$JOBS" --manifest-path "$ROOT_DIR/Cargo.toml" \
+    -p dxbc-accc --lib --crate-type cdylib --target "$BRIDGE_TARGET" --target-dir "$ROOT_DIR/target" \
+    -- -C link-arg="$ROOT_DIR/abi/defs/bx_shader_bridge.def"
+mkdir -p "$BUILD_DIR/bin"
+cp "$ROOT_DIR/target/$BRIDGE_TARGET/release/dxbc_accc.dll" "$BUILD_DIR/bin/bx_shader_bridge.dll"
+
 echo "=== Verifying built PE32+ DLL Export Directories against abi/defs/*.def ==="
 python3 - "$ROOT_DIR/abi/defs" "$BUILD_DIR/bin" <<'PY'
 import os
