@@ -163,8 +163,27 @@ fn cmd_trace(path: &str) -> ExitCode {
     };
     let summary = summarize_jsonl(&text);
     println!("Trace events     : {}", summary.total_lines);
-    println!("clwb VEH traps   : {}", summary.clwb_events);
+    if let Some(lower_bound) = summary.clwb_trap_lower_bound {
+        println!("clwb VEH traps   : at least {lower_bound} (sampled)");
+    } else {
+        println!("clwb VEH samples : {}", summary.clwb_events);
+    }
     println!("ADX illegal ops  : {}", summary.adx_errors);
+    if !summary.unhandled_exceptions.is_empty() {
+        println!(
+            "\nUnhandled exceptions ({}):",
+            summary.unhandled_exceptions.len()
+        );
+        for crash in summary.unhandled_exceptions {
+            println!(
+                "  code={} module_base={} + RVA={} RIP={}",
+                crash.exception_code.as_deref().unwrap_or("unknown"),
+                crash.module_base.as_deref().unwrap_or("unknown"),
+                crash.rva.as_deref().unwrap_or("unknown"),
+                crash.rip.as_deref().unwrap_or("unknown"),
+            );
+        }
+    }
     if !summary.unimpl_apis.is_empty() {
         println!("\nUnimplemented APIs:");
         for (api, count) in summary.unimpl_apis {
