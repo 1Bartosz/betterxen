@@ -10,10 +10,13 @@
 #include "com_dispatch.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <unordered_set>
 #include <utility>
 
 #include "bx_log.h"
@@ -318,8 +321,21 @@ ComSingleton kPlsObj{kPlsVtbl.data(), &kPlsIid, "IXPersistentLocalStorage"};
 
 // --- XUser ---
 
+std::mutex user_event_mutex;
+uint64_t next_user_event_token = 1;
+std::unordered_set<uint64_t> user_event_tokens;
+
 void WINAPI user_close_handle(void*, void* h) {
     XUserCloseHandle(h);
+}
+int32_t WINAPI user_compare(void*, void* u1, void* u2) {
+    if (u1 == u2) return 0;
+    return reinterpret_cast<uintptr_t>(u1) < reinterpret_cast<uintptr_t>(u2) ? -1 : 1;
+}
+HRESULT WINAPI user_get_max_users(void*, uint32_t* max_users) {
+    if (!max_users) return E_POINTER;
+    *max_users = 1;
+    return S_OK;
 }
 HRESULT WINAPI user_add_async(void*, uint32_t opts, void* async) {
     return XUserAddAsync(opts, async);
@@ -327,8 +343,39 @@ HRESULT WINAPI user_add_async(void*, uint32_t opts, void* async) {
 HRESULT WINAPI user_add_result(void*, void* async, void** out) {
     return XUserAddResult(async, out);
 }
+HRESULT WINAPI user_get_local_id(void*, void* user, uint64_t* local_id) {
+    if (!local_id) return E_POINTER;
+    if (!user) return E_INVALIDARG;
+    *local_id = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(user));
+    return S_OK;
+}
 HRESULT WINAPI user_get_id(void*, void* user, uint64_t* id) {
     return XUserGetId(user, id);
+}
+HRESULT WINAPI user_get_is_guest(void*, void* user, bool* is_guest) {
+    if (!is_guest) return E_POINTER;
+    if (!user) return E_INVALIDARG;
+    *is_guest = false;
+    return S_OK;
+}
+HRESULT WINAPI user_get_state(void*, void* user, uint32_t* state) {
+    if (!state) return E_POINTER;
+    if (!user) return E_INVALIDARG;
+    *state = 0; // XUserState::SignedIn
+    return S_OK;
+}
+HRESULT WINAPI user_get_age_group(void*, void* user, uint32_t* age_group) {
+    if (!age_group) return E_POINTER;
+    if (!user) return E_INVALIDARG;
+    *age_group = 3; // XUserAgeGroup::Adult
+    return S_OK;
+}
+HRESULT WINAPI user_check_privilege(void*, void* user, uint32_t, uint32_t, bool* has_priv, uint32_t* deny_reason) {
+    if (!has_priv) return E_POINTER;
+    if (!user) return E_INVALIDARG;
+    *has_priv = true;
+    if (deny_reason) *deny_reason = 0; // XUserPrivilegeDenyReason::None
+    return S_OK;
 }
 HRESULT WINAPI user_resolve_priv_async(void*, void* user, uint32_t opts, uint32_t priv, void* async) {
     return XUserResolvePrivilegeWithUiAsync(user, opts, priv, async);
@@ -346,6 +393,19 @@ HRESULT WINAPI user_token_result_size(void*, void* async, size_t* sz) {
 HRESULT WINAPI user_token_result(void*, void* async, size_t sz, void* buf, void** res, size_t* used) {
     return XUserGetTokenAndSignatureResult(async, sz, buf, res, used);
 }
+HRESULT WINAPI user_register_change_event(void*, void*, void*, void* callback, uint64_t* token) {
+    if (!token) return E_POINTER;
+    if (!callback) return E_INVALIDARG;
+    std::lock_guard lock(user_event_mutex);
+    const uint64_t id = next_user_event_token++;
+    user_event_tokens.insert(id);
+    *token = id;
+    return S_OK;
+}
+bool WINAPI user_unregister_change_event(void*, uint64_t token, bool) {
+    std::lock_guard lock(user_event_mutex);
+    return user_event_tokens.erase(token) > 0;
+}
 HRESULT WINAPI user_get_gamertag(void*, void* user, uint32_t comp, size_t sz, char* out, size_t* used) {
     return XUserGetGamertag(user, comp, sz, out, used);
 }
@@ -353,14 +413,23 @@ HRESULT WINAPI user_get_gamertag(void*, void* user, uint32_t comp, size_t sz, ch
 const std::array<const void*, 64> kUserVtbl = [] {
     auto v = make_default_vtbl<64>();
     v[4] = reinterpret_cast<const void*>(&user_close_handle);
+    v[5] = reinterpret_cast<const void*>(&user_compare);
+    v[6] = reinterpret_cast<const void*>(&user_get_max_users);
     v[7] = reinterpret_cast<const void*>(&user_add_async);
     v[8] = reinterpret_cast<const void*>(&user_add_result);
+    v[9] = reinterpret_cast<const void*>(&user_get_local_id);
     v[11] = reinterpret_cast<const void*>(&user_get_id);
+    v[13] = reinterpret_cast<const void*>(&user_get_is_guest);
+    v[14] = reinterpret_cast<const void*>(&user_get_state);
+    v[19] = reinterpret_cast<const void*>(&user_get_age_group);
+    v[20] = reinterpret_cast<const void*>(&user_check_privilege);
     v[21] = reinterpret_cast<const void*>(&user_resolve_priv_async);
     v[22] = reinterpret_cast<const void*>(&user_resolve_priv_result);
     v[23] = reinterpret_cast<const void*>(&user_token_async);
     v[24] = reinterpret_cast<const void*>(&user_token_result_size);
     v[25] = reinterpret_cast<const void*>(&user_token_result);
+    v[33] = reinterpret_cast<const void*>(&user_register_change_event);
+    v[34] = reinterpret_cast<const void*>(&user_unregister_change_event);
     return v;
 }();
 ComSingleton kUserObj{kUserVtbl.data(), &kUserClsid, "IXUser"};

@@ -556,6 +556,18 @@ int main() {
         auto get_hint = reinterpret_cast<HRESULT(WINAPI*)(void*, NetHint*)>(net_vtbl[15]);
         NetHint hint{};
         CHECK(SUCCEEDED(get_hint(com_net, &hint)) && hint.init);
+
+        const GUID user_guid = {0x01ACD177, 0x91F9, 0x4763, {0xA3, 0x8E, 0xCC, 0xBB, 0x55, 0xCE, 0x32, 0xE0}};
+        void* com_user = nullptr;
+        CHECK(SUCCEEDED(query_api(&user_guid, &user_guid, &com_user)) && com_user);
+        auto** user_vtbl = *static_cast<void***>(com_user);
+        auto reg_ev = reinterpret_cast<HRESULT(WINAPI*)(void*, void*, void*, void*, uint64_t*)>(user_vtbl[33]);
+        auto unreg_ev = reinterpret_cast<bool(WINAPI*)(void*, uint64_t, bool)>(user_vtbl[34]);
+        uint64_t ev_tok = 0;
+        auto dummy_cb = [](void*, uint64_t, uint32_t) {};
+        CHECK(SUCCEEDED(reg_ev(com_user, nullptr, nullptr, reinterpret_cast<void*>(+dummy_cb), &ev_tok)) && ev_tok != 0);
+        CHECK(unreg_ev(com_user, ev_tok, false));
+        CHECK(!unreg_ev(com_user, ev_tok, false));
     }
 
     XGameRuntimeUninitialize();
