@@ -132,7 +132,7 @@ The repository is organized into disjoint track directories around a single froz
 | [`abi/`](abi/README.md) | Shared (frozen) | C headers + `.def` | Versioned cross-DLL headers (`bx_config.h`, `bx_log.h`, `bx_xmem_internal.h`, `bx_shader_bridge.h`) and canonical export tables for all 16 shim DLLs |
 | `launcher/` | Track A | Rust (`arm64`) | `bx-cli` (`doctor`, `probe`, `shader`, `trace`, `run`), `bx-probe` (PE32+ import classifier), `bx-telemetry` (JSONL trace aggregator) |
 | `shims/runtime_veh/` | Track A | C++20 (`x86_64` PE) | `bx_runtime_veh.dll`: `clwb` VEH trap, `adcx`/`adox` tripwire, Lockhart/Anaconda memory profile config, structured JSONL logging |
-| `shims/win32_bridge/` | Track A | C++20 (`x86_64` PE) | `api-ms-win-core-psm-appnotify-l1-1-0/1.dll` stubs and `ext-ms-win-rtcore-ntuser-*` → `user32.dll` forwarders |
+| `shims/win32_bridge/` | Track A | C++20 (`x86_64` PE) | `api-ms-win-core-psm-appnotify-l1-1-0/1.dll` stubs and `ext-ms-win-rtcore-ntuser-*` → `user32.dll` forwarders; CrossOver answers these API-set names itself for static imports, so the files are not loaded that way ([ADR 0007](docs/adr/0007-api-set-shims-under-crossover.md)) |
 | `shims/xmem/`, `shims/xcrdapi/` | Track B | C++20 (`x86_64` PE) | `xmem.dll` (13 Xbox memory APIs + internal region stats) and `XCRDAPI.dll` (`DStorageGetFactory` async I/O) |
 | `shims/d3d12_xs/`, `shims/xg_xs/`, `shims/ffx_bvh_hooks/` | Track C | C++20 (`x86_64` PE) | Xbox D3D12 COM proxy over D3DMetal 3.0, RDNA 2 texture tiling (`XG`), and future FidelityFX/BVH4 hooks |
 | `shader-transpiler/` | Track D | Rust (`arm64`) | `dxbc-accc` (`DXBC`/`DXIL`/`ACCC`/`FSPX` classifier), future RDNA 2 transpiler & `d3dmetal-native` isolation harness |
