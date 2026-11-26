@@ -43,3 +43,9 @@ EXPORTS
     XGameUiShowTextEntryAsync
     XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync
     XNetworkingQuerySecurityInformationForUrlAsync
+    InitializeApiImpl
+    InitializeApiImplEx
+    InitializeApiImplEx2
+    UninitializeApiImpl
+    QueryApiImpl
+    XErrorReport
