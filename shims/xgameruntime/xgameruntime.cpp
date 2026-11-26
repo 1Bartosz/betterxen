@@ -331,6 +331,35 @@ bool runtime_active() {
     return runtime_refs != 0;
 }
 
+/*
+ * Loader export provenance, checked 2026-11-26.
+ *
+ * Public Microsoft Learn pages that were opened:
+ * XGameRuntimeInitialize, XGameRuntimeUninitialize, and
+ * XGameRuntimeInitializeWithOptions (header named there: XGameRuntimeInit.h),
+ * XGameRuntimeOptions { XGameRuntimeGameConfigSource gameConfigSource; const char* gameConfig },
+ * and XGameRuntimeGameConfigSource : uint32_t { Default, Inline, File }.
+ * Those pages also say the DLL init is ref-counted and that an XErrorReport is
+ * emitted when uninit fails with live objects. They do not give a prototype
+ * for XErrorReport. The XError member list names only XErrorCallback,
+ * XErrorSetCallback, and XErrorSetOptions. XErrorCallback is
+ * bool(HRESULT, const char*, void*).
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgameruntimeinit/functions/xgameruntimeinitialize
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgameruntimeinit/functions/xgameruntimeuninitialize
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgameruntimeinit/functions/xgameruntimeinitializewithoptions
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgameruntimeinit/structures/xgameruntimeoptions
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgameruntimeinit/enumerations/xgameruntimegameconfigsource
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xerror/xerror_members
+ * https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xerror/functions/xerrorcallback
+ *
+ * InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl,
+ * UninitializeApiImpl, and a callable XErrorReport prototype were not found
+ * on those pages, and https://github.com/microsoft/GDK/main/include/XGameRuntimeInit.h
+ * returned 404. Their names and parameter lists below are BetterXen-defined
+ * so a static loader can resolve the exports. ApiInitOptions is not the
+ * public XGameRuntimeOptions struct. RuntimeOptions above matches that
+ * public two-field layout. No Microsoft source was copied.
+ */
 struct ApiInitOptions {
     uint32_t unknown;
     uint8_t is_inline;
@@ -355,21 +384,67 @@ void format_guid(char* dst, size_t cap, const GUID* guid) {
                   guid->Data4[3], guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
 }
 
+bool utf8_continuation(unsigned char c) { return (c & 0xC0) == 0x80; }
+
+/* Byte length of one well-formed UTF-8 character at s, or 0 if s is not one. */
+size_t utf8_len(const unsigned char* s) {
+    const unsigned char c = s[0];
+    size_t len = 0;
+    if (c < 0x80) return 1;
+    if (c >= 0xC2 && c <= 0xDF) len = 2;
+    else if (c == 0xE0 || (c >= 0xE1 && c <= 0xEC) || c == 0xED || (c >= 0xEE && c <= 0xEF)) len = 3;
+    else if (c == 0xF0 || (c >= 0xF1 && c <= 0xF3) || c == 0xF4) len = 4;
+    else return 0;
+    for (size_t i = 1; i < len; ++i) {
+        if (s[i] == 0 || !utf8_continuation(s[i])) return 0;
+    }
+    if (c == 0xE0 && s[1] < 0xA0) return 0;
+    if (c == 0xED && s[1] > 0x9F) return 0;
+    if (c == 0xF0 && s[1] < 0x90) return 0;
+    if (c == 0xF4 && s[1] > 0x8F) return 0;
+    return len;
+}
+
+/*
+ * Append src as JSON string content and valid UTF-8.
+ * A quote or backslash is escaped. Bytes below 0x20 and an invalid UTF-8
+ * byte are written as \u00XX, which stays ASCII. A character that does not
+ * fit is left out, so a multi-byte sequence is never split.
+ */
 void append_escaped(char* dst, size_t cap, size_t* used, const char* src) {
     size_t u = *used;
     if (!src) src = "(null)";
-    for (size_t i = 0; src[i] && u + 2 < cap; ++i) {
-        const auto c = static_cast<unsigned char>(src[i]);
+    const auto* p = reinterpret_cast<const unsigned char*>(src);
+    while (*p) {
+        auto fits = [&](size_t n) { return u + n < cap; };
+        const unsigned char c = *p;
+        if (c < 0x20 || c == 0x7F) {
+            if (!fits(6)) break;
+            u += static_cast<size_t>(std::snprintf(dst + u, cap - u, "\\u%04X", c));
+            ++p;
+            continue;
+        }
         if (c == '"' || c == '\\') {
+            if (!fits(2)) break;
             dst[u++] = '\\';
             dst[u++] = static_cast<char>(c);
-        } else if (c < 0x20) {
-            dst[u++] = ' ';
-        } else {
-            dst[u++] = static_cast<char>(c);
+            ++p;
+            continue;
         }
+        const size_t len = c < 0x80 ? 1 : utf8_len(p);
+        if (len == 0) {
+            if (!fits(6)) break;
+            u += static_cast<size_t>(std::snprintf(dst + u, cap - u, "\\u%04X", c));
+            ++p;
+            continue;
+        }
+        if (!fits(len)) break;
+        std::memcpy(dst + u, p, len);
+        u += len;
+        p += len;
     }
-    dst[u < cap ? u : cap - 1] = '\0';
+    if (u < cap) dst[u] = '\0';
+    else if (cap) dst[cap - 1] = '\0';
     *used = u < cap ? u : cap - 1;
 }
 

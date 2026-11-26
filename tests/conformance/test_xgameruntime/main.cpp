@@ -136,6 +136,29 @@ void check_storage() {
 
 } // namespace
 
+bool valid_utf8(const unsigned char* s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = s[i];
+        size_t len = 0;
+        if (c < 0x80) len = 1;
+        else if (c >= 0xC2 && c <= 0xDF) len = 2;
+        else if (c == 0xE0 || (c >= 0xE1 && c <= 0xEC) || c == 0xED || (c >= 0xEE && c <= 0xEF)) len = 3;
+        else if (c == 0xF0 || (c >= 0xF1 && c <= 0xF3) || c == 0xF4) len = 4;
+        else return false;
+        if (i + len > n) return false;
+        for (size_t k = 1; k < len; ++k) {
+            if ((s[i + k] & 0xC0) != 0x80) return false;
+        }
+        if (c == 0xE0 && s[i + 1] < 0xA0) return false;
+        if (c == 0xED && s[i + 1] > 0x9F) return false;
+        if (c == 0xF0 && s[i + 1] < 0x90) return false;
+        if (c == 0xF4 && s[i + 1] > 0x8F) return false;
+        i += len;
+    }
+    return true;
+}
+
 #ifndef BX_TEST_UNENTITLED
 extern "C" __declspec(dllexport) void BetterXenSyntheticStoreFixture() {}
 #endif
@@ -451,6 +474,16 @@ int main() {
     error_report(E_FAIL, "synthetic-gdk-error");
     error_report(E_FAIL, nullptr);
     error_report(E_FAIL, "err \"quoted\" \\path\nline2");
+    error_report(E_FAIL, "caf\xE9");
+    char long_msg[701];
+    long_msg[0] = 'x';
+    size_t long_n = 1;
+    while (long_n + 2 <= 700) {
+        long_msg[long_n++] = '\xC3';
+        long_msg[long_n++] = '\xA9';
+    }
+    long_msg[long_n] = '\0';
+    error_report(E_FAIL, long_msg);
     span.finish();
     CHECK(unsupported == E_NOINTERFACE && !api);
     CHECK(span.has("\"sub\":\"xgameruntime\",\"event\":\"QueryApiImpl\"") && span.has("unsupported clsid=DEADBEEF"));
@@ -462,7 +495,17 @@ int main() {
     CHECK(span.has("\"sub\":\"xgameruntime\",\"event\":\"XErrorReport\"") &&
           span.has("hr=0x80004005 msg=synthetic-gdk-error"));
     CHECK(span.has("hr=0x80004005 msg=(null)"));
-    CHECK(span.has("msg=err \\\"quoted\\\" \\\\path line2"));
+    CHECK(span.has("msg=err \\\"quoted\\\" \\\\path\\u000Aline2"));
+    CHECK(span.has("caf\\u00E9"));
+    CHECK(std::memchr(span.text, static_cast<unsigned char>(0xE9), std::strlen(span.text)) == nullptr);
+    CHECK(valid_utf8(reinterpret_cast<const unsigned char*>(span.text), std::strlen(span.text)));
+    size_t eacute = 0;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(span.text);
+    const size_t nbytes = std::strlen(span.text);
+    for (size_t i = 0; i + 1 < nbytes; ++i) {
+        if (bytes[i] == 0xC3 && bytes[i + 1] == 0xA9) ++eacute;
+    }
+    CHECK(eacute > 0 && eacute < (long_n - 1) / 2);
     XGameRuntimeUninitialize();
     CHECK(XStoreCreateContext(nullptr, &probe) == not_initialized);
 
