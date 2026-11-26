@@ -117,15 +117,33 @@ pub fn evaluate(
             source,
         }
     })?;
-    let report = report::parse_report(&run.stdout).map_err(HarnessError::Report)?;
-    let verdict = match (run.status, report::judge(&report)) {
-        (None, _) => Verdict::TimedOut {
-            detail: format!("probe killed after {} s", timeout.as_secs()),
-        },
-        (Some(status), Verdict::Pass) if !status.success() => Verdict::Incomplete {
-            reason: format!("probe exited with {status} after a full readback"),
-        },
-        (_, verdict) => verdict,
+    let parsed = report::parse_report(&run.stdout);
+    // Output cut short by a kill or by held-open pipes may end mid-record, so
+    // it is judged by how the run ended, not parsed strictly.
+    let (report, verdict) = match (run.status, run.output_complete) {
+        (None, _) => (
+            parsed.unwrap_or_default(),
+            Verdict::TimedOut {
+                detail: format!("probe killed after {} s", timeout.as_secs()),
+            },
+        ),
+        (Some(_), false) => (
+            parsed.unwrap_or_default(),
+            Verdict::Incomplete {
+                reason: "probe output still open at the deadline; a descendant kept its pipes open"
+                    .to_owned(),
+            },
+        ),
+        (Some(status), true) => {
+            let report = parsed.map_err(HarnessError::Report)?;
+            let verdict = match report::judge(&report) {
+                Verdict::Pass if !status.success() => Verdict::Incomplete {
+                    reason: format!("probe exited with {status} after a full readback"),
+                },
+                verdict => verdict,
+            };
+            (report, verdict)
+        }
     };
     Ok(Evaluation {
         framework_archs,

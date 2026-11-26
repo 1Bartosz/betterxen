@@ -16,15 +16,20 @@
 // computes the expected values independently and judges the readback.
 //
 // Output protocol (stdout, one record per line, prefix "BXD3DM "):
-//   BXD3DM protocol 1
+//   BXD3DM protocol 2
+//   BXD3DM init_failed <call>=<code>         (D3DMetal found but not usable)
 //   BXD3DM framework <path>
 //   BXD3DM step <name> hr=0x<8 hex>          (every D3D call that returns HRESULT)
 //   BXD3DM shader_model 0x<2 hex>            (highest supported, e.g. 0x66)
 //   BXD3DM dispatch groups=<n> threads=<n> words=<n> sentinel=0x<8 hex>
 //   BXD3DM readback <words * 8 lowercase hex digits>
+//   BXD3DM device_removed reason=0x<8 hex>   (fence reported UINT64_MAX)
+//   BXD3DM timeout fence after <n> ms
 //   BXD3DM done
-// Exit status: 0 readback printed, 2 a step failed, 64 usage error,
-// 77 D3DMetal could not be loaded (the harness reports this as SKIP).
+// Exit status: 0 readback printed, 2 a step failed or the GPU did not finish,
+// 3 d3dmetal-native could not initialize the framework, 64 usage error.
+// A missing framework is a SKIP decided by the harness before the probe runs;
+// a framework that fails to initialize is a failure.
 
 #ifndef WIDL_EXPLICIT_AGGREGATE_RETURNS
 #error "build with -DWIDL_EXPLICIT_AGGREGATE_RETURNS=1 to match D3DMetal's D3D12 ABI"
@@ -43,6 +48,7 @@
 
 namespace {
 
+constexpr int kProtocolVersion = 2; // bump with every change to the records above
 constexpr UINT kGroups = 4;
 constexpr UINT kThreadsPerGroup = 64; // must match [numthreads] in fill_cs66.hlsl
 constexpr UINT kWords = kGroups * kThreadsPerGroup;
@@ -53,8 +59,10 @@ constexpr UINT kShaderModel66 = 0x66; // the vendored d3d12.h stops at D3D_SHADE
 
 constexpr int kExitOk = 0;
 constexpr int kExitStepFailed = 2;
+constexpr int kExitInitFailed = 3;
 constexpr int kExitUsage = 64;
-constexpr int kExitSkip = 77;
+// GetCompletedValue() returns this once the device has been removed.
+constexpr UINT64 kDeviceRemovedFenceValue = UINT64_MAX;
 
 // Minimal owning COM pointer: releases on scope exit.
 template <typename T>
@@ -115,29 +123,35 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
     return barrier;
 }
 
+enum class FenceWait { Completed, DeviceRemoved, TimedOut };
+
 // Polls the fence; D3DMetal's event handles are not Win32 events outside Wine.
-bool wait_for_fence(ID3D12Fence* fence, UINT64 value) {
-    for (int ms = 0; ms < kFenceTimeoutMs; ++ms) {
-        if (fence->GetCompletedValue() >= value) return true;
+// The device-removed value is checked first: it would otherwise satisfy `>= value`.
+FenceWait wait_for_fence(ID3D12Fence* fence, UINT64 value) {
+    for (int ms = 0; ms <= kFenceTimeoutMs; ++ms) {
+        const UINT64 completed = fence->GetCompletedValue();
+        if (completed == kDeviceRemovedFenceValue) return FenceWait::DeviceRemoved;
+        if (completed >= value) return FenceWait::Completed;
         const timespec one_ms = {0, 1000000};
         nanosleep(&one_ms, nullptr);
     }
-    return fence->GetCompletedValue() >= value;
+    return FenceWait::TimedOut;
 }
 
 int run(const char* framework_path) {
     // A neutral executable name keeps D3DMetal's per-application profiles out of the run.
-    if (dmn_set_executable_path("/betterxen/bx-d3dmetal-probe.exe") != DMN_SUCCESS) {
-        std::printf("BXD3DM skip dmn_set_executable_path\n");
-        return kExitSkip;
+    const dmn_result path_set = dmn_set_executable_path("/betterxen/bx-d3dmetal-probe.exe");
+    if (path_set != DMN_SUCCESS) {
+        std::printf("BXD3DM init_failed dmn_set_executable_path=%d\n", static_cast<int>(path_set));
+        return kExitInitFailed;
     }
     dmn_options options = {};
     options.struct_size = sizeof(options);
     options.framework_path = framework_path;
     const dmn_result init = dmn_init(&options);
     if (init != DMN_SUCCESS) {
-        std::printf("BXD3DM skip dmn_init=%d\n", static_cast<int>(init));
-        return kExitSkip;
+        std::printf("BXD3DM init_failed dmn_init=%d\n", static_cast<int>(init));
+        return kExitInitFailed;
     }
     const char* loaded = dmn_framework_path();
     std::printf("BXD3DM framework %s\n", loaded ? loaded : "(unknown)");
@@ -246,7 +260,14 @@ int run(const char* framework_path) {
     ID3D12CommandList* lists[] = {list.get()};
     queue->ExecuteCommandLists(1, lists);
     if (!step("Signal", queue->Signal(fence.get(), 1))) return kExitStepFailed;
-    if (!wait_for_fence(fence.get(), 1)) {
+    switch (wait_for_fence(fence.get(), 1)) {
+    case FenceWait::Completed:
+        break;
+    case FenceWait::DeviceRemoved:
+        std::printf("BXD3DM device_removed reason=0x%08x\n",
+                    static_cast<unsigned>(device->GetDeviceRemovedReason()));
+        return kExitStepFailed;
+    case FenceWait::TimedOut:
         std::printf("BXD3DM timeout fence after %d ms\n", kFenceTimeoutMs);
         return kExitStepFailed;
     }
@@ -268,7 +289,7 @@ int run(const char* framework_path) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::printf("BXD3DM protocol 1\n");
+    std::printf("BXD3DM protocol %d\n", kProtocolVersion);
     if (argc != 3 || std::strcmp(argv[1], "--framework") != 0) {
         std::fprintf(stderr, "usage: %s --framework <D3DMetal.framework>\n", argv[0]);
         return kExitUsage;

@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use d3dmetal_harness::framework::{self, Discovery};
-use d3dmetal_harness::{Evaluation, Framework, Verdict, binary_archs, evaluate};
+use d3dmetal_harness::{Evaluation, Framework, binary_archs, evaluate};
 
 const EXIT_FAIL: u8 = 1;
 const EXIT_USAGE: u8 = 2;
@@ -142,10 +142,10 @@ fn run(options: &Options) -> ExitCode {
     match evaluate(probe, &fw, options.timeout) {
         Ok(eval) => {
             print_evaluation(&fw, &eval);
-            match eval.verdict {
-                Verdict::Pass => ExitCode::SUCCESS,
-                Verdict::Skipped { .. } => ExitCode::from(EXIT_SKIP),
-                _ => ExitCode::from(EXIT_FAIL),
+            if eval.verdict.is_pass() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(EXIT_FAIL)
             }
         }
         Err(err) => {

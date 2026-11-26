@@ -8,7 +8,7 @@ use std::fmt;
 use crate::kernel::{self, GROUPS, SENTINEL, THREADS_PER_GROUP, WORDS};
 
 /// Protocol version this harness understands.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 const PREFIX: &str = "BXD3DM ";
 
 /// One D3D call and the HRESULT it returned.
@@ -42,7 +42,10 @@ pub struct ProbeReport {
     pub shader_model: Option<u8>,
     pub dispatch: Option<Dispatch>,
     pub readback: Option<Vec<u32>>,
-    pub skip: Option<String>,
+    /// d3dmetal-native could not initialize the framework (`<call>=<code>`).
+    pub init_failed: Option<String>,
+    /// `GetDeviceRemovedReason()` after the fence reported device removal.
+    pub device_removed: Option<u32>,
     pub timeout: Option<String>,
     pub done: bool,
 }
@@ -142,7 +145,14 @@ pub fn parse_report(stdout: &str) -> Result<ProbeReport, ReportError> {
             "readback" => {
                 report.readback = Some(parse_words(rest).ok_or_else(|| malformed("readback"))?);
             }
-            "skip" => report.skip = Some(rest.to_owned()),
+            "init_failed" => report.init_failed = Some(rest.to_owned()),
+            "device_removed" => {
+                let reason = rest
+                    .strip_prefix("reason=")
+                    .and_then(hex_u32)
+                    .ok_or_else(|| malformed("device_removed"))?;
+                report.device_removed = Some(reason);
+            }
             "timeout" => report.timeout = Some(rest.to_owned()),
             "done" => report.done = true,
             _ => {
@@ -167,10 +177,12 @@ pub fn parse_report(stdout: &str) -> Result<ProbeReport, ReportError> {
 pub enum Verdict {
     /// Every word matched the host-computed value.
     Pass,
-    /// The probe could not load D3DMetal; nothing was tested.
-    Skipped { reason: String },
+    /// A framework was found, but d3dmetal-native could not initialize it.
+    InitFailed { detail: String },
     /// A D3D call failed.
     StepFailed { step: String, hresult: u32 },
+    /// The fence reported device removal before the dispatch completed.
+    DeviceRemoved { reason: u32 },
     /// The GPU did not signal completion in time.
     TimedOut { detail: String },
     /// Every word still holds the sentinel: the kernel never wrote.
@@ -196,9 +208,20 @@ impl fmt::Display for Verdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pass => write!(f, "PASS: {WORDS}/{WORDS} words match"),
-            Self::Skipped { reason } => write!(f, "SKIP: D3DMetal not loaded ({reason})"),
+            Self::InitFailed { detail } => {
+                write!(
+                    f,
+                    "FAIL: D3DMetal framework could not be initialized ({detail})"
+                )
+            }
             Self::StepFailed { step, hresult } => {
                 write!(f, "FAIL: {step} returned 0x{hresult:08x}")
+            }
+            Self::DeviceRemoved { reason } => {
+                write!(
+                    f,
+                    "FAIL: device removed (GetDeviceRemovedReason 0x{reason:08x})"
+                )
             }
             Self::TimedOut { detail } => write!(f, "FAIL: GPU timeout ({detail})"),
             Self::KernelDidNotRun => write!(
@@ -221,9 +244,9 @@ impl fmt::Display for Verdict {
 
 /// Judges a report against the host-computed kernel values.
 pub fn judge(report: &ProbeReport) -> Verdict {
-    if let Some(reason) = &report.skip {
-        return Verdict::Skipped {
-            reason: reason.clone(),
+    if let Some(detail) = &report.init_failed {
+        return Verdict::InitFailed {
+            detail: detail.clone(),
         };
     }
     if let Some(step) = report.steps.iter().find(|s| s.failed()) {
@@ -231,6 +254,9 @@ pub fn judge(report: &ProbeReport) -> Verdict {
             step: step.name.clone(),
             hresult: step.hresult,
         };
+    }
+    if let Some(reason) = report.device_removed {
+        return Verdict::DeviceRemoved { reason };
     }
     if let Some(detail) = &report.timeout {
         return Verdict::TimedOut {
@@ -287,7 +313,7 @@ mod tests {
     fn output(words: &[u32]) -> String {
         let hex: String = words.iter().map(|w| format!("{w:08x}")).collect();
         format!(
-            "BXD3DM protocol 1\n\
+            "BXD3DM protocol 2\n\
              BXD3DM framework /fw/D3DMetal\n\
              D3DMetal: unrelated log line\n\
              BXD3DM step D3D12CreateDevice hr=0x00000000\n\
@@ -339,9 +365,9 @@ mod tests {
     }
 
     #[test]
-    fn failed_step_and_skip_take_precedence() {
+    fn init_failure_and_failed_steps_take_precedence() {
         let failed = parse_report(
-            "BXD3DM protocol 1\nBXD3DM step CreateComputePipelineState hr=0x80070057\n",
+            "BXD3DM protocol 2\nBXD3DM step CreateComputePipelineState hr=0x80070057\n",
         )
         .unwrap();
         assert_eq!(
@@ -351,13 +377,28 @@ mod tests {
                 hresult: 0x8007_0057
             }
         );
-        let skipped = parse_report("BXD3DM protocol 1\nBXD3DM skip dmn_init=-1\n").unwrap();
+        let init = parse_report("BXD3DM protocol 2\nBXD3DM init_failed dmn_init=-2\n").unwrap();
         assert_eq!(
-            judge(&skipped),
-            Verdict::Skipped {
-                reason: "dmn_init=-1".into()
+            judge(&init),
+            Verdict::InitFailed {
+                detail: "dmn_init=-2".into()
             }
         );
+    }
+
+    #[test]
+    fn device_removal_is_reported_with_its_reason() {
+        let removed = parse_report(
+            "BXD3DM protocol 2\nBXD3DM step Signal hr=0x00000000\nBXD3DM device_removed reason=0x887a0006\n",
+        )
+        .unwrap();
+        assert_eq!(
+            judge(&removed),
+            Verdict::DeviceRemoved {
+                reason: 0x887a_0006
+            }
+        );
+        assert!(parse_report("BXD3DM protocol 2\nBXD3DM device_removed 0x887a0006\n").is_err());
     }
 
     #[test]
@@ -372,18 +413,19 @@ mod tests {
             judge(&parse_report(&other).unwrap()),
             Verdict::Incomplete { .. }
         ));
-        let empty = parse_report("BXD3DM protocol 1\n").unwrap();
+        let empty = parse_report("BXD3DM protocol 2\n").unwrap();
         assert!(matches!(judge(&empty), Verdict::Incomplete { .. }));
     }
 
     #[test]
     fn rejects_malformed_and_unversioned_output() {
         assert_eq!(parse_report("BXD3DM done\n").unwrap_err().line, 1);
-        assert!(parse_report("BXD3DM protocol 2\n").is_err());
-        assert!(parse_report("BXD3DM protocol 1\nBXD3DM readback 0123\n").is_err());
-        assert!(parse_report("BXD3DM protocol 1\nBXD3DM readback zzzzzzzz\n").is_err());
-        assert!(parse_report("BXD3DM protocol 1\nBXD3DM step NoHr\n").is_err());
-        assert!(parse_report("BXD3DM protocol 1\nBXD3DM shader_model 0x1ff\n").is_err());
-        assert!(parse_report("BXD3DM protocol 1\nBXD3DM bogus 1\n").is_err());
+        assert!(parse_report("BXD3DM protocol 1\n").is_err());
+        assert!(parse_report("BXD3DM protocol 2\nBXD3DM skip dmn_init=-1\n").is_err());
+        assert!(parse_report("BXD3DM protocol 2\nBXD3DM readback 0123\n").is_err());
+        assert!(parse_report("BXD3DM protocol 2\nBXD3DM readback zzzzzzzz\n").is_err());
+        assert!(parse_report("BXD3DM protocol 2\nBXD3DM step NoHr\n").is_err());
+        assert!(parse_report("BXD3DM protocol 2\nBXD3DM shader_model 0x1ff\n").is_err());
+        assert!(parse_report("BXD3DM protocol 2\nBXD3DM bogus 1\n").is_err());
     }
 }

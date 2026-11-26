@@ -8,7 +8,7 @@ An opt-in harness that runs a user-supplied `D3DMetal.framework` **outside Cross
 
 | Part | Arch | Role |
 | --- | --- | --- |
-| `bx-d3dmetal-harness` (`src/`) | arm64 | Finds the framework and checks both binaries' architectures. Runs the probe with a cleared environment (`HOME`, `TMPDIR`, `DMN_LOG` and a fixed `PATH` only) and a timeout. Judges the readback against values it computes itself (`src/kernel.rs`). |
+| `bx-d3dmetal-harness` (`src/`) | arm64 | Finds the framework and checks both binaries' architectures. Runs the probe with a cleared environment (`HOME`, `TMPDIR`, `DMN_LOG` and a fixed `PATH` only) and a timeout that also bounds output collection. Judges the readback against values it computes itself (`src/kernel.rs`). |
 | `bx-d3dmetal-probe` (`probe/`) | x86_64, under Rosetta 2 | Links d3dmetal-native, creates a D3D12 device, runs the SM 6.6 DXIL kernel below and prints every word it reads back. It never decides correctness. |
 
 The probe fills the output buffer with a sentinel (`0xA5A5A5A5`) first. A readback that is still all sentinel means the kernel never ran, which is reported separately from wrong values.
@@ -33,7 +33,11 @@ BX_D3DMETAL_PROBE=target/d3dmetal-harness/bx-d3dmetal-probe \
   cargo test --locked -p d3dmetal-harness --test live_d3dmetal -- --ignored
 ```
 
-`run` exits with 0 on PASS, 1 on FAIL or error, 2 on a usage error and 77 on SKIP (no framework found). An explicit `--framework` or `$D3DMETAL_FRAMEWORK_PATH` that does not resolve is an error. It never falls back silently to another copy.
+`run` exits with 0 on PASS, 1 on FAIL or error, 2 on a usage error and 77 on SKIP. SKIP means only that no framework was found. An explicit `--framework` or `$D3DMETAL_FRAMEWORK_PATH` that does not resolve is an error. It never falls back silently to another copy. These are also failures, not skips:
+
+- a framework that d3dmetal-native cannot initialize;
+- a fence that reports device removal (`UINT64_MAX`), reported with `GetDeviceRemovedReason()`;
+- probe output still open at the deadline, for example because a descendant inherited its pipes.
 
 ## Synthetic kernel and provenance
 
