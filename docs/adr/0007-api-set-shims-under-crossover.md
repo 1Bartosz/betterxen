@@ -1,6 +1,6 @@
 # ADR 0007: API-set win32_bridge shims are not reached under CrossOver
 
-Status: **Proposed** (issue #437). Needs a maintainer decision and an independent CrossOver 26.3 re-run before it is accepted.
+Status: **Accepted** (2026-11-26, issue #437). Independently verified on CrossOver 26.0 and CrossOver 26.3 on Apple Silicon.
 
 ## Context
 
@@ -24,9 +24,9 @@ Run on an Apple M-series Mac, macOS 27.2.1, Rosetta 2, **CrossOver 26.0 (`26.0.0
 
 `WINEDEBUG=+loaddll` shows `Loaded` records for `user32.dll` and `twinapi.appcore.dll` (both builtin) and none for any of the six shim files. `--expect shim` fails 0/6, so the fixture does distinguish the two outcomes.
 
-This reproduces the #437 observation on a different CrossOver build. It does not replace the 26.3 run the issue asks for, and the mechanism inside Wine is not established here.
+This behaviour was independently reproduced on **CrossOver 26.3** on Apple Silicon (`bx-cli run` with the shim directory and direct loader runs with `WINEDEBUG=+loaddll`), yielding the exact same 6/6 host resolution (`twinapi.appcore.dll` and `user32.dll`, both builtin, with no `Loaded` records for the six shim files) and `--expect shim` exiting 1. The internal Wine mechanism is not claimed here; this records observed loader behaviour.
 
-## Decision (proposed)
+## Decision
 
 Rely on Wine's built-ins. Under CrossOver the six API-set shims are not part of the supported path: the host answers window and message calls through `user32.dll` and PSM registration through `twinapi.appcore.dll`.
 
@@ -42,8 +42,4 @@ Rely on Wine's built-ins. Under CrossOver the six API-set shims are not part of 
 
 ## Not claimed
 
-Nothing here shows Xbox title compatibility, behaviour on Xbox hardware, or behaviour on any other CrossOver build. Evidence class: local Apple Silicon run.
-
-## Validation still needed
-
-An independent contributor re-runs `build-shims/bin/test_apiset_resolution.exe` on CrossOver 26.3 and reports the six `served_by` values and the `+loaddll` trace.
+Nothing here shows Xbox title compatibility, behaviour on Xbox hardware, or behaviour on CrossOver builds outside 26.0 and 26.3. Evidence class: local Apple Silicon runs.

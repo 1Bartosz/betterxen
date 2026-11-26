@@ -172,47 +172,62 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    char exe[MAX_PATH];
-    GetModuleFileNameA(nullptr, exe, sizeof(exe));
-    CharLowerBuffA(exe, static_cast<DWORD>(std::strlen(exe)));
+    char exe[MAX_PATH] = "";
+    const bool exe_ok = path_of(GetModuleHandleA(nullptr), exe, sizeof(exe));
     size_t exe_dir = 0;
-    const bool have_exe_dir = dir_len_of(exe, &exe_dir);
+    const bool have_exe_dir = exe_ok && dir_len_of(exe, &exe_dir);
 
     int matched = 0;
     for (const ApiSetName& n : kNames) {
         const IMAGE_IMPORT_DESCRIPTOR* import = find_import(n.dll);
         const bool imported = import != nullptr;
         HMODULE name_mod = GetModuleHandleA(n.dll);
-        char name_path[MAX_PATH];
+        char name_path[MAX_PATH] = "";
         const bool name_ok = path_of(name_mod, name_path, sizeof(name_path));
 
         HMODULE bound_mod = nullptr;
         char bound_path[MAX_PATH] = "";
+        bool bound_ok = false;
         if (import
             && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                   static_cast<LPCSTR>(first_bound_address(import)), &bound_mod)) {
-            path_of(bound_mod, bound_path, sizeof(bound_path));
+            bound_ok = path_of(bound_mod, bound_path, sizeof(bound_path));
         }
 
         /* The shim serves the name only when the loaded module is that file next to this EXE. */
         Served served = Served::Absent;
-        if (name_mod) {
+        if (name_mod && name_ok && have_exe_dir) {
             size_t dir = 0;
             const char* slash = std::strrchr(name_path, '\\');
-            const bool same_dir = name_ok && have_exe_dir && dir_len_of(name_path, &dir) && dir == exe_dir
+            const bool same_dir = dir_len_of(name_path, &dir) && dir == exe_dir
                                && std::memcmp(name_path, exe, exe_dir) == 0;
             served = same_dir && slash && _stricmp(slash + 1, n.dll) == 0 ? Served::Shim : Served::Host;
         }
 
-        const bool ok = imported && served == expect;
+        const bool lookup_ok = have_exe_dir && name_mod && name_ok && bound_ok;
+        const bool ok = imported && lookup_ok && served == expect;
         if (ok) {
             matched++;
         }
         char detail[160];
-        std::snprintf(detail, sizeof(detail), "%s: served by %s, expected %s", n.export_name, served_name(served),
-                      served_name(expect));
-        checkpoint(n.dll, ok, served_name(served), imported, name_ok ? name_path : "", bound_path,
-                   imported ? detail : "name is not in the static import directory");
+        if (!imported) {
+            std::snprintf(detail, sizeof(detail), "name is not in the static import directory");
+        } else if (!have_exe_dir) {
+            std::snprintf(detail, sizeof(detail), "%s: failed to resolve executable directory", n.export_name);
+        } else if (!name_mod) {
+            std::snprintf(detail, sizeof(detail), "%s: GetModuleHandleA returned null (expected %s)", n.export_name,
+                          served_name(expect));
+        } else if (!name_ok) {
+            std::snprintf(detail, sizeof(detail), "%s: failed to resolve path for name module", n.export_name);
+        } else if (!bound_ok) {
+            std::snprintf(detail, sizeof(detail), "%s: failed to resolve owning module for bound IAT entry",
+                          n.export_name);
+        } else {
+            std::snprintf(detail, sizeof(detail), "%s: served by %s, expected %s", n.export_name, served_name(served),
+                          served_name(expect));
+        }
+        checkpoint(n.dll, ok, served_name(served), imported, name_ok ? name_path : "", bound_ok ? bound_path : "",
+                   detail);
     }
 
     const bool ok = g_fail == 0;
