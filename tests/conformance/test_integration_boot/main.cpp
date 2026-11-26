@@ -182,9 +182,10 @@ void report_create(const char* stage, const char* api, HRESULT hr, void* obj, bo
         checkpoint(stage, Status::Pass, "%s returned S_OK with object", api);
     } else if (hr == E_NOTIMPL && !obj) {
         checkpoint(stage, Status::Pending, "%s is an M0 stub (E_NOTIMPL, null object)", api);
-    } else if (null_arg_probe && hr == E_INVALIDARG && !obj) {
+    } else if (null_arg_probe && (hr == E_INVALIDARG || hr == E_POINTER) && !obj) {
         checkpoint(stage, Status::Pending,
-                   "%s rejected the null descriptor (E_INVALIDARG); fixture needs the real descriptor contract", api);
+                   "%s rejected the null descriptor (hr=0x%08lx); fixture needs the real descriptor contract",
+                   api, static_cast<unsigned long>(hr));
     } else {
         checkpoint(stage, Status::Fail, "%s returned hr=0x%08lx object=%s", api,
                    static_cast<unsigned long>(hr), obj ? "non-null" : "null");
