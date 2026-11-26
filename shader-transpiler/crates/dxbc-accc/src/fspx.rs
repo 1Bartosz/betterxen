@@ -6,8 +6,19 @@
 //! machine code from any particular GPU, and it is not Xbox hardware
 //! verification. Section 6 is a byte range only; this module does not
 //! disassemble it.
+//!
+//! A version-1 table holds at most [`FSPX_MAX_SECTIONS`] descriptors. A larger
+//! count is rejected before any descriptor is compared with another, so
+//! inspection stays allocation-free and the pairwise check stays bounded.
 
 use super::{ShaderStage, read_u32_le};
+
+/// Most sections one synthetic FSPX table may declare.
+///
+/// Validation re-reads earlier descriptors from the payload and does not
+/// allocate. At this cap the pairwise check is at most 2,016 comparisons.
+/// `65` or more is an error before that loop starts.
+pub const FSPX_MAX_SECTIONS: usize = 64;
 
 /// One bounds-checked section descriptor.
 ///
@@ -75,6 +86,7 @@ pub(crate) enum FspxError {
     DuplicateSection { section_id: u32 },
     Overlap { section_id: u32 },
     BadStageConfig,
+    TooManySections(u32),
 }
 
 const HEADER_LEN: usize = 16;
@@ -175,6 +187,9 @@ fn read_fspx_header(payload: &[u8]) -> Result<Option<FspxHeader>, FspxError> {
         return Err(FspxError::BadVersion(version));
     }
     let count = usize::try_from(section_count).map_err(|_| FspxError::Truncated)?;
+    if count > FSPX_MAX_SECTIONS {
+        return Err(FspxError::TooManySections(section_count));
+    }
     let table_bytes = count
         .checked_mul(DESCRIPTOR_LEN)
         .ok_or(FspxError::Truncated)?;

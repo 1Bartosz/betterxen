@@ -2,8 +2,9 @@
 //!
 //! `bx_shader_inspect` classifies a blob and fills `bx_shader_inspection_t`
 //! without logging or retaining chunk lists. `bx_shader_prepare_for_d3dmetal`
-//! copies `container_size` bytes when the container has a `DXIL` chunk, even
-//! if an `FSPX` table in the same container is malformed. It returns
+//! copies `container_size` bytes when the container has a `DXIL` program
+//! header, even if an `FSPX` table in the same container is malformed. An
+//! empty `DXIL` chunk is `BX_SHADER_ERR_INVALID_BLOB`. It returns
 //! `BX_SHADER_ERR_UNSUPPORTED` for ACCC-only input and writes that inspection
 //! record to stderr. Other statuses are not logged. RDNA 2 to DXIL translation
 //! is not implemented. `bx_shader_free_buffer` releases a buffer returned by

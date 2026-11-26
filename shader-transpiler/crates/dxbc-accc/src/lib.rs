@@ -7,12 +7,23 @@
 //! # Synthetic FSPX section table
 //!
 //! An `ACCC` payload that begins with `FSPX` uses the layout documented on
-//! [`fspx`]. Version 0 is a magic-only stub. Version 1 is a section table.
+//! [`fspx`]. Version 0 is a magic-only stub. Version 1 is a section table of
+//! at most [`FSPX_MAX_SECTIONS`] descriptors. A larger count is
+//! [`ParseError::FspxTooManySections`] before any pairwise comparison.
 //! Section 0 and section 7 are opaque header ranges, section 1 is the stage
 //! configuration (`bx_shader_stage_t` values), and section 6 is the RDNA 2
 //! code byte range. The code bytes are not decoded. This layout is synthetic.
 //! Parsing it does not establish that a console compiler produced the blob
 //! and is not Xbox hardware verification.
+//!
+//! A `DXIL` chunk is a program only when its payload is a `DxilProgramHeader`
+//! from the public DirectXShaderCompiler layout
+//! (`include/dxc/DxilContainer/DxilContainer.h`). That is `ProgramVersion`,
+//! `SizeInUint32`, then `DxilBitcodeHeader` (`DXIL` magic, version, bitcode
+//! offset, bitcode size). `SizeInUint32 * 4` must equal the chunk size, and
+//! the bitcode range is measured from the start of `DxilBitcodeHeader` and
+//! must lie inside the program. Anything shorter or inconsistent is
+//! [`ParseError::BadDxilHeader`], so preparation does not copy it.
 //!
 //! The C entry points in [`c_abi`] match `abi/include/bx_shader_bridge.h`.
 //! `bx_shader_inspect` fills the C struct without logging. `bx_shader_prepare_for_d3dmetal`
@@ -30,7 +41,7 @@ pub use c_abi::{
     BX_SHADER_ERR_UNSUPPORTED, BX_SHADER_OK, BxShaderInspection, bx_shader_free_buffer,
     bx_shader_inspect, bx_shader_prepare_for_d3dmetal,
 };
-pub use fspx::{FspxCodeBounds, FspxInfo, FspxSection, FspxStageConfig};
+pub use fspx::{FSPX_MAX_SECTIONS, FspxCodeBounds, FspxInfo, FspxSection, FspxStageConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShaderKind {
@@ -94,6 +105,8 @@ pub enum ParseError {
     FspxDuplicateSection { chunk: usize, section_id: u32 },
     FspxSectionOverlap { chunk: usize, section_id: u32 },
     FspxBadStageConfig { chunk: usize },
+    FspxTooManySections { chunk: usize, count: u32 },
+    BadDxilHeader { chunk: usize },
 }
 
 impl fmt::Display for ParseError {
@@ -125,6 +138,16 @@ impl fmt::Display for ParseError {
             }
             Self::FspxBadStageConfig { chunk } => {
                 write!(f, "malformed FSPX stage configuration in chunk {chunk}")
+            }
+            Self::FspxTooManySections { chunk, count } => {
+                write!(
+                    f,
+                    "FSPX section count {count} exceeds {max} in chunk {chunk}",
+                    max = FSPX_MAX_SECTIONS
+                )
+            }
+            Self::BadDxilHeader { chunk } => {
+                write!(f, "DXIL chunk {chunk} is not a DxilProgramHeader")
             }
         }
     }
@@ -166,7 +189,56 @@ fn fspx_error(chunk: usize, err: fspx::FspxError) -> ParseError {
             ParseError::FspxSectionOverlap { chunk, section_id }
         }
         fspx::FspxError::BadStageConfig => ParseError::FspxBadStageConfig { chunk },
+        fspx::FspxError::TooManySections(count) => ParseError::FspxTooManySections { chunk, count },
     }
+}
+
+/// Keep the first declared FSPX stage and ignore later tables until one exists.
+///
+/// Both [`summarize_dxbc`] and [`inspect_dxbc`] call this for every accepted
+/// table, so a later compute stage fills a gap left by an earlier table.
+fn record_fspx_stage(
+    slot: &mut Option<(ShaderStage, u8, u8)>,
+    stage: Option<(ShaderStage, u8, u8)>,
+) {
+    if slot.is_none() && stage.is_some() {
+        *slot = stage;
+    }
+}
+
+/// `DxilProgramHeader` check from the public DirectXShaderCompiler container.
+///
+/// Returns the program version's stage when the header is consistent with
+/// `payload`. The bitcode itself is not decoded.
+fn read_dxil_program(payload: &[u8]) -> Result<(ShaderStage, u8, u8), ()> {
+    const PREFIX: u64 = 8;
+    const BITCODE_HEADER: u64 = 16;
+    const MIN_PROGRAM: u64 = PREFIX + BITCODE_HEADER;
+    if payload.len() < MIN_PROGRAM as usize {
+        return Err(());
+    }
+    let program_version = read_u32_le(payload, 0).ok_or(())?;
+    let size_in_u32 = read_u32_le(payload, 4).ok_or(())?;
+    let program_bytes = u64::from(size_in_u32).checked_mul(4).ok_or(())?;
+    if program_bytes != payload.len() as u64 || program_bytes < MIN_PROGRAM {
+        return Err(());
+    }
+    if payload.get(8..12) != Some(b"DXIL".as_slice()) {
+        return Err(());
+    }
+    let _dxil_version = read_u32_le(payload, 12).ok_or(())?;
+    let bitcode_offset = read_u32_le(payload, 16).ok_or(())?;
+    let bitcode_size = read_u32_le(payload, 20).ok_or(())?;
+    if u64::from(bitcode_offset) < BITCODE_HEADER {
+        return Err(());
+    }
+    let end = u64::from(bitcode_offset)
+        .checked_add(u64::from(bitcode_size))
+        .ok_or(())?;
+    if end > program_bytes - PREFIX {
+        return Err(());
+    }
+    Ok(program_stage(program_version))
 }
 
 struct ContainerLimit {
@@ -303,21 +375,17 @@ pub(crate) fn summarize_dxbc(bytes: &[u8]) -> Result<DxbcSummary, ParseError> {
     let header = visit_chunks(bytes, |index, _offset, fourcc, size, payload| {
         match &fourcc {
             b"DXIL" => {
+                let stage = read_dxil_program(payload)
+                    .map_err(|()| ParseError::BadDxilHeader { chunk: index })?;
                 has_dxil = true;
                 dxil_size = size;
-                if let Some(prog_ver) = read_u32_le(payload, 0) {
-                    dxil_stage = Some(program_stage(prog_ver));
-                }
+                dxil_stage = Some(stage);
             }
             b"ACCC" => {
                 has_accc = true;
                 accc_size = size;
                 match fspx::scan_fspx(payload) {
-                    Ok(Some(scan)) => {
-                        if fspx_stage.is_none() {
-                            fspx_stage = scan.stage;
-                        }
-                    }
+                    Ok(Some(scan)) => record_fspx_stage(&mut fspx_stage, scan.stage),
                     Ok(None) => {}
                     Err(err) => return Err(fspx_error(index, err)),
                 }
@@ -351,12 +419,17 @@ pub(crate) fn summarize_dxbc(bytes: &[u8]) -> Result<DxbcSummary, ParseError> {
 }
 
 /// `Ok(Some(container_size))` when the container is structurally valid and
-/// contains a `DXIL` chunk. A malformed `FSPX` table does not hide that chunk.
-/// `Ok(None)` means the container is structurally valid and has no `DXIL` chunk.
+/// contains a `DXIL` chunk with a `DxilProgramHeader`. A malformed `FSPX`
+/// table does not hide that chunk. A `DXIL` fourcc whose payload is not that
+/// header is [`ParseError::BadDxilHeader`]. `Ok(None)` means the container is
+/// structurally valid and has no `DXIL` chunk.
 pub(crate) fn dxil_container_len(bytes: &[u8]) -> Result<Option<u32>, ParseError> {
     let mut has_dxil = false;
-    let header = visit_chunks(bytes, |_index, _offset, fourcc, _size, _payload| {
+    let header = visit_chunks(bytes, |index, _offset, fourcc, _size, payload| {
         if &fourcc == b"DXIL" {
+            if read_dxil_program(payload).is_err() {
+                return Err(ParseError::BadDxilHeader { chunk: index });
+            }
             has_dxil = true;
         }
         Ok(())
@@ -392,11 +465,11 @@ pub fn inspect_dxbc(bytes: &[u8]) -> Result<ShaderInspection, ParseError> {
     let header = visit_chunks(bytes, |index, offset, fourcc, size, payload| {
         match &fourcc {
             b"DXIL" => {
+                let stage = read_dxil_program(payload)
+                    .map_err(|()| ParseError::BadDxilHeader { chunk: index })?;
                 has_dxil = true;
                 dxil_size = size;
-                if let Some(prog_ver) = read_u32_le(payload, 0) {
-                    dxil_stage = Some(program_stage(prog_ver));
-                }
+                dxil_stage = Some(stage);
             }
             b"ACCC" => {
                 has_accc = true;
@@ -404,14 +477,13 @@ pub fn inspect_dxbc(bytes: &[u8]) -> Result<ShaderInspection, ParseError> {
                 match fspx::parse_fspx(payload) {
                     Ok(Some(info)) => {
                         accc_is_fspx = true;
+                        record_fspx_stage(
+                            &mut fspx_stage,
+                            info.stage_config.map(|cfg| {
+                                (cfg.stage, cfg.shader_model_major, cfg.shader_model_minor)
+                            }),
+                        );
                         if fspx.is_none() {
-                            if let Some(cfg) = info.stage_config {
-                                fspx_stage = Some((
-                                    cfg.stage,
-                                    cfg.shader_model_major,
-                                    cfg.shader_model_minor,
-                                ));
-                            }
                             fspx = Some(info);
                         }
                     }
@@ -508,13 +580,21 @@ pub(crate) mod testutil {
         payload
     }
 
+    /// 24-byte `DxilProgramHeader`: version, size 6, `DXIL`, version 1.0,
+    /// bitcode offset 16, bitcode size 0.
+    pub(crate) fn minimal_dxil_program(program_version: u32) -> [u8; 24] {
+        let mut payload = [0u8; 24];
+        payload[0..4].copy_from_slice(&program_version.to_le_bytes());
+        payload[4..8].copy_from_slice(&6u32.to_le_bytes());
+        payload[8..12].copy_from_slice(b"DXIL");
+        payload[12..16].copy_from_slice(&0x0100u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&16u32.to_le_bytes());
+        payload
+    }
+
     pub(crate) fn synthetic_dxil_blob() -> Vec<u8> {
-        let mut dxil_payload = Vec::new();
         let prog_ver: u32 = (5u32 << 16) | (6u32 << 4) | 6u32;
-        dxil_payload.extend_from_slice(&prog_ver.to_le_bytes());
-        dxil_payload.extend_from_slice(&4u32.to_le_bytes());
-        dxil_payload.extend_from_slice(b"DXIL");
-        dxil_payload.extend_from_slice(&[0u8; 12]);
+        let dxil_payload = minimal_dxil_program(prog_ver);
         build_synthetic_dxbc(&[(b"RTS0", &[1, 2, 3, 4]), (b"DXIL", &dxil_payload)])
     }
 }
@@ -522,12 +602,10 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::c_abi::{clear_shader_log, shader_log_lines};
-    use super::testutil::{build_synthetic_dxbc, synthetic_dxil_blob, synthetic_fspx_payload};
+    use super::testutil::{
+        build_synthetic_dxbc, minimal_dxil_program, synthetic_dxil_blob, synthetic_fspx_payload,
+    };
     use super::*;
-
-    fn push_u32(buf: &mut Vec<u8>, value: u32) {
-        buf.extend_from_slice(&value.to_le_bytes());
-    }
 
     fn fspx_header(
         version: u32,
@@ -648,8 +726,7 @@ mod tests {
 
     #[test]
     fn dxil_stage_wins_over_fspx_stage_in_dual_container() {
-        let mut dxil_payload = Vec::new();
-        push_u32(&mut dxil_payload, (5u32 << 16) | (6u32 << 4) | 6u32);
+        let dxil_payload = minimal_dxil_program((5u32 << 16) | (6u32 << 4) | 6u32);
         let mut fspx = synthetic_fspx_payload();
         // Section 1 stage word is at payload offset 72. Overwrite compute (6)
         // with the ABI pixel value 1, and shader model 6.0 with 5.1.
@@ -1023,8 +1100,7 @@ mod tests {
     #[test]
     fn prepare_passes_dxil_through_when_fspx_is_malformed() {
         clear_shader_log();
-        let mut dxil_payload = Vec::new();
-        push_u32(&mut dxil_payload, (5u32 << 16) | (6u32 << 4) | 6u32);
+        let dxil_payload = minimal_dxil_program((5u32 << 16) | (6u32 << 4) | 6u32);
         let bad_fspx = fspx_header(99, 0, &[], 16);
         let mut blob = build_synthetic_dxbc(&[(b"DXIL", &dxil_payload), (b"ACCC", &bad_fspx)]);
         let container_size = blob.len();
@@ -1058,6 +1134,117 @@ mod tests {
         assert_eq!(copied, &blob[..container_size]);
         unsafe { bx_shader_free_buffer(out_ptr, out_len) };
         assert!(shader_log_lines().is_empty());
+    }
+
+    #[test]
+    fn fspx_section_count_is_bounded() {
+        let at_limit = fspx_table_with_sections(FSPX_MAX_SECTIONS as u32);
+        let blob = build_synthetic_dxbc(&[(b"ACCC", &at_limit)]);
+        let info = inspect_dxbc(&blob).expect("64 sections");
+        let fspx = info.fspx.expect("table");
+        assert_eq!(fspx.sections.len(), FSPX_MAX_SECTIONS);
+
+        let mut c_info = BxShaderInspection::default();
+        let status = unsafe { bx_shader_inspect(blob.as_ptr(), blob.len(), &mut c_info) };
+        assert_eq!(status, BX_SHADER_OK);
+        assert_eq!(c_info.kind, 3);
+
+        let over = fspx_table_with_sections(FSPX_MAX_SECTIONS as u32 + 1);
+        let blob = build_synthetic_dxbc(&[(b"ACCC", &over)]);
+        assert_eq!(
+            inspect_dxbc(&blob),
+            Err(ParseError::FspxTooManySections {
+                chunk: 0,
+                count: FSPX_MAX_SECTIONS as u32 + 1,
+            })
+        );
+        let status = unsafe { bx_shader_inspect(blob.as_ptr(), blob.len(), &mut c_info) };
+        assert_eq!(status, BX_SHADER_ERR_INVALID_BLOB);
+    }
+
+    #[test]
+    fn c_abi_empty_dxil_chunk_returns_invalid() {
+        clear_shader_log();
+        let blob = build_synthetic_dxbc(&[(b"DXIL", &[])]);
+        assert_eq!(
+            inspect_dxbc(&blob),
+            Err(ParseError::BadDxilHeader { chunk: 0 })
+        );
+
+        let mut out_ptr = ptr_sentinel();
+        let mut out_len = 8usize;
+        let status = unsafe {
+            bx_shader_prepare_for_d3dmetal(blob.as_ptr(), blob.len(), &mut out_ptr, &mut out_len)
+        };
+        assert_eq!(status, BX_SHADER_ERR_INVALID_BLOB);
+        assert!(out_ptr.is_null());
+        assert_eq!(out_len, 0);
+        assert!(shader_log_lines().is_empty());
+    }
+
+    #[test]
+    fn later_fspx_stage_is_used_when_earlier_table_has_none() {
+        clear_shader_log();
+        let first = fspx_header(1, 0, &[], 16);
+        let second = fspx_compute_stage();
+        let blob = build_synthetic_dxbc(&[(b"ACCC", &first), (b"ACCC", &second)]);
+
+        let info = inspect_dxbc(&blob).expect("two ACCC chunks");
+        assert_eq!(info.stage, ShaderStage::Compute);
+        assert_eq!((info.shader_model_major, info.shader_model_minor), (6, 0));
+        assert!(info.fspx.expect("first table").stage_config.is_none());
+
+        let mut c_info = BxShaderInspection::default();
+        let status = unsafe { bx_shader_inspect(blob.as_ptr(), blob.len(), &mut c_info) };
+        assert_eq!(status, BX_SHADER_OK);
+        assert_eq!(c_info.stage, 6);
+        assert_eq!(c_info.shader_model_major, 6);
+        assert_eq!(c_info.shader_model_minor, 0);
+
+        let mut out_ptr = ptr_sentinel();
+        let mut out_len = 3usize;
+        let status = unsafe {
+            bx_shader_prepare_for_d3dmetal(blob.as_ptr(), blob.len(), &mut out_ptr, &mut out_len)
+        };
+        assert_eq!(status, BX_SHADER_ERR_UNSUPPORTED);
+        assert!(out_ptr.is_null());
+        assert_eq!(out_len, 0);
+        let log = shader_log_lines();
+        assert_eq!(log.len(), 1);
+        assert!(log[0].contains("stage=compute(6)"));
+        assert!(log[0].contains("sm_major=6"));
+        assert!(log[0].contains("sm_minor=0"));
+    }
+
+    fn fspx_table_with_sections(count: u32) -> Vec<u8> {
+        let count_usize = count as usize;
+        let table_end = 16 + count_usize * 12;
+        let mut payload = vec![0u8; table_end];
+        payload[..4].copy_from_slice(b"FSPX");
+        payload[4..8].copy_from_slice(&1u32.to_le_bytes());
+        payload[8..12].copy_from_slice(&count.to_le_bytes());
+        let end = table_end as u32;
+        for index in 0..count_usize {
+            let at = 16 + index * 12;
+            let id = 100 + index as u32;
+            payload[at..at + 4].copy_from_slice(&id.to_le_bytes());
+            payload[at + 4..at + 8].copy_from_slice(&end.to_le_bytes());
+            payload[at + 8..at + 12].copy_from_slice(&0u32.to_le_bytes());
+        }
+        payload
+    }
+
+    fn fspx_compute_stage() -> Vec<u8> {
+        let mut payload = vec![0u8; 40];
+        payload[..4].copy_from_slice(b"FSPX");
+        payload[4..8].copy_from_slice(&1u32.to_le_bytes());
+        payload[8..12].copy_from_slice(&1u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&1u32.to_le_bytes());
+        payload[20..24].copy_from_slice(&28u32.to_le_bytes());
+        payload[24..28].copy_from_slice(&12u32.to_le_bytes());
+        payload[28..32].copy_from_slice(&6u32.to_le_bytes());
+        payload[32..36].copy_from_slice(&6u32.to_le_bytes());
+        payload
     }
 
     fn ptr_sentinel() -> *mut u8 {
