@@ -192,6 +192,28 @@ fn write_manifest(system32: &Path, owned: &BTreeMap<String, String>) -> Result<(
     })
 }
 
+/// Names from `names` that a guest in `launched_system32` would not find as staged: the entry
+/// there is missing or, read through any link, does not have the bytes of the staged copy in
+/// `staged_system32`.
+///
+/// CrossOver may launch a managed bottle from a private stub whose `system32` links back to the
+/// managed prefix, so a different directory alone does not mean the shims were missed (#474).
+pub fn shims_not_visible_in(
+    staged_system32: &Path,
+    launched_system32: &Path,
+    names: &[String],
+) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| {
+            let staged = fs::read(staged_system32.join(name));
+            let seen = fs::read(launched_system32.join(name));
+            !matches!((staged, seen), (Ok(a), Ok(b)) if a == b)
+        })
+        .cloned()
+        .collect()
+}
+
 /// What staging did to one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Staged {
@@ -226,9 +248,10 @@ pub fn has_system32_shims(shims_dir: &Path) -> bool {
 /// something to skip). A shim the folder does not have is reported as [`Staged::Absent`], so a
 /// run with a partial `--shims` folder still starts. A copy already identical byte for byte is
 /// left alone. A different one is replaced only if this tool staged it and it is unchanged since
-/// (see [`MANIFEST_NAME`]); any other existing file is an error and nothing is written, so a
-/// DLL the bottle already had is never modified or deleted. Nothing outside `system32` is
-/// written.
+/// (see [`MANIFEST_NAME`]); any other existing entry, including a symbolic link that points
+/// nowhere, is an error and nothing is written, so a DLL the bottle already had is never
+/// modified or deleted. New files are installed without replacing anything, and each installed
+/// file is recorded before the next one is touched. Nothing outside `system32` is written.
 pub fn stage_system32(shims_dir: &Path, system32: &Path) -> Result<Vec<Staged>, String> {
     stage_system32_with(shims_dir, system32, pe_imports)
 }
@@ -236,10 +259,44 @@ pub fn stage_system32(shims_dir: &Path, system32: &Path) -> Result<Vec<Staged>, 
 fn stage_system32_with<I>(
     shims_dir: &Path,
     system32: &Path,
-    mut imports_of: I,
+    imports_of: I,
 ) -> Result<Vec<Staged>, String>
 where
     I: FnMut(&Path) -> Result<Vec<String>, String>,
+{
+    stage_system32_hooked(shims_dir, system32, imports_of, |_| Ok(()))
+}
+
+/// Puts `bytes` at `dst` only if nothing is there, not even a dangling symbolic link.
+///
+/// `tmp` already holds the bytes. A hard link either creates `dst` whole or fails because the
+/// name is taken; where links are not supported the file is created exclusively instead.
+fn install_new(tmp: &Path, dst: &Path, bytes: &[u8]) -> io::Result<()> {
+    match fs::hard_link(tmp, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => {
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dst)?;
+            file.write_all(bytes)
+        }
+    }
+}
+
+/// [`stage_system32_with`] with a hook called for each file just before it is put in place, so
+/// tests can make something go wrong between the checks and the installation.
+fn stage_system32_hooked<I, H>(
+    shims_dir: &Path,
+    system32: &Path,
+    mut imports_of: I,
+    mut before_publish: H,
+) -> Result<Vec<Staged>, String>
+where
+    I: FnMut(&Path) -> Result<Vec<String>, String>,
+    H: FnMut(&str) -> Result<(), String>,
 {
     let (roots, absent): (Vec<&str>, Vec<&str>) = SYSTEM32_SHIMS
         .iter()
@@ -270,55 +327,113 @@ where
         },
     )?;
     let mut owned = read_manifest(system32)?;
-    // Decide everything before writing anything, so a foreign file stops the run with
-    // `system32` exactly as it was.
+    let foreign = |dst: &Path, name: &str, what: &str| {
+        format!(
+            "{} {what}; it is left untouched. Use a bottle or prefix without its own {name}, \
+             or move that entry aside yourself, then run again",
+            dst.display()
+        )
+    };
+    // 1. Decide everything before writing anything, so a foreign entry stops the run with
+    //    `system32` exactly as it was.
     let mut plan = Vec::new();
     for name in &names {
         let src = find_shim(shims_dir, name).unwrap_or_else(|| shims_dir.join(name));
         let bytes =
             fs::read(&src).map_err(|e| format!("cannot read shim {}: {e}", src.display()))?;
         let dst = system32.join(name);
-        let result = match fs::read(&dst) {
-            Ok(existing) if existing == bytes => Staged::Unchanged(dst.clone()),
-            Ok(existing) if owned.get(name) == Some(&sha256_hex(&existing)) => {
-                Staged::Replaced(dst.clone())
-            }
-            Ok(_) => {
-                return Err(format!(
-                    "{} already exists and was not staged by bx-cli (or was changed since); \
-                     it is left untouched. Use a bottle or prefix without its own {name}, or \
-                     move that file aside yourself, then run again",
-                    dst.display()
-                ));
-            }
+        // The directory entry itself is inspected, without following links: a dangling
+        // symbolic link has no contents to read but is still the bottle's entry.
+        let result = match fs::symlink_metadata(&dst) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Staged::Copied(dst.clone()),
-            Err(e) => return Err(format!("cannot read {}: {e}", dst.display())),
+            Err(e) => return Err(format!("cannot inspect {}: {e}", dst.display())),
+            Ok(meta) => {
+                let existing = match fs::read(&dst) {
+                    Ok(existing) => Some(existing),
+                    Err(_) if !meta.is_file() => None,
+                    Err(e) => return Err(format!("cannot read {}: {e}", dst.display())),
+                };
+                if existing.as_deref() == Some(bytes.as_slice()) {
+                    Staged::Unchanged(dst.clone())
+                } else if !meta.is_file() {
+                    // bx-cli only ever writes regular files, so a link or anything else here
+                    // was not staged by it.
+                    return Err(foreign(
+                        &dst,
+                        name,
+                        "already exists and is not a regular file (for example a symbolic link)",
+                    ));
+                } else if existing.as_deref().map(sha256_hex).as_ref() == owned.get(name) {
+                    Staged::Replaced(dst.clone())
+                } else {
+                    return Err(foreign(
+                        &dst,
+                        name,
+                        "already exists and was not staged by bx-cli (or was changed since)",
+                    ));
+                }
+            }
         };
         plan.push((name, bytes, dst, result));
     }
-    let mut manifest_changed = false;
+    // 2. Write every new file beside its target first. A failure here publishes nothing.
+    let tmp_of = |name: &str| system32.join(format!(".{name}.{}.bx-staging", std::process::id()));
+    let pending: Vec<PathBuf> = plan
+        .iter()
+        .filter(|(_, _, _, result)| !matches!(result, Staged::Unchanged(_)))
+        .map(|(name, _, _, _)| tmp_of(name))
+        .collect();
+    let discard = |tmps: &[PathBuf]| {
+        for tmp in tmps {
+            let _ = fs::remove_file(tmp);
+        }
+    };
+    for (name, bytes, _, result) in &plan {
+        if !matches!(result, Staged::Unchanged(_)) {
+            let tmp = tmp_of(name);
+            if let Err(e) = fs::write(&tmp, bytes) {
+                discard(&pending);
+                return Err(format!("cannot write {}: {e}", tmp.display()));
+            }
+        }
+    }
+    // 3. Put the files in place one at a time, recording each in the manifest as soon as it is
+    //    there. If a later file fails, the earlier ones are installed and owned, not orphaned.
     for (name, bytes, dst, result) in plan {
         if !matches!(result, Staged::Unchanged(_)) {
-            // Write beside the target, then rename, so a guest never sees a half-written DLL.
-            // The name is per process, so a concurrent run cannot rename a partial write.
-            let tmp = system32.join(format!(".{name}.{}.bx-staging", std::process::id()));
-            fs::write(&tmp, &bytes).map_err(|e| {
-                let _ = fs::remove_file(&tmp);
-                format!("cannot write {}: {e}", tmp.display())
-            })?;
-            fs::rename(&tmp, &dst).map_err(|e| {
-                let _ = fs::remove_file(&tmp);
-                format!("cannot replace {}: {e}", dst.display())
-            })?;
-            // Recorded only after the file is in place: a crash in between leaves a copy that
-            // looks foreign later, which is the safe direction.
+            let tmp = tmp_of(name);
+            let published = before_publish(name).and_then(|()| match result {
+                // Nothing was there at step 1; refuse to replace whatever appeared since.
+                Staged::Copied(_) => install_new(&tmp, &dst, &bytes).map_err(|e| {
+                    if e.kind() == io::ErrorKind::AlreadyExists {
+                        foreign(
+                            &dst,
+                            name,
+                            "appeared while staging and was not staged by bx-cli",
+                        )
+                    } else {
+                        format!("cannot install {}: {e}", dst.display())
+                    }
+                }),
+                // Still our own earlier copy? Then the rename replaces it in one step.
+                _ => match fs::read(&dst) {
+                    Ok(now) if owned.get(name) == Some(&sha256_hex(&now)) => fs::rename(&tmp, &dst)
+                        .map_err(|e| format!("cannot replace {}: {e}", dst.display())),
+                    _ => Err(foreign(&dst, name, "changed while staging")),
+                },
+            });
+            if let Err(e) = published {
+                discard(&pending);
+                return Err(e);
+            }
+            let _ = fs::remove_file(&tmp);
             owned.insert(name.clone(), sha256_hex(&bytes));
-            manifest_changed = true;
+            if let Err(e) = write_manifest(system32, &owned) {
+                discard(&pending);
+                return Err(e);
+            }
         }
         staged.push(result);
-    }
-    if manifest_changed {
-        write_manifest(system32, &owned)?;
     }
     Ok(staged)
 }
@@ -568,6 +683,169 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("bx-staging"))
             .collect();
         assert!(leftovers.is_empty(), "temporary file left behind");
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_a_foreign_entry_and_stays() {
+        let (_t, shims, prefix) = setup("dangling");
+        let sys = system32_dir(&prefix);
+        let link = sys.join("xgameruntime.dll");
+        std::os::unix::fs::symlink(sys.join("no-such-target.dll"), &link).unwrap();
+        let err = stage(&shims, &sys).unwrap_err();
+        assert!(err.contains("xgameruntime.dll"), "{err}");
+        assert!(err.contains("symbolic link"), "{err}");
+        // Still the same dangling link, and nothing else was staged beside it.
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            sys.join("no-such-target.dll")
+        );
+        assert!(!sys.join("bx_runtime_veh.dll").exists());
+        assert!(!sys.join(MANIFEST_NAME).exists());
+    }
+
+    #[test]
+    fn a_symlink_is_never_replaced_whatever_it_points_to() {
+        let (t, shims, prefix) = setup("symlink");
+        let sys = system32_dir(&prefix);
+        let link = sys.join("xgameruntime.dll");
+        // Pointing at a file with other contents: foreign, and the target is not written to.
+        let target = t.0.join("elsewhere.dll");
+        fs::write(&target, b"the bottle's own runtime").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(stage(&shims, &sys).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"the bottle's own runtime");
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        // Pointing at identical contents: already current, left as a link and not claimed.
+        fs::write(&target, b"shim v1").unwrap();
+        let staged = stage(&shims, &sys).unwrap();
+        assert!(staged.contains(&Staged::Unchanged(link.clone())));
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert!(
+            !read_manifest(&sys)
+                .unwrap()
+                .contains_key("xgameruntime.dll")
+        );
+    }
+
+    #[test]
+    fn an_entry_that_appears_after_the_checks_is_not_replaced() {
+        let (_t, shims, prefix) = setup("late");
+        let sys = system32_dir(&prefix);
+        let dst = sys.join("xgameruntime.dll");
+        let late = dst.clone();
+        let err = stage_system32_hooked(&shims, &sys, fake_imports, |name| {
+            if name == "xgameruntime.dll" {
+                fs::write(&late, b"installed meanwhile").unwrap();
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.contains("appeared while staging"), "{err}");
+        assert_eq!(fs::read(&dst).unwrap(), b"installed meanwhile");
+        assert!(
+            !read_manifest(&sys)
+                .unwrap()
+                .contains_key("xgameruntime.dll")
+        );
+        assert!(no_temporary_files(&sys));
+    }
+
+    #[test]
+    fn a_later_failure_leaves_earlier_copies_installed_and_owned() {
+        let (_t, shims, prefix) = setup("partial");
+        let sys = system32_dir(&prefix);
+        // Files are installed in name order: the VEH logger first, then the runtime.
+        let err = stage_system32_hooked(&shims, &sys, fake_imports, |name| {
+            if name == "xgameruntime.dll" {
+                return Err("disk full".to_string());
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(err, "disk full");
+        assert_eq!(fs::read(sys.join("bx_runtime_veh.dll")).unwrap(), b"veh v1");
+        assert!(!sys.join("xgameruntime.dll").exists());
+        let owned = read_manifest(&sys).unwrap();
+        assert_eq!(
+            owned.get("bx_runtime_veh.dll"),
+            Some(&sha256_hex(b"veh v1"))
+        );
+        assert!(no_temporary_files(&sys));
+        // The retry completes, and the first file is still ours: a later update refreshes it.
+        let retry = stage(&shims, &sys).unwrap();
+        assert!(retry.contains(&Staged::Unchanged(sys.join("bx_runtime_veh.dll"))));
+        assert!(retry.contains(&Staged::Copied(sys.join("xgameruntime.dll"))));
+        fs::write(shims.join("bx_runtime_veh.dll"), b"veh v2").unwrap();
+        let update = stage(&shims, &sys).unwrap();
+        assert!(update.contains(&Staged::Replaced(sys.join("bx_runtime_veh.dll"))));
+        assert_eq!(fs::read(sys.join("bx_runtime_veh.dll")).unwrap(), b"veh v2");
+    }
+
+    #[test]
+    fn a_failed_temporary_write_publishes_nothing() {
+        let (_t, shims, prefix) = setup("prepare");
+        let sys = system32_dir(&prefix);
+        // A directory where the second file's temporary copy has to go makes that write fail.
+        let obstacle = sys.join(format!(
+            ".xgameruntime.dll.{}.bx-staging",
+            std::process::id()
+        ));
+        fs::create_dir(&obstacle).unwrap();
+        let err = stage(&shims, &sys).unwrap_err();
+        assert!(err.contains("cannot write"), "{err}");
+        assert!(
+            !sys.join("bx_runtime_veh.dll").exists(),
+            "first file was published"
+        );
+        assert!(!sys.join("xgameruntime.dll").exists());
+        assert!(!sys.join(MANIFEST_NAME).exists());
+        fs::remove_dir(&obstacle).unwrap();
+        assert!(
+            stage(&shims, &sys)
+                .unwrap()
+                .iter()
+                .all(|s| matches!(s, Staged::Copied(_)))
+        );
+    }
+
+    #[test]
+    fn staged_shims_reached_through_a_stub_prefix_count_as_visible() {
+        let (t, shims, prefix) = setup("visible");
+        let sys = system32_dir(&prefix);
+        stage(&shims, &sys).unwrap();
+        let names = vec![
+            "bx_runtime_veh.dll".to_string(),
+            "xgameruntime.dll".to_string(),
+        ];
+        // A private stub whose system32 links back to the managed prefix, as CrossOver creates.
+        let stub = system32_dir(&t.0.join("stub"));
+        fs::create_dir_all(&stub).unwrap();
+        for name in &names {
+            std::os::unix::fs::symlink(sys.join(name), stub.join(name)).unwrap();
+        }
+        assert!(shims_not_visible_in(&sys, &stub, &names).is_empty());
+        // A stub that really lacks one shim, or has other bytes under that name.
+        fs::remove_file(stub.join("xgameruntime.dll")).unwrap();
+        assert_eq!(
+            shims_not_visible_in(&sys, &stub, &names),
+            vec!["xgameruntime.dll"]
+        );
+        fs::write(stub.join("xgameruntime.dll"), b"something else").unwrap();
+        assert_eq!(
+            shims_not_visible_in(&sys, &stub, &names),
+            vec!["xgameruntime.dll"]
+        );
+        // An empty stub sees none of them.
+        let empty = system32_dir(&t.0.join("empty"));
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(shims_not_visible_in(&sys, &empty, &names), names);
+    }
+
+    fn no_temporary_files(sys: &Path) -> bool {
+        fs::read_dir(sys)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e.file_name().to_string_lossy().contains("bx-staging"))
     }
 
     #[test]

@@ -621,11 +621,17 @@ fn cmd_run(args: &[String]) -> ExitCode {
             }
         }
     }
-    let mut staged_into_system32 = false;
+    let mut staged_names: Vec<String> = Vec::new();
     match stage::stage_system32(&abs_shims, &system32) {
         Ok(staged) => {
             for item in &staged {
-                staged_into_system32 |= !matches!(item, stage::Staged::Absent(_));
+                if let stage::Staged::Copied(path)
+                | stage::Staged::Replaced(path)
+                | stage::Staged::Unchanged(path) = item
+                    && let Some(name) = path.file_name()
+                {
+                    staged_names.push(name.to_string_lossy().into_owned());
+                }
                 eprintln!("bx-cli: {}", item.describe());
             }
         }
@@ -724,22 +730,39 @@ fn cmd_run(args: &[String]) -> ExitCode {
         );
     }
     // #474: the shims were staged into the prefix resolved before launch. If CrossOver launched
-    // the bottle somewhere else, the guest never saw them, and the run must not pass quietly.
+    // the bottle from a different prefix that does not expose them, the guest never saw them,
+    // and the run must not pass quietly. A different prefix alone is not a failure: a private
+    // stub of a managed bottle links its system32 entries back to the managed prefix.
     let mut staged_elsewhere = false;
-    if staged_into_system32 {
+    if !staged_names.is_empty() {
         match staging_prefix_mismatch(&environment_dir, bottle.as_deref(), |name| {
             resolve_bottle_prefix_with_host_env(cx_root, name, inherit_env)
         }) {
             Ok(None) => {}
             Ok(Some(launched)) => {
-                staged_elsewhere = true;
-                eprintln!(
-                    "error: system32 shims were staged in {} but CrossOver launched the bottle \
-                     in {}; the guest did not see them. Run again: staging will now use the \
-                     prefix the bottle launches in",
-                    environment_dir.display(),
-                    launched.display()
+                let missing = stage::shims_not_visible_in(
+                    &system32,
+                    &stage::system32_dir(&launched),
+                    &staged_names,
                 );
+                if missing.is_empty() {
+                    eprintln!(
+                        "bx-cli: bottle launched in {}; the shims staged in {} are visible there",
+                        launched.display(),
+                        environment_dir.display()
+                    );
+                } else {
+                    staged_elsewhere = true;
+                    eprintln!(
+                        "error: system32 shims were staged in {} but CrossOver launched the \
+                         bottle in {}, where {} cannot be found as staged; the guest did not \
+                         see them. Run again: staging will now use the prefix the bottle \
+                         launches in",
+                        environment_dir.display(),
+                        launched.display(),
+                        missing.join(", ")
+                    );
+                }
             }
             Err(e) => eprintln!(
                 "warning: cannot confirm which prefix the bottle launched in, so the staged \
