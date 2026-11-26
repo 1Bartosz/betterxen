@@ -9,17 +9,31 @@
 
 /*
  * The configured region is backed by one CUSTOM WRITE_BACK / L0 heap and a buffer
- * that stays mapped. CreateHeap of that size returns that heap. atesahmet0 and
- * Arths17 measured this for #473: WRITE_BACK or WRITE_COMBINE on L0 is shared
- * memory, and both OpenExistingHeap methods return E_NOTIMPL. This file does not
- * call them. OpenExistingHeapFromFileMapping also needs a section handle that
- * bx_xmem_region_info does not carry. This file does not request L1 and does not
- * treat an xmem address as a GPU pointer.
- * Any other size is a normal host heap. Heap alignment values 0, 64 KiB and 4 MiB:
- * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_heap_desc
- * Placed offsets are a multiple of the resource alignment and stay inside the heap,
- * tightened here to 64 KiB:
+ * that stays mapped. That heap is created with D3D12_HEAP_FLAG_NONE, 64 KiB
+ * alignment, and node masks 0. CreateHeap returns it only for the explicit
+ * opt-in desc documented in vmem.h. atesahmet0 and Arths17 measured this for
+ * #473: WRITE_BACK or WRITE_COMBINE on L0 is shared memory, and both
+ * OpenExistingHeap methods return E_NOTIMPL. This file does not call them.
+ * This file does not request L1 and does not treat an xmem address as a GPU pointer.
+ *
+ * Any other CreateHeap forwards the caller's D3D12_HEAP_DESC unmodified and
+ * returns the host HRESULT. The wrapper and the live-heap xmem budget charge
+ * are the only differences: charge on create, credit on the wrapper's final
+ * Release, E_OUTOFMEMORY only when that budget is exceeded.
+ * A null out pointer is forwarded unchanged to the host.
+ * vkd3d on CrossOver 26.2 faults on that pointer with or without this shim.
+ * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createheap
+ *
+ * CreatePlacedResource on any heap other than the backing heap is forwarded
+ * the same way, with no extra checks. On the backing heap the offset must be a
+ * multiple of the alignment GetResourceAllocationInfo reports, the resource
+ * must fit, and an upload or readback heap (not this CUSTOM heap) must use the
+ * initial state Microsoft Learn requires:
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createplacedresource
+ * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-getresourceallocationinfo
+ * Heap alignment values 0, 64 KiB and 4 MiB, and ID3D12Heap1:
+ * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_heap_desc
+ * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12heap1
  * Non-custom heap properties use UNKNOWN CPU page and memory pool:
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_heap_properties
  */
@@ -27,29 +41,22 @@
 namespace {
 
 constexpr uint64_t k64K = 64ull * 1024ull;
-constexpr uint64_t k4M = 4ull * 1024ull * 1024ull;
 constexpr uint32_t kConfigVersion = 1;
-
-constexpr uint32_t kForwardedFlags =
-    static_cast<uint32_t>(D3D12_HEAP_FLAG_DENY_BUFFERS) |
-    static_cast<uint32_t>(D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES) |
-    static_cast<uint32_t>(D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES) |
-    static_cast<uint32_t>(D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS) |
-    static_cast<uint32_t>(D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT) |
-    static_cast<uint32_t>(D3D12_HEAP_FLAG_CREATE_NOT_ZEROED);
 
 struct Record {
     bool configured = false;
+    bool backing_opt_in = false;
     bx_hardware_profile_t profile = BX_PROFILE_LOCKHART;
     uint64_t title_limit = 0;
     bool have_region = false;
+    uint64_t config_base = 0;
+    uint64_t config_size = 0;
     bx_xmem_region_info_t region{};
     /* Bytes of host heaps still alive. D3DMetal keeps freed memory in its own
        pool, so this counts live heaps only: charge on create, credit on the
        final Release. It does not assume the OS reclaimed the pages. */
     uint64_t charged_private_bytes = 0;
     uint64_t cpu_pointer = 0;
-    BxD3d12VirtualMemoryConfig* config_block = nullptr;
     class BxChargedHeap* backing = nullptr;
     ID3D12Resource* backing_buffer = nullptr;
 };
@@ -90,55 +97,6 @@ const char* profile_name(bx_hardware_profile_t profile) {
     return profile == BX_PROFILE_ANACONDA ? "anaconda" : "lockhart";
 }
 
-bool node_masks_ok(UINT creation, UINT visible) {
-    const UINT creation_bit = creation == 0 ? 1u : creation;
-    const UINT visible_bits = visible == 0 ? creation_bit : visible;
-    if (creation != 0 && (creation & (creation - 1u)) != 0) {
-        return false;
-    }
-    return (visible_bits & creation_bit) == creation_bit;
-}
-
-HRESULT check_heap_shape(const D3D12_HEAP_DESC* desc) {
-    if (desc->Properties.MemoryPoolPreference == D3D12_MEMORY_POOL_L1) {
-        return E_INVALIDARG;
-    }
-    const uint64_t align = desc->Alignment == 0 ? k64K : desc->Alignment;
-    if (align != k64K && align != k4M) {
-        return E_INVALIDARG;
-    }
-    if (desc->SizeInBytes == 0 || desc->SizeInBytes % align != 0 || desc->SizeInBytes % k64K != 0) {
-        return E_INVALIDARG;
-    }
-    switch (desc->Properties.Type) {
-    case D3D12_HEAP_TYPE_DEFAULT:
-    case D3D12_HEAP_TYPE_UPLOAD:
-    case D3D12_HEAP_TYPE_READBACK:
-        if (desc->Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN ||
-            desc->Properties.MemoryPoolPreference != D3D12_MEMORY_POOL_UNKNOWN) {
-            return E_INVALIDARG;
-        }
-        break;
-    case D3D12_HEAP_TYPE_CUSTOM:
-        if (desc->Properties.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_UNKNOWN ||
-            desc->Properties.MemoryPoolPreference == D3D12_MEMORY_POOL_UNKNOWN) {
-            return E_INVALIDARG;
-        }
-        break;
-    default:
-        return E_INVALIDARG;
-    }
-    if (!node_masks_ok(desc->Properties.CreationNodeMask, desc->Properties.VisibleNodeMask)) {
-        return E_INVALIDARG;
-    }
-    return S_OK;
-}
-
-bool heap_riid(REFIID riid) {
-    return riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
-           riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Heap);
-}
-
 /* Private host heaps count against the same Lockhart/Anaconda cap as xmem. */
 bool try_charge(uint64_t bytes) {
     Guard guard(g_section);
@@ -169,24 +127,33 @@ void release_charge(uint64_t bytes) {
 
 /*
  * Holds the budget charge for one private host heap and drops it on the last Release.
- * QueryInterface for ID3D12Heap and its base interfaces returns this object, so
- * bx_unwrap sees IID_BxProxyHost and CreatePlacedResource receives the host heap.
- * A CreateHeap riid outside that set cannot be observed here: the host pointer is
- * returned and the charge stays until process exit. Callers in this tree request
- * ID3D12Heap.
+ * QueryInterface for ID3D12Heap, and for ID3D12Heap1 when the host heap answers it,
+ * returns this object. bx_unwrap sees IID_BxProxyHost and receives the host heap.
+ * GetProtectedResourceSession forwards to the host ID3D12Heap1.
+ * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12heap1
  */
-class BxChargedHeap final : public ID3D12Heap {
+class BxChargedHeap final : public ID3D12Heap1 {
 public:
-    static BxChargedHeap* create(ID3D12Heap* host, uint64_t bytes) {
-        return new (std::nothrow) BxChargedHeap(host, bytes);
+    static BxChargedHeap* create(ID3D12Heap* host, ID3D12Heap1* host1, uint64_t bytes) {
+        return new (std::nothrow) BxChargedHeap(host, host1, bytes);
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) {
             return E_POINTER;
         }
-        if (heap_riid(riid)) {
+        *ppv = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
+            riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Heap)) {
             *ppv = static_cast<ID3D12Heap*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (riid == __uuidof(ID3D12Heap1)) {
+            if (!host1_) {
+                return E_NOINTERFACE;
+            }
+            *ppv = static_cast<ID3D12Heap1*>(this);
             AddRef();
             return S_OK;
         }
@@ -194,7 +161,6 @@ public:
             *ppv = host_;
             return S_OK;
         }
-        *ppv = nullptr;
         return E_NOINTERFACE;
     }
 
@@ -206,6 +172,9 @@ public:
             /* Final Release of a live heap. D3DMetal may pool the pages after this,
                so the budget credit is the live-heap count, not a physical-memory drop. */
             release_charge(bytes_);
+            if (host1_) {
+                host1_->Release();
+            }
             if (host_) {
                 host_->Release();
             }
@@ -226,41 +195,93 @@ public:
     HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return host_->SetName(name); }
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppv) override { return host_->GetDevice(riid, ppv); }
     D3D12_HEAP_DESC* STDMETHODCALLTYPE GetDesc(D3D12_HEAP_DESC* ret) override { return host_->GetDesc(ret); }
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID riid, void** session) override {
+        if (!session) {
+            return E_POINTER;
+        }
+        *session = nullptr;
+        if (!host1_) {
+            return E_NOINTERFACE;
+        }
+        return host1_->GetProtectedResourceSession(riid, session);
+    }
 
 private:
-    BxChargedHeap(ID3D12Heap* host, uint64_t bytes) : host_(host), bytes_(bytes) {}
+    BxChargedHeap(ID3D12Heap* host, ID3D12Heap1* host1, uint64_t bytes) : host_(host), host1_(host1), bytes_(bytes) {
+        if (host_) {
+            host_->AddRef();
+        }
+        if (host1_) {
+            host1_->AddRef();
+        }
+    }
     ~BxChargedHeap() = default;
 
     ID3D12Heap* host_;
+    ID3D12Heap1* host1_;
     uint64_t bytes_;
     LONG refs_ = 1;
 };
 
-bool region_matches(const D3D12_HEAP_DESC* desc, const Record& snap, bx_xmem_region_info_t* live) {
-    if (!snap.configured || !snap.have_region || desc->SizeInBytes != snap.region.size_bytes) {
+struct RegionSnap {
+    bool eligible = false;
+    uint64_t base = 0;
+    uint64_t size = 0;
+};
+
+RegionSnap region_snap() {
+    Guard guard(g_section);
+    RegionSnap snap;
+    snap.eligible = g_record.configured && g_record.backing_opt_in && g_record.have_region && g_record.config_size != 0;
+    snap.base = g_record.region.base_va;
+    snap.size = g_record.config_size;
+    return snap;
+}
+
+bool region_still_mapped(const RegionSnap& snap) {
+    if (!snap.eligible || snap.size == 0) {
         return false;
     }
-    if (!bx_xmem_query_region(snap.region.base_va, live) || live->base_va != snap.region.base_va ||
-        live->size_bytes == 0 || snap.region.size_bytes % live->size_bytes != 0) {
+    bx_xmem_region_info_t live{};
+    if (!bx_xmem_query_region(snap.base, &live) || live.base_va != snap.base || live.size_bytes == 0 ||
+        snap.size % live.size_bytes != 0) {
         return false;
     }
-    const uint64_t page = live->size_bytes;
-    for (uint64_t offset = 0; offset < snap.region.size_bytes; offset += page) {
+    const uint64_t page = live.size_bytes;
+    for (uint64_t offset = 0; offset < snap.size; offset += page) {
         bx_xmem_region_info_t part{};
-        if (!bx_xmem_query_region(snap.region.base_va + offset, &part) ||
-            part.base_va != snap.region.base_va + offset || part.size_bytes != page) {
+        if (!bx_xmem_query_region(snap.base + offset, &part) || part.base_va != snap.base + offset ||
+            part.size_bytes != page) {
             return false;
         }
     }
-    live->size_bytes = snap.region.size_bytes;
     return true;
 }
 
-void publish_cpu_pointer(uint64_t pointer) {
-    g_record.cpu_pointer = pointer;
-    if (g_record.config_block) {
-        g_record.config_block->cpu_pointer = pointer;
+/* True only for the explicit backing-heap request documented in vmem.h. */
+bool backing_request(const D3D12_HEAP_DESC* desc) {
+    if (!desc) {
+        return false;
     }
+    if (desc->Properties.Type != D3D12_HEAP_TYPE_CUSTOM ||
+        desc->Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_WRITE_BACK ||
+        desc->Properties.MemoryPoolPreference != D3D12_MEMORY_POOL_L0) {
+        return false;
+    }
+    if (desc->Alignment != 0 && desc->Alignment != k64K) {
+        return false;
+    }
+    if (desc->Flags != D3D12_HEAP_FLAG_NONE) {
+        return false;
+    }
+    if (desc->Properties.CreationNodeMask > 1 || desc->Properties.VisibleNodeMask > 1) {
+        return false;
+    }
+    const RegionSnap snap = region_snap();
+    if (!snap.eligible || desc->SizeInBytes != snap.size) {
+        return false;
+    }
+    return region_still_mapped(snap);
 }
 
 HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFIID riid, void** out);
@@ -289,6 +310,7 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
     desc.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
     desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
     desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    desc.Flags = D3D12_HEAP_FLAG_NONE;
     void* created = nullptr;
     HRESULT hr = host_private_heap(self, &desc, __uuidof(ID3D12Heap), &created);
     if (FAILED(hr) || !created) {
@@ -331,40 +353,45 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
         }
         g_record.backing = wrap;
         g_record.backing_buffer = resource;
-        publish_cpu_pointer(reinterpret_cast<uint64_t>(mapped));
+        /* Remember the map. The caller's config block is not stored and is not written here. */
+        g_record.cpu_pointer = reinterpret_cast<uint64_t>(mapped);
     }
     return return_backing(riid, out);
 }
 
 HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFIID riid, void** out) {
+    /* desc is forwarded unmodified. The charge follows the wrapper, including ID3D12Heap1. */
     if (!try_charge(desc->SizeInBytes)) {
         bx_log_emit(BX_LOG_WARN, "d3d12_xs", "heap_budget",
                     "CreateHeap exceeds the Lockhart/Anaconda xmem title budget");
         return E_OUTOFMEMORY;
     }
     void* raw = nullptr;
-    HRESULT hr = self->h_ID3D12Device->CreateHeap(desc, __uuidof(ID3D12Heap), &raw);
+    HRESULT hr = self->h_ID3D12Device->CreateHeap(desc, riid, &raw);
     if (FAILED(hr) || !raw) {
         release_charge(desc->SizeInBytes);
         return FAILED(hr) ? hr : E_FAIL;
     }
-    auto* host = static_cast<ID3D12Heap*>(raw);
-    if (!heap_riid(riid)) {
-        /* Charge cannot follow an interface this wrapper does not implement.
-           The first heap is dropped. If the caller's CreateHeap succeeds, the
-           charge stays until process exit. See BxChargedHeap. */
-        host->Release();
-        bx_log_emit(BX_LOG_WARN, "d3d12_xs", "heap_budget",
-                    "CreateHeap riid is not ID3D12Heap; the charge stays until process exit");
-        hr = self->h_ID3D12Device->CreateHeap(desc, riid, out);
-        if (FAILED(hr)) {
-            release_charge(desc->SizeInBytes);
-        }
-        return hr;
+    auto* unknown = static_cast<IUnknown*>(raw);
+    ID3D12Heap* host = nullptr;
+    const HRESULT heap_hr = unknown->QueryInterface(__uuidof(ID3D12Heap), reinterpret_cast<void**>(&host));
+    if (FAILED(heap_hr) || !host) {
+        unknown->Release();
+        release_charge(desc->SizeInBytes);
+        return FAILED(heap_hr) ? heap_hr : E_NOINTERFACE;
     }
-    BxChargedHeap* wrap = BxChargedHeap::create(host, desc->SizeInBytes);
+    ID3D12Heap1* host1 = nullptr;
+    void* probed = nullptr;
+    if (host->QueryInterface(__uuidof(ID3D12Heap1), &probed) == S_OK && probed) {
+        host1 = static_cast<ID3D12Heap1*>(probed);
+    }
+    BxChargedHeap* wrap = BxChargedHeap::create(host, host1, desc->SizeInBytes);
+    if (host1) {
+        host1->Release();
+    }
+    host->Release();
+    unknown->Release();
     if (!wrap) {
-        host->Release();
         release_charge(desc->SizeInBytes);
         return E_OUTOFMEMORY;
     }
@@ -376,71 +403,85 @@ HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFI
     return hr;
 }
 
+bool is_backing_heap(ID3D12Heap* heap) {
+    if (!heap) {
+        return false;
+    }
+    BxChargedHeap* backing = nullptr;
+    {
+        Guard guard(g_section);
+        backing = g_record.backing;
+        if (!backing) {
+            return false;
+        }
+        backing->AddRef();
+    }
+    IUnknown* want = nullptr;
+    IUnknown* got = nullptr;
+    const HRESULT want_hr = backing->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(&want));
+    const HRESULT got_hr = heap->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(&got));
+    const bool same = SUCCEEDED(want_hr) && SUCCEEDED(got_hr) && want == got;
+    if (want) {
+        want->Release();
+    }
+    if (got) {
+        got->Release();
+    }
+    backing->Release();
+    return same;
+}
+
+void log_placed(UINT64 offset, HRESULT hr) {
+    char detail[160];
+    std::snprintf(detail, sizeof(detail), "CreatePlacedResource offset=%llu hr=0x%08lx",
+                  static_cast<unsigned long long>(offset), static_cast<unsigned long>(hr));
+    bx_log_emit(FAILED(hr) ? BX_LOG_WARN : BX_LOG_INFO, "d3d12_xs", "placed_resource", detail);
+}
+
 HRESULT STDMETHODCALLTYPE create_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFIID riid, void** out) {
     BX_D3D_TRACE("ID3D12Device", "CreateHeap");
-    if (!out) {
-        return E_POINTER;
-    }
-    *out = nullptr;
     if (!self || !self->h_ID3D12Device) {
+        if (out) {
+            *out = nullptr;
+        }
         BX_VTABLE_STUB_LOG("ID3D12Device", 28u, "CreateHeap");
         return E_NOTIMPL;
     }
     if (!desc) {
+        if (out) {
+            *out = nullptr;
+        }
         return E_INVALIDARG;
     }
-    if ((static_cast<uint32_t>(desc->Flags) & ~kForwardedFlags) != 0) {
-        BX_VTABLE_STUB_LOG("ID3D12Device", 28u, "CreateHeap");
-        return E_NOTIMPL;
+    if (!out) {
+        /* A null out pointer is forwarded unchanged to the host.
+         * vkd3d on CrossOver 26.2 faults on that pointer with or without this shim.
+         */
+        return self->h_ID3D12Device->CreateHeap(desc, riid, nullptr);
     }
-    HRESULT hr = check_heap_shape(desc);
-    if (FAILED(hr)) {
-        return hr;
-    }
-
-    Record snap;
-    {
-        Guard guard(g_section);
-        snap = g_record;
-    }
-    bx_xmem_region_info_t live{};
-    if (region_matches(desc, snap, &live)) {
-        return ensure_backing(self, live.size_bytes, riid, out);
+    *out = nullptr;
+    if (backing_request(desc)) {
+        return ensure_backing(self, desc->SizeInBytes, riid, out);
     }
     return host_private_heap(self, desc, riid, out);
 }
 
-HRESULT STDMETHODCALLTYPE create_placed(BxDeviceProxy* self, ID3D12Heap* heap, UINT64 offset,
-                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
-                                       const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
-    BX_D3D_TRACE("ID3D12Device", "CreatePlacedResource");
-    if (!out) {
-        return E_POINTER;
-    }
-    *out = nullptr;
-    if (!self || !self->h_ID3D12Device) {
-        BX_VTABLE_STUB_LOG("ID3D12Device", 29u, "CreatePlacedResource");
-        return E_NOTIMPL;
-    }
-    if (!heap || !desc || (offset % k64K) != 0) {
+HRESULT validate_backing_placement(ID3D12Device* device, ID3D12Heap* heap, UINT64 offset, const D3D12_RESOURCE_DESC* desc,
+                                   D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear) {
+    if (!heap || !desc) {
         return E_INVALIDARG;
     }
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && clear) {
         return E_INVALIDARG;
     }
-
     D3D12_HEAP_DESC heap_desc = heap->GetDesc();
-    if (heap_desc.SizeInBytes % k64K != 0) {
-        return E_INVALIDARG;
-    }
     if (heap_desc.Properties.Type == D3D12_HEAP_TYPE_UPLOAD && state != D3D12_RESOURCE_STATE_GENERIC_READ) {
         return E_INVALIDARG;
     }
     if (heap_desc.Properties.Type == D3D12_HEAP_TYPE_READBACK && state != D3D12_RESOURCE_STATE_COPY_DEST) {
         return E_INVALIDARG;
     }
-
-    D3D12_RESOURCE_ALLOCATION_INFO info = self->h_ID3D12Device->GetResourceAllocationInfo(0, 1, desc);
+    D3D12_RESOURCE_ALLOCATION_INFO info = device->GetResourceAllocationInfo(0, 1, desc);
     if (info.SizeInBytes == 0 || info.SizeInBytes == ~0ull) {
         return E_INVALIDARG;
     }
@@ -450,15 +491,60 @@ HRESULT STDMETHODCALLTYPE create_placed(BxDeviceProxy* self, ID3D12Heap* heap, U
     if (offset > heap_desc.SizeInBytes || info.SizeInBytes > heap_desc.SizeInBytes - offset) {
         return E_INVALIDARG;
     }
+    return S_OK;
+}
 
+HRESULT STDMETHODCALLTYPE create_placed(BxDeviceProxy* self, ID3D12Heap* heap, UINT64 offset,
+                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                                       const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
+    BX_D3D_TRACE("ID3D12Device", "CreatePlacedResource");
+    if (!self || !self->h_ID3D12Device) {
+        if (out) {
+            *out = nullptr;
+        }
+        BX_VTABLE_STUB_LOG("ID3D12Device", 29u, "CreatePlacedResource");
+        return E_NOTIMPL;
+    }
+    if (!out) {
+        /* A null out pointer is forwarded unchanged to the host.
+         * vkd3d on CrossOver 26.2 faults on that pointer with or without this shim.
+         */
+        if (is_backing_heap(heap)) {
+            const HRESULT check_hr = validate_backing_placement(self->h_ID3D12Device, heap, offset, desc, state, clear);
+            if (FAILED(check_hr)) {
+                log_placed(offset, check_hr);
+                return check_hr;
+            }
+        }
+        ID3D12Heap* host_heap = bx_unwrap(heap);
+        const HRESULT hr =
+            self->h_ID3D12Device->CreatePlacedResource(host_heap, offset, desc, state, clear, riid, nullptr);
+        log_placed(offset, hr);
+        return hr;
+    }
+    *out = nullptr;
+    if (is_backing_heap(heap)) {
+        const HRESULT check_hr = validate_backing_placement(self->h_ID3D12Device, heap, offset, desc, state, clear);
+        if (FAILED(check_hr)) {
+            log_placed(offset, check_hr);
+            return check_hr;
+        }
+    }
     ID3D12Heap* host_heap = bx_unwrap(heap);
-    HRESULT hr = self->h_ID3D12Device->CreatePlacedResource(host_heap, offset, desc, state, clear, riid, out);
-    char detail[160];
-    std::snprintf(detail, sizeof(detail), "CreatePlacedResource offset=%llu bytes=%llu hr=0x%08lx",
-                  static_cast<unsigned long long>(offset), static_cast<unsigned long long>(info.SizeInBytes),
-                  static_cast<unsigned long>(hr));
-    bx_log_emit(FAILED(hr) ? BX_LOG_WARN : BX_LOG_INFO, "d3d12_xs", "placed_resource", detail);
+    const HRESULT hr =
+        self->h_ID3D12Device->CreatePlacedResource(host_heap, offset, desc, state, clear, riid, out);
+    log_placed(offset, hr);
     return hr;
+}
+
+struct ConfigHeader {
+    uint32_t magic;
+    uint32_t struct_size;
+};
+static_assert(sizeof(ConfigHeader) == 8, "config probe is the 8-byte header");
+
+void write_cpu_pointer(void* config, uint64_t pointer) {
+    std::memcpy(static_cast<char*>(config) + offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer), &pointer, sizeof(pointer));
 }
 
 } // namespace
@@ -469,8 +555,21 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
         return S_OK;
     }
-    const auto* in = static_cast<const BxD3d12VirtualMemoryConfig*>(config);
-    if (in->version != kConfigVersion || in->flags != 0 || in->reserved != 0) {
+    /*
+     * PVOID has no size. Read 8 bytes, and only then the rest of a block that
+     * names this struct. A mismatch is left untouched.
+     */
+    ConfigHeader header{};
+    std::memcpy(&header, config, sizeof(header));
+    if (header.magic != BX_D3D12_VMEM_MAGIC || header.struct_size != sizeof(BxD3d12VirtualMemoryConfig)) {
+        BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
+        return S_OK;
+    }
+
+    BxD3d12VirtualMemoryConfig in{};
+    std::memcpy(&in, config, sizeof(in));
+    const uint32_t unknown_flags = in.flags & ~BX_D3D12_VMEM_FLAG_BACKING_HEAP;
+    if (in.version != kConfigVersion || unknown_flags != 0 || in.reserved != 0) {
         /* A console parameter block is not this struct. Leave those bytes alone. */
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
         return S_OK;
@@ -479,25 +578,25 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
     const bx_runtime_config_t* cfg = bx_get_runtime_config();
     const uint64_t cap = title_limit();
     const auto profile = (cfg && cfg->profile == BX_PROFILE_ANACONDA) ? BX_PROFILE_ANACONDA : BX_PROFILE_LOCKHART;
-    if (in->size_bytes != 0 && (in->size_bytes % k64K != 0 || in->size_bytes > cap)) {
+    if (in.size_bytes != 0 && (in.size_bytes % k64K != 0 || in.size_bytes > cap)) {
         return E_INVALIDARG;
     }
 
     bx_xmem_stats_t stats{};
     bx_xmem_get_internal_stats(&stats);
-    if (in->size_bytes != 0 && stats.title_limit_bytes != 0 && in->size_bytes > stats.title_limit_bytes) {
+    if (in.size_bytes != 0 && stats.title_limit_bytes != 0 && in.size_bytes > stats.title_limit_bytes) {
         return E_INVALIDARG;
     }
 
     bx_xmem_region_info_t region{};
     bool have_region = false;
-    if (in->base_va != 0) {
+    if (in.base_va != 0) {
         bx_xmem_region_info_t first{};
-        if (!bx_xmem_query_region(in->base_va, &first) || first.size_bytes == 0 || first.base_va != in->base_va ||
+        if (!bx_xmem_query_region(in.base_va, &first) || first.size_bytes == 0 || first.base_va != in.base_va ||
             first.base_va % k64K != 0 || first.size_bytes % k64K != 0) {
             return E_INVALIDARG;
         }
-        const uint64_t span = in->size_bytes != 0 ? in->size_bytes : first.size_bytes;
+        const uint64_t span = in.size_bytes != 0 ? in.size_bytes : first.size_bytes;
         if (span < first.size_bytes || span % first.size_bytes != 0) {
             return E_INVALIDARG;
         }
@@ -513,13 +612,14 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
         have_region = true;
     }
 
-    auto* block = static_cast<BxD3d12VirtualMemoryConfig*>(config);
+    const uint64_t new_base = have_region ? region.base_va : in.base_va;
+    const uint64_t new_size = have_region ? region.size_bytes : in.size_bytes;
     BxChargedHeap* old_heap = nullptr;
     ID3D12Resource* old_buffer = nullptr;
+    uint64_t published = 0;
     {
         Guard guard(g_section);
-        const bool same = have_region && g_record.have_region && g_record.region.base_va == region.base_va &&
-                          g_record.region.size_bytes == region.size_bytes;
+        const bool same = g_record.configured && g_record.config_base == new_base && g_record.config_size == new_size;
         if (!same) {
             old_heap = g_record.backing;
             old_buffer = g_record.backing_buffer;
@@ -528,13 +628,17 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
             g_record.cpu_pointer = 0;
         }
         g_record.configured = true;
+        g_record.backing_opt_in = (in.flags & BX_D3D12_VMEM_FLAG_BACKING_HEAP) != 0;
         g_record.profile = profile;
         g_record.title_limit = cap;
         g_record.have_region = have_region;
+        g_record.config_base = new_base;
+        g_record.config_size = new_size;
         g_record.region = have_region ? region : bx_xmem_region_info_t{};
-        g_record.config_block = block;
-        block->cpu_pointer = g_record.cpu_pointer;
+        published = g_record.cpu_pointer;
     }
+    /* The only write to caller memory, and it happens before this call returns. */
+    write_cpu_pointer(config, published);
     if (old_buffer) {
         old_buffer->Unmap(0, nullptr);
         old_buffer->Release();

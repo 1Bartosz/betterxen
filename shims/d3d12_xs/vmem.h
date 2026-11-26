@@ -7,19 +7,50 @@
 
 /*
  * BetterXen-defined parameter block for D3D12ConfigureVirtualMemoryX.
- * version is 1. flags and reserved must be 0.
+ *
+ * The export is PVOID and the frozen ABI has no size argument (abi/ is out of
+ * scope). The first 8 bytes are therefore the minimum dereference: magic then
+ * the struct size. Magic is 'BXVM' (0x4D565842). struct_size must equal
+ * sizeof(BxD3d12VirtualMemoryConfig). Any other pointer, including null, is not
+ * this struct: the call logs the unimplemented-API stub and returns S_OK. It
+ * does not read past those 8 bytes and it does not write.
+ *
+ * A block whose magic and size match is then checked in full. version is 1.
+ * flags may be 0 or BX_D3D12_VMEM_FLAG_BACKING_HEAP. Any other flag bit, or a
+ * non-zero reserved word, is not this struct either (logged S_OK, no write).
+ * A recognised block with a bad size or a base_va that bx_xmem_query_region
+ * does not resolve still returns E_INVALIDARG and is not written.
+ *
  * base_va is 0, or an address bx_xmem_query_region resolves. It is not a GPU pointer.
  * size_bytes is 0 or a 64 KiB multiple that does not exceed the active title limit.
- * cpu_pointer is an output. It is the persistent Map address of the WRITE_BACK buffer
- * that backs the region, or 0 until that heap has been created. The block passed here
- * must stay alive until the matching CreateHeap returns, because that is when a 0
- * becomes the map address. There is no separate export for this pointer.
- * A null argument, or a block whose version is not 1 or whose flags or reserved
- * word is non-zero, is not this struct. That call logs the unimplemented-API stub
- * and returns S_OK. It does not store the pointer and does not write cpu_pointer.
+ *
+ * The call copies what it needs. The caller's pointer is not kept. cpu_pointer
+ * is written only before this call returns: the persistent Map address of the
+ * WRITE_BACK buffer if that backing heap already exists, otherwise 0. CreateHeap
+ * does not write the block. A caller that needs the address after the backing
+ * heap has been created calls D3D12ConfigureVirtualMemoryX again with the same
+ * region (same base_va and size). That second call does not reset or recreate
+ * the backing heap. It writes the current map into the new block.
+ *
+ * CreateHeap returns that backing heap only when all of the following hold:
+ * the block opted in with BX_D3D12_VMEM_FLAG_BACKING_HEAP, the region size is
+ * non-zero, and the desc is the heap this file creates for the region:
+ * Type CUSTOM, CPUPageProperty WRITE_BACK, MemoryPoolPreference L0,
+ * SizeInBytes equal to the configured region, Alignment 0 or 64 KiB,
+ * Flags exactly D3D12_HEAP_FLAG_NONE (the flag set used when the backing heap
+ * is created), and CreationNodeMask and VisibleNodeMask each 0 or 1.
+ * Any other CreateHeap is the host CreateHeap. The desc is not modified.
+ * The live-heap xmem budget charge (taken on create, dropped on the wrapper's
+ * final Release) is the budget difference, and the returned object is the wrapper.
+ *
  * The layout must match tests/conformance/test_d3d12_placed/main.cpp.
  */
+constexpr uint32_t BX_D3D12_VMEM_MAGIC = 0x4D565842u;
+constexpr uint32_t BX_D3D12_VMEM_FLAG_BACKING_HEAP = 0x1u;
+
 struct BxD3d12VirtualMemoryConfig {
+    uint32_t magic;
+    uint32_t struct_size;
     uint32_t version;
     uint32_t flags;
     uint64_t base_va;
@@ -27,11 +58,15 @@ struct BxD3d12VirtualMemoryConfig {
     uint64_t reserved;
     uint64_t cpu_pointer;
 };
-static_assert(sizeof(BxD3d12VirtualMemoryConfig) == 40, "config block is 40 bytes");
-static_assert(offsetof(BxD3d12VirtualMemoryConfig, base_va) == 8, "base_va offset");
-static_assert(offsetof(BxD3d12VirtualMemoryConfig, size_bytes) == 16, "size_bytes offset");
-static_assert(offsetof(BxD3d12VirtualMemoryConfig, reserved) == 24, "reserved offset");
-static_assert(offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer) == 32, "cpu_pointer offset");
+static_assert(sizeof(BxD3d12VirtualMemoryConfig) == 48, "config block is 48 bytes");
+static_assert(offsetof(BxD3d12VirtualMemoryConfig, magic) == 0, "magic offset");
+static_assert(offsetof(BxD3d12VirtualMemoryConfig, struct_size) == 4, "struct_size offset");
+static_assert(offsetof(BxD3d12VirtualMemoryConfig, version) == 8, "version offset");
+static_assert(offsetof(BxD3d12VirtualMemoryConfig, flags) == 12, "flags offset");
+static_assert(offsetof(BxD3d12VirtualMemoryConfig, base_va) == 16, "base_va offset");
+static_assert(offsetof(BxD3d12VirtualMemoryConfig, size_bytes) == 24, "size_bytes offset");
+static_assert(offsetof(BxD3d12VirtualMemoryConfig, reserved) == 32, "reserved offset");
+static_assert(offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer) == 40, "cpu_pointer offset");
 
 extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config);
 
