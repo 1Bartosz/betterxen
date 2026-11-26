@@ -192,17 +192,32 @@ mod tests {
     /// (#479). They check what happens at the deadline, not how fast a script starts.
     const START_MARGIN: Duration = Duration::from_secs(2);
 
+    /// Removes the pid file, and kills the recorded process if a failing test left it running.
+    struct PidFile(PathBuf);
+
+    impl Drop for PidFile {
+        fn drop(&mut self) {
+            if std::thread::panicking()
+                && let Ok(pid) = std::fs::read_to_string(&self.0)
+            {
+                let _ = Command::new("/bin/kill").arg(pid.trim()).status();
+            }
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
     fn kills_a_probe_that_exceeds_the_timeout() {
-        let pid_file =
-            std::env::temp_dir().join(format!("bx-harness-hang-{}.pid", std::process::id()));
-        let _ = std::fs::remove_file(&pid_file);
+        let pid_file = PidFile(
+            std::env::temp_dir().join(format!("bx-harness-hang-{}.pid", std::process::id())),
+        );
+        let _ = std::fs::remove_file(&pid_file.0);
         // `exec` keeps the pid, so the recorded pid is the process that has to be killed.
         let script = Script::new(
             "hang",
             &format!(
                 "echo $$ > '{}'; echo started; exec sleep 30",
-                pid_file.display()
+                pid_file.0.display()
             ),
         );
         let started = Instant::now();
@@ -220,7 +235,7 @@ mod tests {
         // The process is gone. `output_complete` is deliberately not asserted: tests run in
         // parallel, and a child spawned by another test at the wrong moment can inherit this
         // probe's pipe and hold it open (seen in 2 of 200 runs).
-        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = std::fs::read_to_string(&pid_file.0).unwrap();
         let alive = Command::new("/bin/kill")
             .args(["-0", pid.trim()])
             .stderr(Stdio::null())
@@ -228,7 +243,6 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "probe {} survived the timeout", pid.trim());
-        let _ = std::fs::remove_file(&pid_file);
     }
 
     /// The probe exits at once, but a background descendant inherits stdout and
