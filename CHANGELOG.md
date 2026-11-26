@@ -10,6 +10,7 @@ Guest execution uses original, purpose-built test programs. Commercial Xbox game
 remains unsupported.
 
 ### Added
+- Implemented clean-room COM `IUnknown` vtable dispatch in `xgameruntime.dll!QueryApiImpl` for the core public Microsoft PC GDK (`Microsoft.GDK.Windows 2610.0.9661`) interface families (`XAsync`/`XTaskQueue`/`XThread`, `XGameRuntimeIsFeatureAvailable`, `XSystem`, `XError`, `XPersistentLocalStorage`, `XUser`, `XStore`, `XGameUi`, `XNetworking`, `XGame`), with auto-logging `BX_VTABLE_STUB_LOG` fallback on unimplemented slots. Validated live on CrossOver 26.3 with an independently authored caller linked against Microsoft's public `xgameruntime.lib` (#456).
 - `bx-cli run` now stages the shims a guest loads by system-directory search into the prefix's or bottle's `drive_c/windows/system32` before launch (#457). GDK titles load `xgameruntime.dll` with `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`, which never searches `WINEPATH`. The bootstrap therefore reported `E_GAMERUNTIME_DLL_NOT_FOUND` before the #441 loader exports could be reached.
   - **What is staged:** `xgameruntime.dll` and, found through `bx-probe`, every BetterXen shim it imports (today `bx_runtime_veh.dll`). The same restricted search applies to a DLL's own imports, so staging the runtime alone fails unless the guest happened to load the logger first.
   - **How:** copies are idempotent: an identical file is left alone, a different one is replaced through a rename. `bx-cli` prints what it staged.

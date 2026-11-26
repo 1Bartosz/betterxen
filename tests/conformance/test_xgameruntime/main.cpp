@@ -506,6 +506,70 @@ int main() {
         if (bytes[i] == 0xC3 && bytes[i + 1] == 0xA9) ++eacute;
     }
     CHECK(eacute > 0 && eacute < (long_n - 1) / 2);
+
+    // Public Microsoft.GDK.Windows 2610.0.9661 COM IUnknown QueryApiImpl dispatch checks (#456).
+    {
+        const GUID core_guid = {0x073B7DCB, 0x1FCF, 0x4030, {0x94, 0xBE, 0xE3, 0xC9, 0xEB, 0x62, 0x34, 0x28}};
+        const GUID sys_clsid = {0xE349BD1A, 0xFC20, 0x4E40, {0xB9, 0x9C, 0x41, 0x78, 0xCC, 0x6B, 0x40, 0x9F}};
+        const GUID sys_iid = {0x1861CF2E, 0xE18B, 0x4834, {0xA9, 0xF5, 0xB4, 0xA4, 0xE6, 0xEF, 0xB4, 0xCF}};
+        const GUID game_clsid = {0x973A344E, 0x24BF, 0x4D0F, {0x84, 0x57, 0x56, 0xC5, 0x34, 0x89, 0x2B, 0x29}};
+        const GUID game_iid = {0x2549F142, 0x6419, 0x4A06, {0x97, 0xB5, 0x93, 0x1A, 0xAB, 0x7C, 0x2F, 0x34}};
+        const GUID net_clsid = {0x37E56907, 0x2F10, 0x41E8, {0xB7, 0x2F, 0x36, 0xED, 0xB1, 0x85, 0x33, 0x1A}};
+        const GUID net_iid = {0xBF2346B2, 0x39AF, 0x4658, {0xB5, 0xEA, 0x44, 0x71, 0x3C, 0x7E, 0x83, 0xB3}};
+        const GUID iunknown = {0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+
+        void* com_core = nullptr;
+        CHECK(SUCCEEDED(query_api(&core_guid, &core_guid, &com_core)) && com_core);
+        auto** core_vtbl = *static_cast<void***>(com_core);
+        auto qi = reinterpret_cast<HRESULT(WINAPI*)(void*, const GUID*, void**)>(core_vtbl[0]);
+        auto release = reinterpret_cast<ULONG(WINAPI*)(void*)>(core_vtbl[2]);
+        auto tq_create = reinterpret_cast<HRESULT(WINAPI*)(void*, uint32_t, uint32_t, void**)>(core_vtbl[12]);
+        auto tq_close = reinterpret_cast<void(WINAPI*)(void*, void*)>(core_vtbl[17]);
+        auto unimpl_slot = reinterpret_cast<HRESULT(WINAPI*)(void*)>(core_vtbl[14]);
+        void* qi_out = nullptr;
+        CHECK(SUCCEEDED(qi(com_core, &iunknown, &qi_out)) && qi_out == com_core);
+        void* q = nullptr;
+        CHECK(SUCCEEDED(tq_create(com_core, 2, 2, &q)) && q);
+        tq_close(com_core, q);
+        CHECK(unimpl_slot(com_core) == E_NOTIMPL);
+        CHECK(release(com_core) >= 1);
+
+        void* com_sys = nullptr;
+        CHECK(SUCCEEDED(query_api(&sys_clsid, &sys_iid, &com_sys)) && com_sys);
+        auto** sys_vtbl = *static_cast<void***>(com_sys);
+        auto get_cid = reinterpret_cast<HRESULT(WINAPI*)(void*, size_t, char*, size_t*)>(sys_vtbl[3]);
+        char cid[64]{};
+        size_t cid_used = 0;
+        CHECK(SUCCEEDED(get_cid(com_sys, sizeof(cid), cid, &cid_used)) && cid_used > 1);
+
+        void* com_game = nullptr;
+        CHECK(SUCCEEDED(query_api(&game_clsid, &game_iid, &com_game)) && com_game);
+        auto** game_vtbl = *static_cast<void***>(com_game);
+        auto get_tid = reinterpret_cast<HRESULT(WINAPI*)(void*, uint32_t*)>(game_vtbl[3]);
+        uint32_t title_id = 0;
+        CHECK(SUCCEEDED(get_tid(com_game, &title_id)) && title_id != 0);
+
+        void* com_net = nullptr;
+        CHECK(SUCCEEDED(query_api(&net_clsid, &net_iid, &com_net)) && com_net);
+        auto** net_vtbl = *static_cast<void***>(com_net);
+        struct NetHint { uint32_t lvl, cost, iana; bool init, app, over, roam; };
+        auto get_hint = reinterpret_cast<HRESULT(WINAPI*)(void*, NetHint*)>(net_vtbl[15]);
+        NetHint hint{};
+        CHECK(SUCCEEDED(get_hint(com_net, &hint)) && hint.init);
+
+        const GUID user_guid = {0x01ACD177, 0x91F9, 0x4763, {0xA3, 0x8E, 0xCC, 0xBB, 0x55, 0xCE, 0x32, 0xE0}};
+        void* com_user = nullptr;
+        CHECK(SUCCEEDED(query_api(&user_guid, &user_guid, &com_user)) && com_user);
+        auto** user_vtbl = *static_cast<void***>(com_user);
+        auto reg_ev = reinterpret_cast<HRESULT(WINAPI*)(void*, void*, void*, void*, uint64_t*)>(user_vtbl[33]);
+        auto unreg_ev = reinterpret_cast<bool(WINAPI*)(void*, uint64_t, bool)>(user_vtbl[34]);
+        uint64_t ev_tok = 0;
+        auto dummy_cb = [](void*, uint64_t, uint32_t) {};
+        CHECK(SUCCEEDED(reg_ev(com_user, nullptr, nullptr, reinterpret_cast<void*>(+dummy_cb), &ev_tok)) && ev_tok != 0);
+        CHECK(unreg_ev(com_user, ev_tok, false));
+        CHECK(!unreg_ev(com_user, ev_tok, false));
+    }
+
     XGameRuntimeUninitialize();
     CHECK(XStoreCreateContext(nullptr, &probe) == not_initialized);
 
