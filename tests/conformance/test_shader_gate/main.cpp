@@ -13,6 +13,8 @@
  *
  * Expected values come from the D3D12 contract, the DXBC layout and the documented kernel, not
  * from the shim. Needs bx_shader_bridge.dll next to the shims and BX_LOG_FILE (bx-cli --log).
+ * It also checks that the bridge was loaded from d3d12_xs.dll's directory; run it with the EXE
+ * in a different directory from the shims to exercise that lookup.
  */
 #ifndef WIDL_EXPLICIT_AGGREGATE_RETURNS
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
@@ -293,12 +295,20 @@ int main() {
     ID3D12PipelineState* pso = nullptr;
     hr = create_compute(device, root_uav, g_fill_cs66, sizeof(g_fill_cs66), &pso);
     check(SUCCEEDED(hr) && pso, "DXIL SM 6.6 CreateComputePipelineState hr=0x%08lx", ul(hr));
-    if (!check(GetModuleHandleW(L"bx_shader_bridge.dll") != nullptr,
+    const HMODULE bridge = GetModuleHandleW(L"bx_shader_bridge.dll");
+    if (!check(bridge != nullptr,
                "bx_shader_bridge.dll was not loaded: build it with shader-transpiler/crates/dxbc-accc/guest/build.sh "
                "(#445) and place it next to the shims")) {
         if (pso) pso->Release();
         return finish();
     }
+    // The shim must find the bridge beside itself, not through the EXE's directory (crate README).
+    wchar_t bridge_path[MAX_PATH] = {}, shim_path[MAX_PATH] = {};
+    GetModuleFileNameW(bridge, bridge_path, MAX_PATH);
+    GetModuleFileNameW(GetModuleHandleW(L"d3d12_xs.dll"), shim_path, MAX_PATH);
+    const auto dir_of = [](std::wstring path) { return path.substr(0, path.find_last_of(L'\\')); };
+    check(_wcsicmp(dir_of(bridge_path).c_str(), dir_of(shim_path).c_str()) == 0,
+          "bx_shader_bridge.dll was loaded from %ls, not beside d3d12_xs.dll (%ls)", bridge_path, shim_path);
     if (pso) {
         run_dxil(device, root_uav, pso);
         pso->Release();
