@@ -1,8 +1,7 @@
 #include "proxy.h"
+#include "vmem.h"
 
 #include <cstdio>
-
-#include "bx_xmem_internal.h"
 
 /*
  * Track C (M1-C1, #414): Xbox Series D3D12 entry points over the host's d3d12.dll
@@ -66,6 +65,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(PVOID params, REFIID riid, void** ppv) {
     if (!proxy) {
         return E_OUTOFMEMORY;
     }
+    bx_vmem_install_device_hooks(proxy);
 
     /* Record how far up the ID3D12DeviceN chain the host goes: QueryInterface on the proxy stops there. */
     int highest = 0;
@@ -88,10 +88,8 @@ HRESULT WINAPI D3D12XboxCreateDevice(PVOID params, REFIID riid, void** ppv) {
     return hr;
 }
 
-/* Logged no-op: console startup sequences check SUCCEEDED(hr) before reserving virtual memory. */
-HRESULT WINAPI D3D12ConfigureVirtualMemoryX(PVOID /*config*/) {
-    BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
-    return S_OK;
+HRESULT WINAPI D3D12ConfigureVirtualMemoryX(PVOID config) {
+    return bx_d3d12_configure_virtual_memory(config);
 }
 
 HRESULT WINAPI D3D12SerializeVersionedRootSignature(
