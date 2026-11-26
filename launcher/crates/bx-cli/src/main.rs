@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bx_probe::{ShimTrack, classify_dll, probe_pe32_plus};
 use bx_telemetry::summarize_jsonl;
@@ -460,6 +460,44 @@ fn apply_prefix_env(command: &mut Command, cx_root: &Path, prefix: &Path, winelo
         );
 }
 
+/// Reports a timeout or signal and stops the environment's `wineserver`. True if cleanup failed.
+fn stop_environment(
+    stop: Stop,
+    cx_root: &Path,
+    environment_dir: &Path,
+    bottle: Option<&str>,
+    inherit_env: bool,
+) -> bool {
+    match stop {
+        Stop::TimedOut => eprintln!("timed out; stopping the environment"),
+        Stop::Signalled(signal) => {
+            eprintln!("received signal {signal}; stopping the environment");
+        }
+    }
+    let server_env: Vec<(String, String)> = collect_isolated_host_env(|k| env::var(k).ok())
+        .into_iter()
+        .collect();
+    let mut cleanup_failed = false;
+    let prefixes_to_stop = match cleanup_prefixes_for_stop(environment_dir, bottle, |name| {
+        resolve_bottle_prefix_with_host_env(cx_root, name, inherit_env)
+    }) {
+        Ok(prefixes) => prefixes,
+        Err(e) => {
+            eprintln!("cleanup failed to re-resolve bottle prefix: {e}");
+            cleanup_failed = true;
+            vec![environment_dir.to_path_buf()]
+        }
+    };
+    for prefix in &prefixes_to_stop {
+        if let Err(e) = supervise::stop_server(&cx_root.join("bin/wineserver"), prefix, &server_env)
+        {
+            eprintln!("cleanup failed, programs may still be running: {e}");
+            cleanup_failed = true;
+        }
+    }
+    cleanup_failed
+}
+
 fn cmd_run(args: &[String]) -> ExitCode {
     let run = match parse_run_args(args) {
         Ok(run) => run,
@@ -507,24 +545,33 @@ fn cmd_run(args: &[String]) -> ExitCode {
         None => resolved_prefix.clone(),
     };
 
+    // Handled from here on, so that prefix initialization is cleaned up like the guest is.
+    supervise::install_signal_handlers();
+    let started = Instant::now();
+
     // #457: shims loaded with LOAD_LIBRARY_SEARCH_SYSTEM32 never see WINEPATH, so they are
     // copied into the environment's system32 first. A bare prefix is initialized for that.
     let system32 = stage::system32_dir(&environment_dir);
-    if bottle.is_none() && !system32.is_dir() {
+    if bottle.is_none() && !system32.is_dir() && stage::has_system32_shims(&abs_shims) {
         let _ = fs::create_dir_all(&resolved_prefix);
         let mut boot = Command::new(&wineloader);
         boot.args(["wineboot", "--init"]);
         apply_host_env(&mut boot, inherit_env);
         apply_prefix_env(&mut boot, cx_root, &resolved_prefix, &wineloader);
         boot.env("WINEDEBUG", "-all");
-        match boot.status() {
-            Ok(st) if st.success() => {}
-            Ok(st) => {
+        match supervise::supervise(boot, timeout, supervise::received_signal) {
+            Ok(Outcome::Exited(st)) if st.success() => {}
+            Ok(Outcome::Exited(st)) => {
                 eprintln!(
                     "error: wineboot --init failed for {}: {st}",
                     resolved_prefix.display()
                 );
                 return ExitCode::FAILURE;
+            }
+            Ok(outcome @ Outcome::Stopped(stop)) => {
+                let failed = stop_environment(stop, cx_root, &environment_dir, None, inherit_env);
+                let code = outcome.exit_code();
+                return ExitCode::from(if failed { code.max(1) } else { code });
             }
             Err(e) => {
                 eprintln!(
@@ -590,8 +637,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let log_size = |log: &PathBuf| fs::metadata(log).map_or(0, |m| m.len());
     let log_size_before = abs_log.as_ref().map_or(0, log_size);
 
-    supervise::install_signal_handlers();
-    let outcome = supervise::supervise(cmd, timeout, supervise::received_signal);
+    // `--timeout` bounds the whole run, including any prefix initialization above.
+    let remaining = timeout.map(|limit| limit.saturating_sub(started.elapsed()));
+    let outcome = supervise::supervise(cmd, remaining, supervise::received_signal);
     let code = match &outcome {
         Ok(outcome) => outcome.exit_code(),
         Err(e) => {
@@ -605,34 +653,13 @@ fn cmd_run(args: &[String]) -> ExitCode {
             eprintln!("guest exited with status: {status}");
         }
         Ok(Outcome::Stopped(stop)) => {
-            match stop {
-                Stop::TimedOut => eprintln!("timed out; stopping the environment"),
-                Stop::Signalled(signal) => {
-                    eprintln!("received signal {signal}; stopping the environment");
-                }
-            }
-            let server_env: Vec<(String, String)> = collect_isolated_host_env(|k| env::var(k).ok())
-                .into_iter()
-                .collect();
-            let prefixes_to_stop =
-                match cleanup_prefixes_for_stop(&environment_dir, bottle.as_deref(), |name| {
-                    resolve_bottle_prefix_with_host_env(cx_root, name, inherit_env)
-                }) {
-                    Ok(prefixes) => prefixes,
-                    Err(e) => {
-                        eprintln!("cleanup failed to re-resolve bottle prefix: {e}");
-                        cleanup_failed = true;
-                        vec![environment_dir.clone()]
-                    }
-                };
-            for prefix in &prefixes_to_stop {
-                if let Err(e) =
-                    supervise::stop_server(&cx_root.join("bin/wineserver"), prefix, &server_env)
-                {
-                    eprintln!("cleanup failed, programs may still be running: {e}");
-                    cleanup_failed = true;
-                }
-            }
+            cleanup_failed = stop_environment(
+                *stop,
+                cx_root,
+                &environment_dir,
+                bottle.as_deref(),
+                inherit_env,
+            );
         }
         _ => {}
     }

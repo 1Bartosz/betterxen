@@ -80,6 +80,8 @@ pub enum Staged {
     Copied(PathBuf),
     Replaced(PathBuf),
     Unchanged(PathBuf),
+    /// A [`SYSTEM32_SHIMS`] file the shim folder does not have.
+    Absent(PathBuf),
 }
 
 impl Staged {
@@ -88,13 +90,22 @@ impl Staged {
             Staged::Copied(p) => format!("staged {}", p.display()),
             Staged::Replaced(p) => format!("replaced {}", p.display()),
             Staged::Unchanged(p) => format!("already current {}", p.display()),
+            Staged::Absent(p) => format!("not staged, {} not found", p.display()),
         }
     }
 }
 
+/// True if the shim folder has any [`SYSTEM32_SHIMS`] file, so there is something to stage.
+pub fn has_system32_shims(shims_dir: &Path) -> bool {
+    SYSTEM32_SHIMS
+        .iter()
+        .any(|name| find_shim(shims_dir, name).is_some())
+}
+
 /// Copies every [`SYSTEM32_SHIMS`] file, and the shims they import, from `shims_dir` into
 /// `system32`. The directory must already exist (an uninitialized prefix is a caller error, not
-/// something to skip). A missing shim is an error. A copy already identical byte for byte is
+/// something to skip). A shim the folder does not have is reported as [`Staged::Absent`], so a
+/// run with a partial `--shims` folder still starts. A copy already identical byte for byte is
 /// left alone, a different one is replaced. Nothing outside `system32` is written.
 pub fn stage_system32(shims_dir: &Path, system32: &Path) -> Result<Vec<Staged>, String> {
     stage_system32_with(shims_dir, system32, pe_imports)
@@ -108,6 +119,17 @@ fn stage_system32_with<I>(
 where
     I: FnMut(&Path) -> Result<Vec<String>, String>,
 {
+    let (roots, absent): (Vec<&str>, Vec<&str>) = SYSTEM32_SHIMS
+        .iter()
+        .copied()
+        .partition(|name| find_shim(shims_dir, name).is_some());
+    let mut staged: Vec<Staged> = absent
+        .iter()
+        .map(|name| Staged::Absent(shims_dir.join(name)))
+        .collect();
+    if roots.is_empty() {
+        return Ok(staged);
+    }
     if !system32.is_dir() {
         return Err(format!(
             "{} does not exist; the prefix is not initialized",
@@ -115,7 +137,7 @@ where
         ));
     }
     let names = shim_closure(
-        SYSTEM32_SHIMS,
+        &roots,
         |dep| find_shim(shims_dir, dep).is_some(),
         |name| match find_shim(shims_dir, name) {
             Some(path) => imports_of(&path),
@@ -125,7 +147,6 @@ where
             )),
         },
     )?;
-    let mut staged = Vec::new();
     for name in &names {
         let src = find_shim(shims_dir, name).unwrap_or_else(|| shims_dir.join(name));
         let bytes =
@@ -139,8 +160,12 @@ where
         };
         if !matches!(result, Staged::Unchanged(_)) {
             // Write beside the target, then rename, so a guest never sees a half-written DLL.
-            let tmp = system32.join(format!(".{name}.bx-staging"));
-            fs::write(&tmp, &bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+            // The name is per process, so a concurrent run cannot rename a partial write.
+            let tmp = system32.join(format!(".{name}.{}.bx-staging", std::process::id()));
+            fs::write(&tmp, &bytes).map_err(|e| {
+                let _ = fs::remove_file(&tmp);
+                format!("cannot write {}: {e}", tmp.display())
+            })?;
             fs::rename(&tmp, &dst).map_err(|e| {
                 let _ = fs::remove_file(&tmp);
                 format!("cannot replace {}: {e}", dst.display())
@@ -268,11 +293,18 @@ mod tests {
     }
 
     #[test]
-    fn missing_shim_is_an_error() {
-        let (_t, shims, prefix) = setup("missing");
+    fn missing_shim_is_reported_and_nothing_is_staged() {
+        let (t, shims, prefix) = setup("missing");
         fs::remove_file(shims.join("xgameruntime.dll")).unwrap();
-        let err = stage(&shims, &system32_dir(&prefix)).unwrap_err();
-        assert!(err.contains("cannot read shim"), "{err}");
+        assert!(!has_system32_shims(&shims));
+        let sys = system32_dir(&prefix);
+        let expected = vec![Staged::Absent(shims.join("xgameruntime.dll"))];
+        assert_eq!(stage(&shims, &sys).unwrap(), expected);
+        assert_eq!(fs::read_dir(&sys).unwrap().count(), 0);
+        // With nothing to stage, a prefix without system32 is not an error either.
+        let fresh = system32_dir(&t.0.join("fresh"));
+        assert_eq!(stage(&shims, &fresh).unwrap(), expected);
+        assert!(!fresh.exists());
     }
 
     #[test]
