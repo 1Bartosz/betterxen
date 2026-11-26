@@ -48,6 +48,13 @@ int main() {
     CHECK(!XMemGetWorkingSetStatistics(&stats, sizeof(stats) - 1));
     CHECK(GetLastError() == ERROR_INVALID_PARAMETER);
 
+    unsigned char large_stats[sizeof(bx_xmem_stats_t) + 16];
+    std::memset(large_stats, 0xCC, sizeof(large_stats));
+    CHECK(XMemGetWorkingSetStatistics(large_stats, sizeof(large_stats)));
+    for (size_t i = sizeof(bx_xmem_stats_t); i < sizeof(large_stats); ++i) {
+        CHECK(large_stats[i] == 0);
+    }
+
     auto* ordinary = XMemAlloc(73, 0);
     auto* empty = XMemAllocDefault(0, 0);
     CHECK(ordinary && empty);
@@ -92,5 +99,16 @@ int main() {
     CHECK(VirtualFree(reserved, 0, MEM_RELEASE));
     bx_xmem_get_internal_stats(&stats);
     CHECK(stats.committed_virtual_bytes == 0 && stats.peak_committed_bytes == page * 3);
+
+    // Console callers pass multi-bit attributes (e.g. 0x21) in arg 4 and high bits in alloc_type.
+    auto* console_res = static_cast<unsigned char*>(
+        XMemVirtualAlloc(nullptr, page * 2, MEM_RESERVE | 0x20400000u, 0x21u));
+    CHECK(console_res != nullptr);
+    CHECK(XMemVirtualAlloc(console_res, page, MEM_COMMIT, 0x21u) == console_res);
+    console_res[0] = 0x5Au;
+    CHECK(console_res[0] == 0x5Au);
+    CHECK(VirtualFree(console_res, 0, MEM_RELEASE));
+    bx_xmem_get_internal_stats(&stats);
+    CHECK(stats.committed_virtual_bytes == 0);
     std::puts("test_xmem: passed");
 }

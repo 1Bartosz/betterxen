@@ -179,8 +179,14 @@ PVOID WINAPI XMemVirtualAlloc(PVOID address, SIZE_T size, DWORD alloc_type, DWOR
     /* Strip console-only high bits before forwarding to standard Win32 VirtualAlloc. */
     DWORD win_alloc = alloc_type & (MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN);
     if (win_alloc == 0) win_alloc = MEM_COMMIT | MEM_RESERVE;
-    DWORD win_prot = protect & 0xFFu;
-    if (win_prot == 0) win_prot = PAGE_READWRITE;
+    /* Console callers may pass multi-bit Xbox memory attributes (e.g. 0x21) in arg 4;
+     * valid Win32 base page protections are a single power-of-two bit in 0x01..0x80. */
+    DWORD low_prot = protect & 0xFFu;
+    DWORD win_prot = (low_prot != 0 && (low_prot & (low_prot - 1)) == 0)
+        ? (protect & (0xFFu | PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE))
+        : PAGE_READWRITE;
+    /* MEM_RESET combined with MEM_COMMIT is rejected by Win32 VirtualAlloc, so returning
+     * early here cannot commit pages outside the working-set budget. */
     if (!(win_alloc & MEM_COMMIT) || (win_alloc & MEM_RESET)) {
         return VirtualAlloc(address, size, win_alloc, win_prot);
     }
@@ -306,6 +312,7 @@ BOOL WINAPI XMemGetWorkingSetStatistics(PVOID out_stats, SIZE_T stats_size) {
         return FALSE;
     }
     const bx_xmem_stats_t stats{title_limit(), heap_bytes + virtual_bytes, 0, peak_bytes};
+    std::memset(out_stats, 0, stats_size);
     std::memcpy(out_stats, &stats, sizeof(stats));
     return TRUE;
 }
