@@ -1,3 +1,4 @@
+#include "com_dispatch.h"
 #include "task_queue.h"
 
 #include <condition_variable>
@@ -837,6 +838,11 @@ HRESULT WINAPI QueryApiImpl(const GUID* clsid, const GUID* iid, void** out) {
         return runtime_not_initialized;
     }
 
+    bool public_clsid_known = false;
+    if (bx::gdk::query_public_gdk_interface(clsid, iid, out, &public_clsid_known)) {
+        return S_OK;
+    }
+
     const auto* family = find_family(clsid);
     if (family && synthetic_guid(iid) && iid->Data1 == family->iid) {
         *out = const_cast<void*>(family->table);
@@ -853,6 +859,8 @@ HRESULT WINAPI QueryApiImpl(const GUID* clsid, const GUID* iid, void** out) {
     if (family) {
         std::snprintf(detail, sizeof(detail), "iid_mismatch family=%s clsid=%s iid=%s", family->name, clsid_text,
                       iid_text);
+    } else if (public_clsid_known) {
+        std::snprintf(detail, sizeof(detail), "public_iid_mismatch clsid=%s iid=%s", clsid_text, iid_text);
     } else {
         std::snprintf(detail, sizeof(detail), "unsupported clsid=%s iid=%s", clsid_text, iid_text);
     }

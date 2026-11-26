@@ -58,7 +58,7 @@ Legend: 🟢 **Done / Merged** · 🔵 **Active Milestone** · ⚪ **Planned**
 | **Track B** | `XCRDAPI.dll` DirectStorage GPU-buffer & batch transfers (`#467`) | `⬜` *(1 ready)* | [View Track B](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+B%22) |
 | **Track C** | `d3d12_xs` `D3D12ConfigureVirtualMemoryX` + placed resources (`#464`), `PresentX` swapchain bridge (`#465`), D3D workload fixes (`#450`) | `⬜⬜⬜` *(3 ready)* | [View Track C](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+C%22) |
 | **Track D** | `dxbc-accc` Windows guest bridge (`#445`), M2 Shader Format Gate ADR & PSO hook (`#466`) | `⬜⬜` *(2 ready)* | [View Track D](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+D%22) |
-| **Track E** | Public GDK COM `QueryApiImpl` dispatch (`#456`), offline `XGameSave` + `XPackage` COM dispatch (`#468`) | `🟨⬜` *(PR #462 open, 1 ready)* | [View Track E](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+E%22) |
+| **Track E** | Public GDK COM `QueryApiImpl` dispatch (`#456` / PR `#462` merged), offline `XGameSave` + `XPackage` COM dispatch (`#468`) | `🟩⬜` *(#462 merged, 1 ready)* | [View Track E](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+E%22) |
 | **Track F** | D3DMetal GPU limits fixture (`#453` / PR #455), M2 first-frame + shader-gate exit fixture (`#469`) | `🟨⬜` *(PR #455 approved, 1 ready)* | [View Track F](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+F%22) |
 
 `🟩` Merged & verified · `🟨` PR open / in review · `⬜` Open & ready to claim
