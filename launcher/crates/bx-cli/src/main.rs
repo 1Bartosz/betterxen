@@ -17,7 +17,7 @@ use bx_telemetry::summarize_jsonl;
 use dxbc_accc::inspect_dxbc;
 use supervise::{Outcome, Stop};
 
-const SHIM_DLL_OVERRIDES: &str = "bx_runtime_veh,d3d12_xs,xg_xs,xmem,XCRDAPI,xgameruntime,AcpHal,xapu,chad,GameInput,\
+const SHIM_DLL_OVERRIDES: &str = "bx_runtime_veh,d3d12_xs,xg_xs,xmem,xcrdapi,XCRDAPI,xgameruntime,acphal,AcpHal,xapu,chad,gameinput,GameInput,\
 api-ms-win-core-psm-appnotify-l1-1-0,api-ms-win-core-psm-appnotify-l1-1-1,\
 ext-ms-win-rtcore-ntuser-message-l1-1-0,ext-ms-win-rtcore-ntuser-message-ansi-l1-1-0,\
 ext-ms-win-rtcore-ntuser-window-l1-1-0,ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0=n,b";
@@ -720,6 +720,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             for item in &staged {
                 if let stage::Staged::Copied(path)
                 | stage::Staged::Replaced(path)
+                | stage::Staged::ReplacedWineStub(path)
                 | stage::Staged::Unchanged(path) = item
                     && let Some(name) = path.file_name()
                 {
