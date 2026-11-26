@@ -1,0 +1,11 @@
+LIBRARY AcpHal.dll
+EXPORTS
+    AcpHalCreate
+    AcpHalAllocateShapeContexts
+    AcpHalReleaseShapeContexts
+    ApuCreateHeap
+    ApuAlloc
+    ApuFree
+    ApuIsVirtualAddressValid
+    ApuMapApuAddress
+    ApuMapVirtualAddress

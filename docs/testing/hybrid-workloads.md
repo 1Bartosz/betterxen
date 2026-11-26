@@ -19,8 +19,7 @@ The implementation links in this document are pinned to that candidate. They
 describe source inspection, not independent acceptance of the author's recorded
 M4 results. Those results remain in the candidate's
 [baseline record](https://github.com/MacosPorters/betterxen/blob/566272082a74d8b45fcec37edd00f4f6703df3ab/docs/research/crossover-baseline-2026-11-25.md).
-Use the [roadmap](../roadmap.md) for phase completion and
-[benchmark protocol](benchmarks.md) for the existing native benchmark's separate scope.
+Use the [roadmap](../roadmap.md) for milestone completion and the retired native benchmark protocol at tag `native-first-final` (`docs/testing/benchmarks.md`) for historical reference.
 
 ## Selected workloads and provenance
 
@@ -195,7 +194,7 @@ Run correctness and both graphics negative controls for each backend before
 using its timing. Use release builds, AC power, an otherwise idle machine and
 one GPU job at a time. Record validation variables and toolchain settings;
 keep correctness with validation enabled separate from timing with it disabled.
-Reuse the [native protocol's](benchmarks.md#protocol) environment discipline.
+Reuse the retired native protocol's (`native-first-final`: `docs/testing/benchmarks.md#protocol`) environment discipline.
 
 Declare iteration count (for example 2,000), two untimed warm-up processes and
 five measured processes per backend before starting. Record the exact backend
@@ -250,7 +249,7 @@ tooling, a skipped test or a timeout cannot establish GPU support.
 
 Keep source review (class D), local original-fixture execution and independent
 reproduction distinct under the repository's [claims registry](../claims.toml)
-and [review records](review-log.md). Do not promote one machine's observation to
+and recorded review logs. Do not promote one machine's observation to
 M1–M5 compatibility, Xbox-hardware verification or game compatibility. A second
 contributor records their own candidate, hardware, commands and disagreements;
 the implementer cannot independently accept their result.

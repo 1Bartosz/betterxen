@@ -1,0 +1,8 @@
+LIBRARY bx_runtime_veh.dll
+EXPORTS
+    bx_log_emit
+    bx_log_unimpl_api
+    bx_log_unimpl_vtable
+    bx_get_runtime_config
+    bx_veh_install
+    bx_veh_get_clwb_trap_count

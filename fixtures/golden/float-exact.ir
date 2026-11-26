@@ -1,9 +1,0 @@
-0000: t0 = load.u32 input[index]
-000c: t1 = const.u32 0x00400000
-0014: t2 = and.b32 t0, t1
-0018: t3 = const.u32 0x3f800000
-001c: t4 = xor.b32 t2, t3
-0020: t5 = const.u32 0x40200000
-0028: t6 = add.f32 t4, t5
-002c: t7 = mul.f32 t6, t5
-0030: store.u32 output[index], t7

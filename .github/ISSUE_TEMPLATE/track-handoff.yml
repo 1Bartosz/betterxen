@@ -1,0 +1,82 @@
+name: Parallel track handoff issue
+description: Self-contained engineering task scoped to one BetterXen track (A-F) for conflict-free parallel work.
+title: "[M1-X0] "
+labels: ["track: hybrid"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to hand off work to contributors across Tracks A-F.
+        Keep file scopes disjoint so 5-8+ contributors can work concurrently without merge conflicts.
+        Never include proprietary game files, names, hashes, or leaked material in issues or PRs.
+  - type: dropdown
+    id: track
+    attributes:
+      label: Track
+      options:
+        - "Track A — Host Launcher, VEH & Win32 Bridge"
+        - "Track B — Memory (xmem) & Storage (XCRDAPI)"
+        - "Track C — Graphics (d3d12_xs, xg_xs, DXR/FFX)"
+        - "Track D — Shader Pipeline (DXBC/DXIL/ACCC)"
+        - "Track E — Platform (xgameruntime), Input & Audio"
+        - "Track F — Conformance, QA & Performance"
+        - "ABI Freeze — Shared Contract (abi/)"
+    validations:
+      required: true
+  - type: dropdown
+    id: milestone
+    attributes:
+      label: Milestone
+      options:
+        - "M0 — Repo, ABI & Cross-Build"
+        - "M1 — Boot to D3D12XboxCreateDevice"
+        - "M2 — First Frame & Shader Format Gate"
+        - "M3 — Full Shaders, Streaming & Texture Correctness"
+        - "M4 — 3D Rendering, DXR/BVH & Input"
+        - "M5 — Audio, Saves & Stability"
+        - "M6 — Shader Cache, 16 GB Optimization & Polish"
+    validations:
+      required: true
+  - type: textarea
+    id: file_scope
+    attributes:
+      label: Exclusive file scope
+      description: Exact directories/files this issue may modify. Do not overlap with other active issues.
+      placeholder: |
+        - `shims/xmem/**`
+        - `tests/conformance/test_xmem/**`
+    validations:
+      required: true
+  - type: textarea
+    id: api_contract
+    attributes:
+      label: Exact API / export / COM contract
+      description: Exported symbols (referencing `abi/defs/*.def`), COM interface IIDs/vtable slots, or CLI flags to implement.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Hard dependencies
+      description: Blocking `[ABI]` or prerequisite issues (`none` if immediately claimable).
+      value: "none"
+    validations:
+      required: true
+  - type: textarea
+    id: synthetic_test
+    attributes:
+      label: Required synthetic conformance test
+      description: Clean-room synthetic test in `tests/conformance/` or `cargo test` proving correctness.
+    validations:
+      required: true
+  - type: textarea
+    id: exit_criteria
+    attributes:
+      label: Definition of done
+      description: Exact commands that must succeed locally and in CI.
+      placeholder: |
+        - `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
+        - `scripts/build-shims.sh` (all DLL export checks pass)
+        - Synthetic conformance binary passes under CrossOver/Wine
+    validations:
+      required: true

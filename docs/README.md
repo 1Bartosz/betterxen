@@ -1,90 +1,32 @@
-# BetterXen documentation
+# BetterXen Documentation
 
-## Getting started
+## Getting Started & Architecture
 
-Start with the [project README](../README.md) for scope and build commands,
-then read the [interface contracts](interfaces.md). Reproduce an
-[original guest test program](../experiments/x1/README.md) or run the
-[independent validation suite](../tests/validation/README.md) before changing
-either path. The [changelog](../CHANGELOG.md) records notable changes.
+- [Project README](../README.md) — Overview, quick start, `bx-cli` commands, and verified scope.
+- [Roadmap](roadmap.md) — Single authoritative plan (Milestones M0–M6) and completion gates.
+- [Parallel Track Architecture](architecture/parallel-tracks.md) — 6-track directory ownership, ABI freeze rule, and multi-agent Git workflow.
+- [Wave 1 Parallel Backlog](issues/wave-1-backlog.md) — Non-overlapping starter issues across Tracks A–F.
+- [Frozen ABI Contracts](../abi/README.md) — Cross-DLL C headers (`abi/include/`) and canonical `.def` export tables (`abi/defs/`).
+- [Synthetic Conformance Suite](../tests/conformance/README.md) — Auto-discovered PE32+ conformance binaries.
+- [Changelog](../CHANGELOG.md) — Unreleased and historical changes.
 
-Use the [roadmap](roadmap.md) for the active CrossOver-based hybrid plan, phases,
-critical path and completion criteria; see [ADR 0005](adr/0005-crossover-hybrid-direction.md)
-for the decision and [project board setup](planning/project-board.md). Native work is
-paused: [deferred native roadmap](research/native-roadmap.md) and the archived
-[native-first plan](archive/development-phases-native-first.md) with
-[retired milestones](archive/native-first-milestones.json), the
-[native issue archive](research/native-issue-archive.md) and the retired
-[H0 to H7 breakdown](archive/hybrid-phases-h0-h7.md). Research inputs: the [upstream research registry](research/upstream-registry.md) and
-[component reuse matrix](research/component-reuse-matrix.md). Historical phase
-checkpoints retain their original evidence scope.
+## Architecture Decision Records
 
-## Architecture and technical design
+- [ADR 0005: CrossOver-based hybrid direction](adr/0005-crossover-hybrid-direction.md) — Pivot to CrossOver + Rosetta 2 + D3DMetal as the external foundation.
+- [ADR 0006: Retire in-tree native-first workspace](adr/0006-retire-in-tree-native-workspace.md) — Retirement of paused native code/scripts/docs from `main` (preserved at Git tag `native-first-final`).
 
-- [Interface contracts](interfaces.md) — Translated shader stages, guest services, native command submission, and synthetic textures.
-- [Fixture memory model](adr/0003-demo-memory-model.md) and [CPU boundary](adr/0004-cpu-boundary.md) — Buffer bindings, guest address translation, and dependency direction.
+## Research, Testing & Licensing
 
-## Native Metal graphics
+- [Hybrid Workloads & Measurement Protocol](testing/hybrid-workloads.md) — Original Windows workloads, receipt fields, timing conventions, and negative controls.
+- [CrossOver Licensing & Redistribution Boundaries](research/crossover-licensing.md) — Per-component license review for CrossOver, Wine, DXMT, DXVK, VKD3D-Proton, MoltenVK, D3DMetal, and Rosetta 2.
+- [Upstream Research Registry](research/upstream-registry.md) & [Component Reuse Matrix](research/component-reuse-matrix.md) — Public upstream evaluation and provenance screening.
+- [Primary-Source Verification (2026-11-25)](research/primary-source-verification-2026-11-25.md) & [Hybrid Backlog Research Record](research/hybrid-backlog-research-2026-11-25.md) — Vendor documentation verification notes.
+- [Public Technical References](research/sources.md), [Xbox GDK Notes](research/xbox-gdk.md), [RDNA 2 Notes](research/rdna2.md), and [Shader Containers](research/shader-containers.md) — Public specification references for shim and shader work.
 
-- [Translated offscreen stages](interfaces.md#translated-offscreen-stages) — Translated vertex and pixel stages for the bounded gfx1030 subset.
-- [Blend and depth passes](interfaces.md) — Native blend and depth graphics passes with per-draw state.
-- [Apple GPU evidence](research/apple-gpu.md) and [host lab record](research/host-lab.md) — Observed behavior and historical floating-point results.
+## Governance, Security & Legal
 
-## RDNA 2 decoding and shader translation
-
-- [Instruction coverage](shaders/instruction-coverage.md) — Desktop gfx1030 instruction forms, operand limits, and CPU and GPU results.
-- [Semantic coverage](shaders/semantic-coverage.md) — Generated per-family counts of identified, declared, decoded, lowered and verified gfx1030 forms.
-- [SOP2 scalar ALU](shaders/scalar-alu.md) — Supported scalar add, subtract and bitwise forms, their SCC rules and sources.
-- [Semantic registry](shaders/semantic-registry.md) — How to add an instruction form: registry fields, validation, generation and the independence rule.
-- [VOP1 vector unary and swap](shaders/vector-unary.md) — Wave32 integer bit operations, register exchange, and operand limits.
-- [VOP2 select and carry](shaders/vector-vcc.md) — Wave32 lane selection, carry and borrow through the vector condition code.
-- [VOPC integer compares](shaders/vector-compare.md) — Wave32 compare forms, the VCC/EXEC contract, runtime `s_cbranch_vccz` and the Metal mapping.
-- [Metal Shading Language generation](shaders/msl.md) and [independent CPU reference](shaders/reference-interpreter.md) — Translation rules and separate CPU execution models.
-
-## Guest CPU and runtime experiments
-
-- [Guest experiment guide](../experiments/x1/README.md) — Bounded x86-64 execution, executable loading, experimental services, native compute, and offscreen rendering.
-- [x86-64 instruction registry](cpu/instruction-registry.md) — Shared decoder, generated tables, semantics, native lowering and how to add a verified instruction form.
-- [Proposed AVX and AVX2 guest contract](cpu/avx-contract.md) — VEX decoding, vector state, fault behavior and an original integer fixture specification.
-- [Runtime service registry](runtime/registry.md) and [generated coverage](runtime/services.md) — Import resolution, typed Win64 adapters and how to add a tested service.
-- [Guest threads](runtime/threads.md) — Deterministic scheduler, thread services, limits and tests.
-- [Guest CPU research](research/cpu-boundary.md) — Public specifications and unresolved console requirements.
-- [Synthetic import fixtures](../tests/compat_fixtures/README.md) — Reproducible PE32+ builds and expected service behavior.
-
-## Testing, validation, and benchmarks
-
-- [Hybrid workloads and measurement protocol](testing/hybrid-workloads.md) — Original Windows workload selection, metric definitions, receipt sources and independent reproduction requirements; distinguishes the pending hybrid candidate from merged behavior.
-- [Migrated pull-request integration review](testing/migration-pr-review.md) — Merge decisions, integration fixes, native verification and excluded concurrent work.
-- [Testing and acceptance index](testing/README.md) — Entry point for test procedures, evidence and review records.
-- [AMD RDNA2 desktop GPU (gfx1030) form acceptance](testing/shader-form-acceptance.md) — Independence, command, log and promotion rules for fixture-verified instruction forms.
-- [Engineering progress](progress.md) — Verification commands, metric definitions, and open release gates.
-- [CPU test runtime, shards and coverage map](testing/cpu-coverage.md) — Measured CPU gate cost, deterministic test-target shards, and a verified per-operation CPU/loader coverage map with exact test evidence.
-- [Test inventory comparison](testing/test-inventory.md) — Detect missing or newly ignored Cargo tests across commits.
-- [Persistent resource and translated rendering acceptance](testing/x9-acceptance.md) — Pinned upstream tests, native ARM64 results and unsupported cases.
-- [Baseline acceptance](testing/phase-02-baseline.md), [Phase 01 assurance](testing/phase01-assurance.md), and [independent reviews](testing/review-log.md) — Candidate-specific results and release findings.
-- [Gate A: a compiled C program](testing/gate-a.md) — The two milestones, what the A1 and A2 tests check and what they do not show.
-- [Mutation testing](testing/mutation.md) and [benchmark protocol](testing/benchmarks.md) — Test sensitivity, benchmark inputs, and timing requirements.
-
-## Research and engineering decisions
-
-- [Public sources](research/sources.md), [RDNA 2 notes](research/rdna2.md), and [Xbox GPU evidence](research/xbox-gpu.md) — Specifications, evidence scope, and unknown console behavior.
-- [Shader inputs](research/shader-containers.md) and [risk register](risk-register.md) — Input provenance and unresolved engineering risks.
-- [Texture format inventory](research/texture-formats.md) — Formats and layouts by stage (decode, layout, native upload, sampling, guest), their public specifications, unknowns and ranked follow-ups.
-- [PortWatch native macOS research](research/portwatch-native-macos.md) — Screening of public Xbox-on-Windows port projects for native macOS planning; discovery only.
-- [Synthetic integration and upstream evidence](research/synthetic-integration.md) — Audited source snapshots and remaining commercial startup prerequisites.
-- [Hybrid backlog research record](research/hybrid-backlog-research-2026-11-25.md) — Findings, registry candidates and the issues they produced (2026-11-25); not verified on hardware.
-- [Primary-source verification](research/primary-source-verification-2026-11-25.md) — Which hybrid-research claims were confirmed, contradicted or left unverified against vendor documentation.
-- [CrossOver licensing boundaries](research/crossover-licensing.md) — Per-component licenses and redistribution status for the hybrid direction, with the unread documents named.
-
-## Security, licensing, and contributions
-
-- [Threat model](threat-model.md) and [security reporting](../SECURITY.md) — Execution limits and disclosure instructions.
-- [Legal scope](legal.md), [dependency licensing](licenses.md), and [third-party notices](../THIRD_PARTY_NOTICES.md) — Input policy, attribution, and redistribution findings.
-- [Contribution guidelines](../CONTRIBUTING.md) — Original authorship, Developer Certificate of Origin sign-off, and evidence requirements.
-- [Agent task queue](coordination/agent-tasks.md) — Areas, claiming, leases, upstream sync, verification and the security model for parallel contributors and coding agents.
-- [CPU/runtime expansion campaign ledger](coordination/cpu-campaign-ledger.md) — Progress ledger for the BetterXen native CPU and runtime compatibility campaign: starting/current commits, completed batches, new forms, verification evidence and the next implementation target.
-- [Infrastructure QA ownership](coordination/infrastructure-qa-ownership.md) — Non-overlapping paths for infrastructure and QA tooling.
-- [Agent queue smoke evidence](coordination/agent-queue-smoke.md) — Live Actions results from the disposable smoke repository.
-- [Infrastructure QA tooling](testing/infrastructure/README.md) — Advisory orchestration, PR validation, benchmark analysis and release checks.
-
-- [Migration to BetterXen](migration.md): source attribution, imported history and compatibility names.
+- [Engineering & Agent Rules](../AGENTS.md) (`CLAUDE.md` symlink) — Mandatory rules for human contributors and coding agents.
+- [Contributing Guidelines](../CONTRIBUTING.md) — Claiming, verification, clean-room policy, and DCO sign-off.
+- [Claims & Evidence Classes](claims.toml) — Evidence classification definitions (classes A–D, U).
+- [Legal Scope](legal.md), [Dependency Licensing](licenses.md), and [Third-Party Notices](../THIRD_PARTY_NOTICES.md) — Input policy, attribution, and redistribution boundaries.
+- [Threat Model](threat-model.md) & [Security Policy](../SECURITY.md) — Isolation boundaries and vulnerability reporting.

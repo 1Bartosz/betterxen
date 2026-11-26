@@ -1,19 +1,22 @@
 [workspace]
-members = ["crates/*", "tests/validation", "benchmarks"]
+members = [
+    "launcher/crates/bx-cli",
+    "launcher/crates/bx-probe",
+    "launcher/crates/bx-telemetry",
+    "shader-transpiler/crates/dxbc-accc",
+]
+exclude = ["legacy-native"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-rust-version = "1.100"
+rust-version = "1.85"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
-# Whole-program optimization for release and bench builds (#116). On an Apple M5 the
-# interpreter ran about 6 % and cold DBT about 9 % faster in `dbt_bench`, at the cost of
-# slower release builds. Debug and test builds are unaffected.
 [profile.release]
-lto = "fat"
+lto = "thin"
 codegen-units = 1

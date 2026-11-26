@@ -1,10 +1,9 @@
 # Rust and local builds
 /target/
-/experiments/x1/target/
 /build/
+/build-shims/
 /cmake-build-*/
-/fuzz/target/
-/fuzz/artifacts/
+/local-runs/
 
 # macOS / Xcode local state
 .DS_Store
@@ -20,8 +19,6 @@
 *.profraw
 *.profdata
 
-# Keep Cargo.lock, source fixtures, reviewed golden files and documentation tracked.
-
 # Local AI agent tooling
 .agents/
 .claude/
@@ -29,15 +26,10 @@
 .cursor/
 .gemini/
 
-# Local gate evidence and intermediate fixture objects
+# Local gate evidence and ignored probes
 /artifacts/
-/tests/validation/target/
-
 __pycache__/
 *.pyc
 /diagnostics/probe/
 /diagnostics/title-candidate-*/
 /diagnostics/title-check/
-
-# Native application build output
-/app/.build/

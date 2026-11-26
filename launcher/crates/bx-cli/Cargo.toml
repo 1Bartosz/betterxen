@@ -1,0 +1,18 @@
+[package]
+name = "bx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "bx-cli"
+path = "src/main.rs"
+
+[dependencies]
+bx-probe = { path = "../bx-probe" }
+bx-telemetry = { path = "../bx-telemetry" }
+dxbc-accc = { path = "../../../shader-transpiler/crates/dxbc-accc" }
+
+[lints]
+workspace = true
