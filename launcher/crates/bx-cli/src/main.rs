@@ -1,19 +1,27 @@
 //! Track A (M1-A1): Native ARM64 macOS CLI for BetterXen hybrid execution.
 
+mod supervise;
+
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use bx_probe::{ShimTrack, classify_dll, probe_pe32_plus};
 use bx_telemetry::summarize_jsonl;
 use dxbc_accc::inspect_dxbc;
+use supervise::{Outcome, Stop};
 
 const SHIM_DLL_OVERRIDES: &str = "bx_runtime_veh,d3d12_xs,xg_xs,xmem,XCRDAPI,xgameruntime,AcpHal,xapu,chad,GameInput,\
 api-ms-win-core-psm-appnotify-l1-1-0,api-ms-win-core-psm-appnotify-l1-1-1,\
 ext-ms-win-rtcore-ntuser-message-l1-1-0,ext-ms-win-rtcore-ntuser-message-ansi-l1-1-0,\
 ext-ms-win-rtcore-ntuser-window-l1-1-0,ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0=n,b";
+
+/// Accepted `--backend` values. CrossOver ignores an unknown value silently, so one is refused.
+const BACKENDS: [&str; 4] = ["d3dmetal", "dxmt", "dxvk", "wined3d"];
 
 const SAFE_CHILD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
@@ -39,7 +47,8 @@ fn print_usage() {
            bx-cli probe <pe32+_path>             Classify PE32+ imports by BetterXen track (A-E)\n\
            bx-cli shader <dxbc_blob_path>        Classify a DXBC shader container (DXIL vs ACCC/FSPX)\n\
            bx-cli trace <log.jsonl>              Summarize bx_runtime_veh JSONL diagnostics\n\
-           bx-cli run --exe <path> [--shims <dir>] [--bottle <name> | --prefix <dir>] [--profile lockhart|anaconda] [--log <path>] [--inherit-env]\n"
+           bx-cli run --exe <path> [--shims <dir>] [--bottle <name> | --prefix <dir>] [--profile lockhart|anaconda] [--log <path>] [--inherit-env] [--timeout <secs>] [--backend d3dmetal|dxmt|dxvk|wined3d]\n\
+           (shims default to build-shims/bin; a timeout or signal stops the whole bottle or prefix)\n"
     );
 }
 
@@ -171,20 +180,29 @@ fn cmd_trace(path: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let summary = summarize_jsonl(&text);
-    println!("Trace events     : {}", summary.total_lines);
-    println!(
+    print!("{}", render_trace(&text));
+    ExitCode::SUCCESS
+}
+
+fn render_trace(text: &str) -> String {
+    let mut out = String::new();
+    let summary = summarize_jsonl(text);
+    let _ = writeln!(out, "Trace events     : {}", summary.total_lines);
+    let _ = writeln!(
+        out,
         "{}",
         format_clwb_line(summary.clwb_events, summary.clwb_trap_lower_bound)
     );
-    println!("ADX illegal ops  : {}", summary.adx_errors);
+    let _ = writeln!(out, "ADX illegal ops  : {}", summary.adx_errors);
     if !summary.unhandled_exceptions.is_empty() {
-        println!(
+        let _ = writeln!(
+            out,
             "\nUnhandled exceptions ({}):",
             summary.unhandled_exceptions.len()
         );
         for crash in summary.unhandled_exceptions {
-            println!(
+            let _ = writeln!(
+                out,
                 "  code={} module_base={} + RVA={} RIP={}",
                 crash.exception_code.as_deref().unwrap_or("unknown"),
                 crash.module_base.as_deref().unwrap_or("unknown"),
@@ -194,18 +212,18 @@ fn cmd_trace(path: &str) -> ExitCode {
         }
     }
     if !summary.unimpl_apis.is_empty() {
-        println!("\nUnimplemented APIs:");
+        let _ = writeln!(out, "\nUnimplemented APIs:");
         for (api, count) in summary.unimpl_apis {
-            println!("  {count:5}x  {api}");
+            let _ = writeln!(out, "  {count:5}x  {api}");
         }
     }
     if !summary.unimpl_vtables.is_empty() {
-        println!("\nUnimplemented COM vtable slots:");
+        let _ = writeln!(out, "\nUnimplemented COM vtable slots:");
         for (slot, count) in summary.unimpl_vtables {
-            println!("  {count:5}x  {slot}");
+            let _ = writeln!(out, "  {count:5}x  {slot}");
         }
     }
-    ExitCode::SUCCESS
+    out
 }
 
 fn unix_to_wine_z_path(path: &Path) -> String {
@@ -227,7 +245,20 @@ where
     env_map
 }
 
-fn cmd_run(args: &[String]) -> ExitCode {
+#[derive(Debug)]
+struct RunArgs {
+    exe: PathBuf,
+    shims_dir: PathBuf,
+    profile: String,
+    bottle: Option<String>,
+    prefix: Option<PathBuf>,
+    log: Option<PathBuf>,
+    inherit_env: bool,
+    timeout: Option<Duration>,
+    backend: Option<String>,
+}
+
+fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut exe_path: Option<PathBuf> = None;
     let mut shims_dir = PathBuf::from("build-shims/bin");
     let mut profile = String::from("lockhart");
@@ -235,6 +266,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut wine_prefix: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
     let mut inherit_env = false;
+    let mut timeout = None;
+    let mut backend: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -263,21 +296,82 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 log_file = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--timeout" if i + 1 < args.len() => {
+                let seconds: u64 = args[i + 1]
+                    .parse()
+                    .ok()
+                    .filter(|s| *s > 0)
+                    .ok_or("--timeout needs a whole number of seconds above 0")?;
+                timeout = Some(Duration::from_secs(seconds));
+                i += 2;
+            }
+            "--backend" if i + 1 < args.len() => {
+                let name = args[i + 1].clone();
+                if !BACKENDS.contains(&name.as_str()) {
+                    return Err(format!(
+                        "unknown backend {name:?}; use one of {}",
+                        BACKENDS.join(", ")
+                    ));
+                }
+                backend = Some(name);
+                i += 2;
+            }
             "--inherit-env" => {
                 inherit_env = true;
                 i += 1;
             }
-            other => {
-                eprintln!("unknown argument: {other}");
-                return ExitCode::FAILURE;
-            }
+            other => return Err(format!("unknown argument: {other}")),
         }
     }
 
-    let Some(exe) = exe_path else {
-        eprintln!("error: --exe <path> is required");
-        return ExitCode::FAILURE;
+    if let Some(name) = &bottle
+        && (name.is_empty() || name.starts_with(['-', '.']) || name.contains('/'))
+    {
+        return Err(format!("invalid bottle name {name:?}"));
+    }
+    Ok(RunArgs {
+        exe: exe_path.ok_or("error: --exe <path> is required")?,
+        shims_dir,
+        profile,
+        bottle,
+        prefix: wine_prefix,
+        log: log_file,
+        inherit_env,
+        timeout,
+        backend,
+    })
+}
+
+/// `bin/wine` deletes an inherited `WINEDLLOVERRIDES` and applies the bottle's
+/// `[EnvironmentVariables]` over what it is given, so bottle mode passes both as options.
+fn bottle_options(backend: Option<&str>) -> Vec<String> {
+    let mut options = vec!["--dll".to_string(), SHIM_DLL_OVERRIDES.to_string()];
+    if let Some(backend) = backend {
+        options.push("--env".to_string());
+        options.push(format!("CX_GRAPHICS_BACKEND={backend}"));
+    }
+    options
+}
+
+fn cmd_run(args: &[String]) -> ExitCode {
+    let run = match parse_run_args(args) {
+        Ok(run) => run,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
     };
+    let RunArgs {
+        exe,
+        shims_dir,
+        profile,
+        bottle,
+        prefix: wine_prefix,
+        log: log_file,
+        inherit_env,
+        timeout,
+        backend,
+    } = run;
 
     let cx_root = Path::new("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver");
     let wine_wrapper = cx_root.join("bin/wine");
@@ -294,9 +388,19 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let resolved_prefix =
         wine_prefix.unwrap_or_else(|| PathBuf::from("/tmp/betterxen-wine-prefix"));
 
+    // The environment a timeout or signal has to stop.
+    let environment_dir = match &bottle {
+        Some(name) => PathBuf::from(env::var("HOME").unwrap_or_default())
+            .join("Library/Application Support/CrossOver/Bottles")
+            .join(name),
+        None => resolved_prefix.clone(),
+    };
+
     let mut cmd = if let Some(ref bname) = bottle {
         let mut c = Command::new(&wine_wrapper);
-        c.args(["--bottle", bname]).arg(&abs_exe);
+        c.args(["--bottle", bname])
+            .args(bottle_options(backend.as_deref()))
+            .arg(&abs_exe);
         c
     } else {
         let _ = fs::create_dir_all(&resolved_prefix);
@@ -310,6 +414,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
         for (k, v) in collect_isolated_host_env(|k| env::var(k).ok()) {
             cmd.env(k, v);
         }
+    }
+    // Inherited values must not point the launcher at a different bottle than cleanup does.
+    if bottle.is_some() {
+        cmd.env_remove("WINEPREFIX").env_remove("CX_BOTTLE");
     }
 
     if bottle.is_none() {
@@ -339,27 +447,73 @@ fn cmd_run(args: &[String]) -> ExitCode {
         .env("WINEPATH", &wine_shims_path)
         .env("BX_PROFILE", &profile)
         .env("WINEDEBUG", "-all");
+    if let Some(backend) = &backend {
+        cmd.env("CX_GRAPHICS_BACKEND", backend);
+    }
 
-    if let Some(ref lf) = log_file {
-        let abs_log = if lf.is_absolute() {
-            lf.clone()
+    let abs_log = log_file.map(|lf| {
+        if lf.is_absolute() {
+            lf
         } else {
             env::current_dir().unwrap_or_default().join(lf)
-        };
-        cmd.env("BX_LOG_FILE", unix_to_wine_z_path(&abs_log));
+        }
+    });
+    if let Some(log) = &abs_log {
+        cmd.env("BX_LOG_FILE", unix_to_wine_z_path(log));
+    }
+    let log_size = |log: &PathBuf| fs::metadata(log).map_or(0, |m| m.len());
+    let log_size_before = abs_log.as_ref().map_or(0, log_size);
+
+    supervise::install_signal_handlers();
+    let outcome = supervise::supervise(cmd, timeout, supervise::received_signal);
+    let code = match &outcome {
+        Ok(outcome) => outcome.exit_code(),
+        Err(e) => {
+            eprintln!("failed to run CrossOver wine: {e}");
+            1
+        }
+    };
+    let mut cleanup_failed = false;
+    match &outcome {
+        Ok(Outcome::Exited(status)) if !status.success() => {
+            eprintln!("guest exited with status: {status}");
+        }
+        Ok(Outcome::Stopped(stop)) => {
+            match stop {
+                Stop::TimedOut => eprintln!("timed out; stopping the environment"),
+                Stop::Signalled(signal) => {
+                    eprintln!("received signal {signal}; stopping the environment");
+                }
+            }
+            let server_env: Vec<(String, String)> = collect_isolated_host_env(|k| env::var(k).ok())
+                .into_iter()
+                .collect();
+            if let Err(e) = supervise::stop_server(
+                &cx_root.join("bin/wineserver"),
+                &environment_dir,
+                &server_env,
+            ) {
+                eprintln!("cleanup failed, programs may still be running: {e}");
+                cleanup_failed = true;
+            }
+        }
+        _ => {}
     }
 
-    match cmd.status() {
-        Ok(st) if st.success() => ExitCode::SUCCESS,
-        Ok(st) => {
-            eprintln!("guest exited with status: {st}");
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("failed to launch CrossOver wine: {e}");
-            ExitCode::FAILURE
-        }
+    // Printed for failed and stopped runs too, which is when it matters most.
+    if let Some(log) = &abs_log
+        && log_size(log) > log_size_before
+        && let Ok(bytes) = fs::read(log)
+    {
+        // Guest text may not be valid UTF-8; a summary is still worth printing.
+        print!(
+            "\nTrace summary of {}:\n{}",
+            log.display(),
+            render_trace(&String::from_utf8_lossy(&bytes))
+        );
     }
+    // The reason for the stop is kept; a failed cleanup only turns success into failure.
+    ExitCode::from(if cleanup_failed { code.max(1) } else { code })
 }
 
 fn cmd_shader(path: &str) -> ExitCode {
@@ -415,6 +569,50 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_run_arguments() {
+        let run = parse_run_args(&args(&[
+            "--exe",
+            "a.exe",
+            "--bottle",
+            "b",
+            "--timeout",
+            "30",
+            "--backend",
+            "d3dmetal",
+        ]))
+        .unwrap();
+        assert_eq!(run.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(run.backend.as_deref(), Some("d3dmetal"));
+        assert_eq!(run.shims_dir, PathBuf::from("build-shims/bin"));
+        assert_eq!(run.profile, "lockhart");
+        let plain = parse_run_args(&args(&["--exe", "a.exe"])).unwrap();
+        assert!(plain.timeout.is_none() && plain.bottle.is_none() && plain.prefix.is_none());
+        for bad in [
+            &["--exe", "a.exe", "--timeout", "0"][..],
+            &["--exe", "a.exe", "--timeout", "soon"],
+            &["--exe", "a.exe", "--backend", "dmxt2"],
+            &["--exe", "a.exe", "--bottle", "../x"],
+            &["--exe", "a.exe", "--timeout"],
+            &["--bottle", "b"],
+        ] {
+            assert!(parse_run_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn bottle_mode_passes_overrides_and_backend_as_launcher_options() {
+        assert_eq!(bottle_options(None), ["--dll", SHIM_DLL_OVERRIDES]);
+        assert_eq!(
+            bottle_options(Some("dxvk"))[2..],
+            ["--env", "CX_GRAPHICS_BACKEND=dxvk"]
+        );
+    }
 
     #[test]
     fn isolated_env_strips_secrets_and_pins_path() {
