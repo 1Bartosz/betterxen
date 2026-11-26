@@ -392,6 +392,38 @@ fn resolve_bottle_prefix(
     Ok(path)
 }
 
+fn resolve_bottle_prefix_with_host_env(
+    cx_root: &Path,
+    name: &str,
+    inherit_env: bool,
+) -> Result<PathBuf, String> {
+    let mut query = Command::new("/usr/bin/perl");
+    apply_host_env(&mut query, inherit_env);
+    resolve_bottle_prefix(cx_root, query, name)
+}
+
+/// Collects the prefixes that cleanup must stop. Re-resolving a named bottle after launch catches
+/// the case where a managed-only bottle caused CrossOver's `bin/wine` to create and launch inside
+/// a new private stub bottle.
+fn cleanup_prefixes_for_stop<F>(
+    initial_prefix: &Path,
+    bottle: Option<&str>,
+    mut re_resolve: F,
+) -> Result<Vec<PathBuf>, String>
+where
+    F: FnMut(&str) -> Result<PathBuf, String>,
+{
+    let mut prefixes = Vec::new();
+    if let Some(name) = bottle {
+        let current = re_resolve(name)?;
+        prefixes.push(current);
+    }
+    if !prefixes.iter().any(|p| p == initial_prefix) {
+        prefixes.push(initial_prefix.to_path_buf());
+    }
+    Ok(prefixes)
+}
+
 /// `bin/wine` deletes an inherited `WINEDLLOVERRIDES` and applies the bottle's
 /// `[EnvironmentVariables]` over what it is given, so bottle mode passes both as options.
 fn bottle_options(backend: Option<&str>) -> Vec<String> {
@@ -440,17 +472,13 @@ fn cmd_run(args: &[String]) -> ExitCode {
 
     // The environment a timeout or signal has to stop.
     let environment_dir = match &bottle {
-        Some(name) => {
-            let mut query = Command::new("/usr/bin/perl");
-            apply_host_env(&mut query, inherit_env);
-            match resolve_bottle_prefix(cx_root, query, name) {
-                Ok(path) => path,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
+        Some(name) => match resolve_bottle_prefix_with_host_env(cx_root, name, inherit_env) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
             }
-        }
+        },
         None => resolved_prefix.clone(),
     };
 
@@ -534,13 +562,24 @@ fn cmd_run(args: &[String]) -> ExitCode {
             let server_env: Vec<(String, String)> = collect_isolated_host_env(|k| env::var(k).ok())
                 .into_iter()
                 .collect();
-            if let Err(e) = supervise::stop_server(
-                &cx_root.join("bin/wineserver"),
-                &environment_dir,
-                &server_env,
-            ) {
-                eprintln!("cleanup failed, programs may still be running: {e}");
-                cleanup_failed = true;
+            let prefixes_to_stop =
+                match cleanup_prefixes_for_stop(&environment_dir, bottle.as_deref(), |name| {
+                    resolve_bottle_prefix_with_host_env(cx_root, name, inherit_env)
+                }) {
+                    Ok(prefixes) => prefixes,
+                    Err(e) => {
+                        eprintln!("cleanup failed to re-resolve bottle prefix: {e}");
+                        cleanup_failed = true;
+                        vec![environment_dir.clone()]
+                    }
+                };
+            for prefix in &prefixes_to_stop {
+                if let Err(e) =
+                    supervise::stop_server(&cx_root.join("bin/wineserver"), prefix, &server_env)
+                {
+                    eprintln!("cleanup failed, programs may still be running: {e}");
+                    cleanup_failed = true;
+                }
             }
         }
         _ => {}
@@ -707,6 +746,93 @@ sub setup_bottle_wineprefix {
         assert!(matches!(outcome, Outcome::Stopped(Stop::TimedOut)));
         supervise::stop_server(&server, &prefix, &[]).unwrap();
         let expected = format!("-k {0}\n-w {0}\n", bottle.display());
+        assert_eq!(fs::read_to_string(&seen).unwrap(), expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Regression test starting with only a managed bottle and no private stub: the launch creates
+    // the private stub, and timeout cleanup re-resolves via CXBottle so wineserver stops the stub.
+    #[test]
+    fn a_timeout_cleans_up_a_managed_bottle_private_stub_created_on_first_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = env::temp_dir().join(format!("bx-cli-managed-stub-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let managed = root.join("managed/corp");
+        let private_dir = root.join("private");
+        let private_stub = private_dir.join("corp");
+        fs::create_dir_all(&managed).unwrap();
+        fs::create_dir_all(&private_dir).unwrap();
+        fs::create_dir_all(root.join("cx/lib/perl")).unwrap();
+        fs::write(
+            root.join("cx/lib/perl/CXBottle.pm"),
+            r#"package CXBottle;
+sub get_crossover_config {}
+sub setup_bottle_wineprefix {
+    my $priv = "$ENV{CX_BOTTLE_PATH}/$ENV{CX_BOTTLE}";
+    if (-f "$priv/system.reg") {
+        $ENV{WINEPREFIX} = $priv;
+        return ('private', $priv);
+    }
+    my $mgmt = "$ENV{CX_MANAGED_BOTTLE_PATH}/$ENV{CX_BOTTLE}";
+    if (-d $mgmt) {
+        $ENV{WINEPREFIX} = $mgmt;
+        return ('managed', $mgmt);
+    }
+    return (undef, undef);
+}
+1;
+"#,
+        )
+        .unwrap();
+
+        let query = |name: &str| {
+            let mut command = Command::new("/usr/bin/perl");
+            command
+                .env("CX_BOTTLE_PATH", &private_dir)
+                .env("CX_MANAGED_BOTTLE_PATH", root.join("managed"));
+            resolve_bottle_prefix(&root.join("cx"), command, name)
+        };
+
+        // Before launch there is no private stub, so CXBottle reports the managed bottle.
+        assert!(!private_stub.exists());
+        let initial = query("corp").unwrap();
+        assert_eq!(initial, managed);
+
+        // Simulated first launch creates the private stub before hanging until timeout.
+        let mut launcher = Command::new("/bin/sh");
+        launcher.args([
+            "-c",
+            &format!(
+                "mkdir -p '{0}' && touch '{0}/system.reg' && exec sleep 30",
+                private_stub.display()
+            ),
+        ]);
+        let outcome =
+            supervise::supervise(launcher, Some(Duration::from_millis(300)), || 0).unwrap();
+        assert!(matches!(outcome, Outcome::Stopped(Stop::TimedOut)));
+
+        let prefixes = cleanup_prefixes_for_stop(&initial, Some("corp"), query).unwrap();
+        assert_eq!(prefixes, vec![private_stub.clone(), managed.clone()]);
+
+        let server = root.join("wineserver");
+        let seen = root.join("seen");
+        fs::write(
+            &server,
+            format!(
+                "#!/bin/sh\necho \"$1 $WINEPREFIX\" >> '{}'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+        for prefix in &prefixes {
+            supervise::stop_server(&server, prefix, &[]).unwrap();
+        }
+        let expected = format!(
+            "-k {0}\n-w {0}\n-k {1}\n-w {1}\n",
+            private_stub.display(),
+            managed.display()
+        );
         assert_eq!(fs::read_to_string(&seen).unwrap(), expected);
         fs::remove_dir_all(root).unwrap();
     }
