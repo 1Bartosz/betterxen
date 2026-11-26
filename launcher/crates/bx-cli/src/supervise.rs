@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(50);
@@ -22,6 +22,8 @@ const STOP_SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHU
 
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
 static SUSPEND: AtomicBool = AtomicBool::new(false);
+/// Total time this process has spent suspended inside [`supervise`], in nanoseconds.
+static SUSPENDED_NANOS: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn note_signal(signal: libc::c_int) {
     SIGNAL.store(signal, Ordering::SeqCst);
@@ -62,6 +64,14 @@ pub fn install_signal_handlers() {
 
 pub fn received_signal() -> i32 {
     SIGNAL.load(Ordering::SeqCst)
+}
+
+/// Total time spent suspended (Ctrl-Z until continued) across every [`supervise`] call so far.
+///
+/// A caller that budgets one `--timeout` over several supervised phases subtracts this from its
+/// own wall-clock measurement, so a pause during an earlier phase is not charged to a later one.
+pub fn suspended_time() -> Duration {
+    Duration::from_nanos(SUSPENDED_NANOS.load(Ordering::SeqCst))
 }
 
 /// True once per SIGTSTP received since the last call.
@@ -166,7 +176,12 @@ fn supervise_with(
             signal_group(&child, libc::SIGTSTP);
             suspend(child.id() as libc::pid_t);
             signal_group(&child, libc::SIGCONT);
-            suspended += paused.elapsed();
+            let pause = paused.elapsed();
+            suspended += pause;
+            SUSPENDED_NANOS.fetch_add(
+                u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
             continue;
         }
         if timeout.is_some_and(|limit| started.elapsed().saturating_sub(suspended) >= limit) {
@@ -390,6 +405,7 @@ mod tests {
     fn a_suspend_request_stops_and_resumes_the_guest_without_using_up_the_timeout() {
         let requested = std::cell::Cell::new(false);
         let guest_was_stopped = std::cell::Cell::new(false);
+        let suspended_before = suspended_time();
         let outcome = supervise_with(
             shell("sleep 0.4; exit 0"),
             // Shorter than the suspension below: only running time may count.
@@ -403,6 +419,9 @@ mod tests {
         )
         .unwrap();
         assert!(guest_was_stopped.get(), "the guest group was not stopped");
+        // The pause is also reported to callers that budget a timeout across several phases.
+        let reported = suspended_time() - suspended_before;
+        assert!(reported >= Duration::from_millis(2000), "{reported:?}");
         match outcome {
             Outcome::Exited(status) => assert!(status.success(), "{status}"),
             other => panic!("the resumed guest should have finished on its own: {other:?}"),

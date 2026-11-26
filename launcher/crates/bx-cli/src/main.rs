@@ -527,13 +527,72 @@ fn stop_environment(
     report_stop(stop, cleanup, &mut std::io::stderr())
 }
 
-/// The part of a trace log that was appended after it had `size_before` bytes. A log that
-/// shrank was replaced during the run, so all of it is new.
-fn appended_since(bytes: &[u8], size_before: u64) -> &[u8] {
-    usize::try_from(size_before)
-        .ok()
-        .and_then(|start| bytes.get(start..))
-        .unwrap_or(bytes)
+/// How many trailing bytes of a log are remembered to recognize it again after the run.
+const LOG_MARK_TAIL: u64 = 256;
+
+/// What a trace log was before the run: which file, how long, and how it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogMark {
+    /// Device and inode of the file.
+    identity: (u64, u64),
+    len: u64,
+    /// The last bytes before `len` (up to [`LOG_MARK_TAIL`]).
+    tail: Vec<u8>,
+}
+
+/// The mark of the log at `path`, or `None` if there is no readable log yet.
+fn log_mark(path: &Path) -> Option<LogMark> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::MetadataExt;
+    let mut file = fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    let len = meta.len();
+    let tail_len = len.min(LOG_MARK_TAIL);
+    file.seek(SeekFrom::Start(len - tail_len)).ok()?;
+    let mut tail = Vec::new();
+    file.take(tail_len).read_to_end(&mut tail).ok()?;
+    Some(LogMark {
+        identity: (meta.dev(), meta.ino()),
+        len,
+        tail,
+    })
+}
+
+/// A log's identity and contents, read through one open file so the two cannot disagree.
+fn read_log(path: &Path) -> Option<((u64, u64), Vec<u8>)> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let mut file = fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(((meta.dev(), meta.ino()), bytes))
+}
+
+/// The part of a trace log that this run added, given the log's mark from before the run.
+///
+/// The old length is used as an offset only when the log is still the same file and still holds
+/// the same bytes just before that offset. A log that was replaced or rewritten during the run,
+/// whatever its new size, is new in full, as is a log that did not exist before.
+fn appended_since<'a>(bytes: &'a [u8], identity: (u64, u64), before: Option<&LogMark>) -> &'a [u8] {
+    let Some(mark) = before else {
+        return bytes;
+    };
+    let appended = usize::try_from(mark.len).ok().and_then(|start| {
+        let old_end = bytes.get(..start)?;
+        (mark.identity == identity && old_end.ends_with(&mark.tail)).then(|| &bytes[start..])
+    });
+    appended.unwrap_or(bytes)
+}
+
+/// What is left of `--timeout` after `elapsed` wall-clock time, of which `suspended` was spent
+/// stopped by Ctrl-Z. Suspended time is not charged, whichever phase of the run it fell in.
+fn remaining_budget(
+    timeout: Option<Duration>,
+    elapsed: Duration,
+    suspended: Duration,
+) -> Option<Duration> {
+    timeout.map(|limit| limit.saturating_sub(elapsed.saturating_sub(suspended)))
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
@@ -674,11 +733,11 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if let Some(log) = &abs_log {
         cmd.env("BX_LOG_FILE", unix_to_wine_z_path(log));
     }
-    let log_size = |log: &PathBuf| fs::metadata(log).map_or(0, |m| m.len());
-    let log_size_before = abs_log.as_ref().map_or(0, log_size);
+    let log_before = abs_log.as_deref().and_then(log_mark);
 
-    // `--timeout` bounds the whole run, including any prefix initialization above.
-    let remaining = timeout.map(|limit| limit.saturating_sub(started.elapsed()));
+    // `--timeout` bounds the whole run, including any prefix initialization above, but not
+    // time the run spent suspended in either phase.
+    let remaining = remaining_budget(timeout, started.elapsed(), supervise::suspended_time());
     let outcome = supervise::supervise(cmd, remaining, supervise::received_signal);
     let code = match &outcome {
         Ok(outcome) => outcome.exit_code(),
@@ -707,9 +766,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
     // Printed for failed and stopped runs too, which is when it matters most. The log is
     // appended to across runs, so only what this run added is summarized.
     if let Some(log) = &abs_log
-        && let Ok(bytes) = fs::read(log)
+        && let Some((identity, bytes)) = read_log(log)
     {
-        let fresh = appended_since(&bytes, log_size_before);
+        let fresh = appended_since(&bytes, identity, log_before.as_ref());
         if !fresh.is_empty() {
             // Guest text may not be valid UTF-8; a summary is still worth printing. A closed
             // stdout must not turn into a panic after the run.
@@ -833,22 +892,125 @@ mod tests {
         );
     }
 
+    fn mark(identity: (u64, u64), contents: &str) -> LogMark {
+        let bytes = contents.as_bytes();
+        let tail_start = bytes.len().saturating_sub(LOG_MARK_TAIL as usize);
+        LogMark {
+            identity,
+            len: bytes.len() as u64,
+            tail: bytes[tail_start..].to_vec(),
+        }
+    }
+
     #[test]
     fn the_trace_summary_covers_only_what_this_run_appended() {
+        let file = (1, 100);
         let earlier = "{\"event\":\"unimpl_api\",\"detail\":\"old.dll!Earlier\"}\n";
         let this_run = "{\"event\":\"unimpl_api\",\"detail\":\"new.dll!ThisRun\"}\n";
         let log = format!("{earlier}{this_run}");
-        let fresh = appended_since(log.as_bytes(), earlier.len() as u64);
+        let before = mark(file, earlier);
+        let fresh = appended_since(log.as_bytes(), file, Some(&before));
         assert_eq!(fresh, this_run.as_bytes());
         let rendered = render_trace(&String::from_utf8_lossy(fresh));
         assert!(rendered.contains("new.dll!ThisRun"), "{rendered}");
         assert!(!rendered.contains("old.dll!Earlier"), "{rendered}");
         // Nothing appended: nothing to summarize.
-        assert!(appended_since(log.as_bytes(), log.len() as u64).is_empty());
-        // A log that was replaced by a shorter one is new in full.
+        assert!(appended_since(earlier.as_bytes(), file, Some(&before)).is_empty());
+        // No log before the run: everything in it is from this run.
         assert_eq!(
-            appended_since(this_run.as_bytes(), log.len() as u64),
+            appended_since(this_run.as_bytes(), file, None),
             this_run.as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_replaced_log_is_summarized_in_full_whatever_its_size() {
+        let old_file = (1, 100);
+        let new_file = (1, 200);
+        let old = "{\"event\":\"unimpl_api\",\"detail\":\"old.dll!Earlier\"}\n";
+        let before = mark(old_file, old);
+        let record = "{\"event\":\"unimpl_api\",\"detail\":\"new.dll!A\"}\n";
+        // Shorter, exactly as long, and longer than the old log: the old length must never be
+        // used as an offset into a different file.
+        let shorter = &record[..record.len() - 1];
+        let same_size = format!("{:<width$}\n", record.trim_end(), width = old.len() - 1);
+        let longer = format!("{record}{record}{record}");
+        assert!(shorter.len() < old.len() && same_size.len() == old.len());
+        assert!(longer.len() > old.len());
+        for replacement in [shorter, same_size.as_str(), longer.as_str()] {
+            let fresh = appended_since(replacement.as_bytes(), new_file, Some(&before));
+            assert_eq!(fresh, replacement.as_bytes(), "{} bytes", replacement.len());
+        }
+        // Rewritten in place (same file, different contents before the old end).
+        let fresh = appended_since(longer.as_bytes(), old_file, Some(&before));
+        assert_eq!(fresh, longer.as_bytes());
+        assert_eq!(
+            summarize_jsonl(&String::from_utf8_lossy(fresh)).total_lines,
+            3
+        );
+    }
+
+    #[test]
+    fn log_marks_follow_the_file_on_disk() {
+        let dir = env::temp_dir().join(format!("bx-cli-logmark-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("trace.jsonl");
+        assert_eq!(log_mark(&log), None);
+        let old = "{\"event\":\"unimpl_api\",\"detail\":\"old.dll!Earlier\"}\n";
+        fs::write(&log, old).unwrap();
+        let before = log_mark(&log).unwrap();
+        assert_eq!(before.len, old.len() as u64);
+        assert_eq!(before.tail, old.as_bytes());
+
+        // Appended to, as bx_runtime_veh does: only the new record is this run's.
+        let added = "{\"event\":\"unimpl_api\",\"detail\":\"new.dll!ThisRun\"}\n";
+        fs::write(&log, format!("{old}{added}")).unwrap();
+        let (identity, bytes) = read_log(&log).unwrap();
+        assert_eq!(
+            appended_since(&bytes, identity, Some(&before)),
+            added.as_bytes()
+        );
+
+        // Replaced by a new, longer file during the run: all of it is this run's.
+        let replacement = dir.join("replacement");
+        let longer = format!("{added}{added}{added}");
+        fs::write(&replacement, &longer).unwrap();
+        fs::rename(&replacement, &log).unwrap();
+        let (identity, bytes) = read_log(&log).unwrap();
+        assert_ne!(identity, before.identity);
+        let fresh = appended_since(&bytes, identity, Some(&before));
+        assert_eq!(
+            summarize_jsonl(&String::from_utf8_lossy(fresh)).total_lines,
+            3
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_pause_in_an_earlier_phase_is_not_charged_to_the_guest() {
+        let limit = Some(Duration::from_secs(2));
+        // As reviewed: paused 2.5 s during wineboot with --timeout 2, 0.3 s actually running.
+        assert_eq!(
+            remaining_budget(
+                limit,
+                Duration::from_millis(2800),
+                Duration::from_millis(2500)
+            ),
+            Some(Duration::from_millis(1700))
+        );
+        // Without a pause the wall clock counts in full, down to zero.
+        assert_eq!(
+            remaining_budget(limit, Duration::from_millis(500), Duration::ZERO),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            remaining_budget(limit, Duration::from_secs(5), Duration::ZERO),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            remaining_budget(None, Duration::from_secs(5), Duration::ZERO),
+            None
         );
     }
 
