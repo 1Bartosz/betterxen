@@ -64,29 +64,6 @@ SIZE_T WINAPI XMemVirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buf, S
     return VirtualQuery(address, buf, len);
 }
 
-BOOL WINAPI XMemAllocatePhysicalPages(SIZE_T* /*num_pages*/, PULONG_PTR /*page_array*/, uint64_t /*flags*/) {
-    BX_STUB_LOG("xmem.dll", "XMemAllocatePhysicalPages");
-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-    return FALSE;
-}
-
-BOOL WINAPI XMemFreePhysicalPages(SIZE_T /*num_pages*/, PULONG_PTR /*page_array*/, uint64_t /*flags*/) {
-    BX_STUB_LOG("xmem.dll", "XMemFreePhysicalPages");
-    return TRUE;
-}
-
-PVOID WINAPI XMemMapPhysicalPages(PVOID /*base*/, SIZE_T /*num_pages*/, uint64_t /*flags*/, PULONG_PTR /*page_array*/) {
-    BX_STUB_LOG("xmem.dll", "XMemMapPhysicalPages");
-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-    return nullptr;
-}
-
-PVOID WINAPI XMemMapPhysicalPagesScatter(PVOID /*base*/, SIZE_T /*num_pages*/, uint64_t /*flags*/, PULONG_PTR /*page_array*/) {
-    BX_STUB_LOG("xmem.dll", "XMemMapPhysicalPagesScatter");
-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-    return nullptr;
-}
-
 BOOL WINAPI XMemTransferMemory(PVOID dst, LPCVOID src, SIZE_T bytes, uint64_t /*flags*/) {
     if (!dst || !src) return FALSE;
     std::memcpy(dst, src, bytes);
@@ -103,10 +80,6 @@ BOOL WINAPI XMemGetWorkingSetStatistics(PVOID out_stats, SIZE_T stats_size) {
 
 BOOL WINAPI XMemIsToolsMemAvailable(void) {
     return FALSE;
-}
-
-int bx_xmem_query_region(uint64_t /*va*/, bx_xmem_region_info_t* /*out_info*/) {
-    return 0;
 }
 
 void bx_xmem_get_internal_stats(bx_xmem_stats_t* out_stats) {
