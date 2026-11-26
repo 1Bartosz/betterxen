@@ -9,13 +9,13 @@
 ![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon%20(ARM64)-1f6feb?logo=apple&logoColor=white)
 ![Graphics: D3DMetal 3.0](https://img.shields.io/badge/graphics-D3DMetal%203.0%20%2F%20Metal-8957e5)
 ![Stack: Rust + C++20 PE32+](https://img.shields.io/badge/stack-Rust%20%2B%20C%2B%2B20%20PE32%2B-dea584)
-![Status: experimental](https://img.shields.io/badge/status-experimental%20(M0)-d29922)
+![Status: experimental](https://img.shields.io/badge/status-experimental%20(M2)-0969da)
 ![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-2ea043)
 
 </div>
 
 > [!IMPORTANT]
-> **Experimental status.** BetterXen is an active, open-source compatibility engineering project currently at **Milestone M0** (cross-compiled shim foundation and live CrossOver/Rosetta smoke tests verified on synthetic PE32+ workloads). **Commercial Xbox game execution is not yet supported.** CrossOver, Rosetta 2, and D3DMetal are externally installed dependencies and are never bundled or redistributed.
+> **Experimental status.** BetterXen is an active, open-source compatibility engineering project with **Milestone M0 and Milestone M1 verified complete** on synthetic PE32+ workloads under CrossOver 26.3 + Rosetta 2, and **Milestone M2** (`First Rendered Frame & Shader Format Gate`) currently active. **Commercial Xbox game execution is not yet supported.** CrossOver, Rosetta 2, and D3DMetal are externally installed dependencies and are never bundled or redistributed.
 
 BetterXen builds the missing Xbox Game OS layer around **CrossOver 26.3+**, **Rosetta 2**, and **D3DMetal 3.0** on Apple Silicon:
 - **Native ARM64 macOS tooling** (`launcher/`, Rust) for host diagnostics, PE32+ static probing, CrossOver bottle orchestration, and structured trace aggregation.
@@ -33,9 +33,9 @@ BetterXen builds the missing Xbox Game OS layer around **CrossOver 26.3+**, **Ro
 
 ```mermaid
 flowchart LR
-    M0["M0: Foundation & Shims\n(Merged #406)"]:::done
-    M1["M1: Boot to D3D12\n(Active — Milestone #17)"]:::active
-    M2["M2: First Frame &\nShader Gate"]:::planned
+    M0["M0: Foundation & Shims\n(Verified Complete)"]:::done
+    M1["M1: Boot to D3D12\n(Verified Complete — 16/16)"]:::done
+    M2["M2: First Frame &\nShader Gate\n(Active — Milestone #18)"]:::active
     M3["M3: Shaders &\nTexture Tiling"]:::planned
     M4["M4: 3D, DXR/BVH\n& Input"]:::planned
     M5["M5: Audio, Saves\n& Stability"]:::planned
@@ -50,16 +50,16 @@ flowchart LR
 
 Legend: 🟢 **Done / Merged** · 🔵 **Active Milestone** · ⚪ **Planned**
 
-### Active Milestone — [M1: Startup Shims to `D3D12XboxCreateDevice`](https://github.com/MacosPorters/betterxen/milestone/17)
+### Active Milestone — [M2: First Rendered Frame & Shader Format Gate](https://github.com/MacosPorters/betterxen/milestone/18)
 
 | Track | Focus | Visual Status | Live Issues |
 | --- | --- | --- | --- |
-| **Track A** | `bx-cli` supervision, `clwb` VEH + crash dumper, Win32 bridge | `🟨🟨🟨` *(3/3 PRs open)* | [View Track A](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+A%22) |
-| **Track B** | `xmem.dll` core + physical/scatter pages, `XCRDAPI.dll` DirectStorage | `🟨🟨🟨` *(3/3 PRs open)* | [View Track B](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+B%22) |
-| **Track C** | `d3d12_xs.dll` COM proxy (D3DMetal 3.0), `xg_xs.dll` texture computer | `⬜⬜` *(needs contributors!)* | [View Track C](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+C%22) |
-| **Track D** | `dxbc-accc` FSPX C ABI bridge, `d3dmetal-native` harness | `🟨⬜` *(1 PR open, 1 ready)* | [View Track D](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+D%22) |
-| **Track E** | `xgameruntime.dll` offline GDK, `AcpHal`/`xapu`/`chad`, `GameInput` | `🟨🟨` *(2/2 PRs open)* | [View Track E](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+E%22) |
-| **Track F** | End-to-end synthetic boot fixture (`test_integration_boot`) | `🟨` *(1/1 PR open)* | [View Track F](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+F%22) |
+| **Track A** | `system32` shim staging (`#457` / PR `#458` merged), AMD-only VEH emulation (`#451`), Track A/F runner integration (`#407`) | `🟩🟨🟨` *(#458 merged; #451, #407 active)* | [View Track A](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+A%22) |
+| **Track B** | `XCRDAPI.dll` DirectStorage GPU-buffer & batch transfers (`#467`) | `⬜` *(1 ready)* | [View Track B](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+B%22) |
+| **Track C** | `d3d12_xs` `D3D12ConfigureVirtualMemoryX` + placed resources (`#464`), `PresentX` swapchain bridge (`#465`), D3D workload fixes (`#450`) | `⬜⬜⬜` *(3 ready)* | [View Track C](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+C%22) |
+| **Track D** | `dxbc-accc` Windows guest bridge (`#445`), M2 Shader Format Gate ADR & PSO hook (`#466`) | `⬜⬜` *(2 ready)* | [View Track D](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+D%22) |
+| **Track E** | Public GDK COM `QueryApiImpl` dispatch (`#456` / PR `#462` merged), offline `XGameSave` + `XPackage` COM dispatch (`#468`) | `🟩⬜` *(#462 merged, 1 ready)* | [View Track E](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+E%22) |
+| **Track F** | D3DMetal GPU limits fixture (`#453` / PR #455), M2 first-frame + shader-gate exit fixture (`#469`) | `🟨⬜` *(PR #455 approved, 1 ready)* | [View Track F](https://github.com/MacosPorters/betterxen/issues?q=is%3Aopen+label%3A%22track%3A+F%22) |
 
 `🟩` Merged & verified · `🟨` PR open / in review · `⬜` Open & ready to claim
 
@@ -67,9 +67,9 @@ Legend: 🟢 **Done / Merged** · 🔵 **Active Milestone** · ⚪ **Planned**
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
-| **M0 — Repo, ABI & Cross-Build** | 6-track layout, frozen `abi/`, ARM64 `bx-cli`, 16 cross-compiled PE32+ shims, live CrossOver + Rosetta 2 smoke tests (`test_veh_clwb`, `test_shim_exports`) | 🟢 **Merged (`#406`)** |
-| **M1 — Boot to `D3D12XboxCreateDevice`** | Full startup shim coverage (`xmem` physical/scatter pages, `XCRDAPI` async file reads, `d3d12_xs` auto-logging COM proxy, offline `xgameruntime`, audio queue stubs) | 🔵 **Active ([Milestone #17](https://github.com/MacosPorters/betterxen/milestone/17))** |
-| **M2 — First Frame & Shader Gate** | `PresentX` → `IDXGISwapChain3::Present` via D3DMetal 3.0; inspect runtime shaders to select DXIL fast path vs. `ACCC`/`FSPX` RDNA 2 transpilation | ⚪ Planned |
+| **M0 — Repo, ABI & Cross-Build** | 6-track layout, frozen `abi/`, ARM64 `bx-cli`, 16 cross-compiled PE32+ shims, live CrossOver + Rosetta 2 smoke tests (`test_veh_clwb`, `test_shim_exports`) | 🟢 **Verified complete (`#406`)** |
+| **M1 — Boot to `D3D12XboxCreateDevice`** | Full startup shim coverage (`xmem` physical/scatter pages, `XCRDAPI` async file reads, `d3d12_xs` auto-logging COM proxy, offline `xgameruntime` + dynamic loader exports, audio queue stubs, supervised `bx-cli run`, ADR 0007, `test_integration_boot` 19 pass / 2 pending / 0 fail) | 🟢 **Verified complete ([Milestone #17](https://github.com/MacosPorters/betterxen/milestone/17))** |
+| **M2 — First Frame & Shader Gate** | Reversible `system32` staging, public GDK COM `QueryApiImpl` dispatch, `PresentX` → `IDXGISwapChain3::Present` via D3DMetal 3.0, `dxbc-accc` Windows bridge, D3DMetal GPU limits, and Shader Format Gate ADR | 🔵 **Active ([Milestone #18](https://github.com/MacosPorters/betterxen/milestone/18))** |
 | **M3 — Shaders, Streaming & Textures** | DirectStorage decompression, RDNA 2 `xg_xs` texture deswizzling, full shader pipeline | ⚪ Planned |
 | **M4 — 3D Rendering, DXR/BVH & Input** | BVH4 rehydration → live D3DMetal 3.0 DXR rebuild, PC FidelityFX/MetalFX upscaling shim, full `GameInput` | ⚪ Planned |
 | **M5 — Audio, Saves & Stability** | Software audio/DSP decoding (`AcpHal`/`xapu`/`chad`), `PersistentLocalStorage`, multi-hour soak stability | ⚪ Planned |
