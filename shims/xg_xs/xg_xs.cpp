@@ -52,14 +52,32 @@ struct Resolved {
     uint32_t layout;
 };
 
+struct MipInfo {
+    uint64_t offset; /* byte offset of this mip inside one array slice */
+    uint32_t logical_width;
+    uint32_t logical_height;
+    uint32_t footprint_width;
+    uint32_t footprint_height;
+    uint32_t row_pitch;
+    uint32_t row_count;
+    uint64_t row_bytes;
+};
+
+/* 16384 texels have 15 mips. One extra slot keeps the bound obvious. */
+constexpr uint32_t kMaxStoredMips = 16u;
+
 struct TextureComputer {
     bx_xg_texture_computer iface;
     volatile LONG refcount;
     Resolved resolved;
+    MipInfo mips[kMaxStoredMips];
+    uint32_t stored_mips;
+    uint64_t slice_stride;
 };
 
 struct Placement {
     uint64_t offset;
+    uint64_t copy_end;
     uint32_t width; /* logical texels, used for element bounds */
     uint32_t height;
     uint32_t footprint_width; /* texels rounded up to the block */
@@ -372,66 +390,87 @@ static HRESULT advance_cursor(uint64_t cursor, const Placement* place, uint64_t*
     return S_OK;
 }
 
-using PlacementSink = void (*)(void* ctx, uint32_t slot, const Placement* place);
-
-static HRESULT walk_placements(
-    const Resolved* resolved,
-    uint64_t base_offset,
-    uint32_t first,
-    uint32_t last_exclusive,
-    PlacementSink sink,
-    void* sink_ctx,
-    uint64_t* aligned_end
-) {
-    uint64_t cursor = base_offset;
-    uint64_t end = base_offset;
-    for (uint32_t index = 0; index < last_exclusive; ++index) {
+static HRESULT build_linear_table(TextureComputer* obj) {
+    if (obj->resolved.layout != BX_XG_LAYOUT_LINEAR) {
+        return S_OK;
+    }
+    if (obj->resolved.mip_levels == 0u || obj->resolved.mip_levels > kMaxStoredMips) {
+        return E_INVALIDARG;
+    }
+    uint64_t cursor = 0;
+    for (uint32_t mip = 0; mip < obj->resolved.mip_levels; ++mip) {
         Placement place{};
-        const HRESULT hr = measure_mip(resolved, index % resolved->mip_levels, &place);
-        if (hr != S_OK) {
-            return hr;
+        const HRESULT measured = measure_mip(&obj->resolved, mip, &place);
+        if (measured != S_OK) {
+            return measured;
         }
-        place.offset = cursor;
+        MipInfo* info = &obj->mips[mip];
+        info->offset = cursor;
+        info->logical_width = place.width;
+        info->logical_height = place.height;
+        info->footprint_width = place.footprint_width;
+        info->footprint_height = place.footprint_height;
+        info->row_pitch = place.row_pitch;
+        info->row_count = place.row_count;
+        info->row_bytes = place.row_bytes;
         uint64_t next = 0;
         const HRESULT advanced = advance_cursor(cursor, &place, &next);
         if (advanced != S_OK) {
             return advanced;
         }
-        if (sink && index >= first) {
-            sink(sink_ctx, index - first, &place);
-        }
-        end = next;
         cursor = next;
     }
-    *aligned_end = end;
+    obj->slice_stride = cursor;
+    obj->stored_mips = obj->resolved.mip_levels;
     return S_OK;
 }
 
-struct OnePlacement {
-    Placement place;
-    bool written;
-};
-
-static void sink_one(void* ctx, uint32_t /*slot*/, const Placement* place) {
-    auto* out = static_cast<OnePlacement*>(ctx);
-    out->place = *place;
-    out->written = true;
-}
-
-static HRESULT placement_at(const Resolved* resolved, uint32_t index, Placement* out) {
-    if (index >= resolved->subresource_count) {
+static HRESULT allocation_end_relative(const TextureComputer* obj, uint32_t index, uint64_t* end) {
+    if (obj->stored_mips == 0u || index >= obj->resolved.subresource_count) {
         return E_INVALIDARG;
     }
-    OnePlacement captured{};
-    uint64_t end = 0;
-    const HRESULT hr = walk_placements(resolved, 0, index, index + 1u, sink_one, &captured, &end);
-    if (hr != S_OK) {
-        return hr;
+    const uint32_t mip = index % obj->stored_mips;
+    const uint32_t slice = index / obj->stored_mips;
+    if (mip + 1u < obj->stored_mips) {
+        uint64_t slice_base = 0;
+        if (!mul_u64(slice, obj->slice_stride, &slice_base) || !add_u64(slice_base, obj->mips[mip + 1u].offset, end)) {
+            return E_INVALIDARG;
+        }
+        return S_OK;
     }
-    if (!captured.written) {
-        return E_FAIL;
+    return mul_u64(static_cast<uint64_t>(slice) + 1u, obj->slice_stride, end) ? S_OK : E_INVALIDARG;
+}
+
+static HRESULT placement_from_index(const TextureComputer* obj, uint32_t index, uint64_t base_offset, Placement* out) {
+    if (obj->stored_mips == 0u || index >= obj->resolved.subresource_count) {
+        return E_INVALIDARG;
     }
-    *out = captured.place;
+    const uint32_t mip = index % obj->stored_mips;
+    const uint32_t slice = index / obj->stored_mips;
+    const MipInfo* info = &obj->mips[mip];
+    uint64_t relative = 0;
+    uint64_t absolute = 0;
+    uint64_t row_tail = 0;
+    uint64_t copy_end = 0;
+    if (!mul_u64(slice, obj->slice_stride, &relative) || !add_u64(relative, info->offset, &relative) ||
+        !add_u64(relative, base_offset, &absolute)) {
+        return E_INVALIDARG;
+    }
+    if (info->row_count == 0u || !mul_u64(info->row_count - 1u, info->row_pitch, &row_tail) ||
+        !add_u64(row_tail, info->row_bytes, &row_tail) || !add_u64(absolute, row_tail, &copy_end)) {
+        return E_INVALIDARG;
+    }
+    out->offset = absolute;
+    out->copy_end = copy_end;
+    out->width = info->logical_width;
+    out->height = info->logical_height;
+    out->footprint_width = info->footprint_width;
+    out->footprint_height = info->footprint_height;
+    out->depth = 1u;
+    out->row_pitch = info->row_pitch;
+    out->row_count = info->row_count;
+    out->row_bytes = info->row_bytes;
+    out->format = obj->resolved.format;
     return S_OK;
 }
 
@@ -441,14 +480,14 @@ struct LayoutOut {
     uint64_t* row_sizes;
 };
 
-static void sink_layout(void* ctx, uint32_t slot, const Placement* place) {
-    auto* out = static_cast<LayoutOut*>(ctx);
+static void write_layout(LayoutOut* out, uint32_t slot, const Placement* place) {
     out->layouts[slot].offset = place->offset;
     out->layouts[slot].footprint.format = place->format;
     out->layouts[slot].footprint.width = place->footprint_width;
     out->layouts[slot].footprint.height = place->footprint_height;
     out->layouts[slot].footprint.depth = place->depth;
     out->layouts[slot].footprint.row_pitch = place->row_pitch;
+    out->layouts[slot].copy_end = place->copy_end;
     out->row_counts[slot] = place->row_count;
     out->row_sizes[slot] = place->row_bytes;
 }
@@ -509,6 +548,83 @@ static HRESULT resolve_image_pitch(const Placement* place, uint32_t row_pitch_in
     return S_OK;
 }
 
+static bool touch_span(
+    uint64_t origin,
+    uint64_t row_pitch,
+    uint64_t depth_pitch,
+    uint32_t depth,
+    uint32_t row_count,
+    uint64_t row_bytes,
+    uint64_t size,
+    uint64_t* lo,
+    uint64_t* hi
+) {
+    uint64_t low = UINT64_MAX;
+    uint64_t high = 0;
+    for (uint32_t z = 0; z < depth; ++z) {
+        for (uint32_t y = 0; y < row_count; ++y) {
+            uint64_t begin = 0;
+            uint64_t end = 0;
+            if (!row_bounds(origin, row_pitch, depth_pitch, z, y, row_bytes, size, &begin, &end)) {
+                return false;
+            }
+            if (begin < low) {
+                low = begin;
+            }
+            if (end > high) {
+                high = end;
+            }
+        }
+    }
+    *lo = low;
+    *hi = high;
+    return true;
+}
+
+static bool byte_ranges_overlap(
+    const uint8_t* left,
+    uint64_t left_lo,
+    uint64_t left_hi,
+    const uint8_t* right,
+    uint64_t right_lo,
+    uint64_t right_hi
+) {
+    const uintptr_t left_begin = reinterpret_cast<uintptr_t>(left) + static_cast<uintptr_t>(left_lo);
+    const uintptr_t left_end = reinterpret_cast<uintptr_t>(left) + static_cast<uintptr_t>(left_hi);
+    const uintptr_t right_begin = reinterpret_cast<uintptr_t>(right) + static_cast<uintptr_t>(right_lo);
+    const uintptr_t right_end = reinterpret_cast<uintptr_t>(right) + static_cast<uintptr_t>(right_hi);
+    return left_begin < right_end && right_begin < left_end;
+}
+
+static HRESULT emit_rows(
+    const Placement* place,
+    uint8_t* dst,
+    uint64_t dst_size,
+    uint64_t dst_origin,
+    uint64_t dst_row_pitch,
+    uint64_t dst_depth_pitch,
+    const uint8_t* src,
+    uint64_t src_size,
+    uint64_t src_origin,
+    uint64_t src_row_pitch,
+    uint64_t src_depth_pitch
+) {
+    for (uint32_t z = 0; z < place->depth; ++z) {
+        for (uint32_t y = 0; y < place->row_count; ++y) {
+            uint64_t src_begin = 0;
+            uint64_t src_end = 0;
+            uint64_t dst_begin = 0;
+            uint64_t dst_end = 0;
+            if (!row_bounds(src_origin, src_row_pitch, src_depth_pitch, z, y, place->row_bytes, src_size, &src_begin, &src_end) ||
+                !row_bounds(dst_origin, dst_row_pitch, dst_depth_pitch, z, y, place->row_bytes, dst_size, &dst_begin, &dst_end)) {
+                return E_FAIL;
+            }
+            std::memcpy(dst + dst_begin, src + src_begin, static_cast<size_t>(place->row_bytes));
+        }
+    }
+    return S_OK;
+}
+
 static HRESULT copy_rows(
     const Placement* place,
     uint8_t* dst,
@@ -532,33 +648,44 @@ static HRESULT copy_rows(
         return E_INVALIDARG;
     }
 
-    for (uint32_t z = 0; z < place->depth; ++z) {
-        for (uint32_t y = 0; y < place->row_count; ++y) {
-            uint64_t src_begin = 0;
-            uint64_t src_end = 0;
-            uint64_t dst_begin = 0;
-            uint64_t dst_end = 0;
-            if (!row_bounds(src_origin, src_row_pitch, src_depth_pitch, z, y, place->row_bytes, src_size, &src_begin, &src_end) ||
-                !row_bounds(dst_origin, dst_row_pitch, dst_depth_pitch, z, y, place->row_bytes, dst_size, &dst_begin, &dst_end)) {
-                return E_INVALIDARG;
-            }
-        }
+    uint64_t src_lo = 0;
+    uint64_t src_hi = 0;
+    uint64_t dst_lo = 0;
+    uint64_t dst_hi = 0;
+    if (!touch_span(src_origin, src_row_pitch, src_depth_pitch, place->depth, place->row_count, place->row_bytes, src_size, &src_lo, &src_hi) ||
+        !touch_span(dst_origin, dst_row_pitch, dst_depth_pitch, place->depth, place->row_count, place->row_bytes, dst_size, &dst_lo, &dst_hi)) {
+        return E_INVALIDARG;
+    }
+    if (!byte_ranges_overlap(src, src_lo, src_hi, dst, dst_lo, dst_hi)) {
+        return emit_rows(
+            place, dst, dst_size, dst_origin, dst_row_pitch, dst_depth_pitch, src, src_size, src_origin, src_row_pitch, src_depth_pitch);
     }
 
-    for (uint32_t z = 0; z < place->depth; ++z) {
-        for (uint32_t y = 0; y < place->row_count; ++y) {
-            uint64_t src_begin = 0;
-            uint64_t src_end = 0;
-            uint64_t dst_begin = 0;
-            uint64_t dst_end = 0;
-            if (!row_bounds(src_origin, src_row_pitch, src_depth_pitch, z, y, place->row_bytes, src_size, &src_begin, &src_end) ||
-                !row_bounds(dst_origin, dst_row_pitch, dst_depth_pitch, z, y, place->row_bytes, dst_size, &dst_begin, &dst_end)) {
-                return E_FAIL;
-            }
-            std::memcpy(dst + dst_begin, src + src_begin, static_cast<size_t>(place->row_bytes));
-        }
+    /* Stage the whole source span first so a later row cannot clobber an unread one. */
+    const uint64_t stage_lo = src_lo < src_origin ? src_lo : src_origin;
+    if (src_hi < stage_lo || src_hi - stage_lo > SIZE_MAX) {
+        return E_INVALIDARG;
     }
-    return S_OK;
+    const size_t staged_bytes = static_cast<size_t>(src_hi - stage_lo);
+    auto* staged = static_cast<uint8_t*>(HeapAlloc(GetProcessHeap(), 0, staged_bytes));
+    if (!staged) {
+        return E_OUTOFMEMORY;
+    }
+    std::memcpy(staged, src + stage_lo, staged_bytes);
+    const HRESULT hr = emit_rows(
+        place,
+        dst,
+        dst_size,
+        dst_origin,
+        dst_row_pitch,
+        dst_depth_pitch,
+        staged,
+        staged_bytes,
+        src_origin - stage_lo,
+        src_row_pitch,
+        src_depth_pitch);
+    HeapFree(GetProcessHeap(), 0, staged);
+    return hr;
 }
 
 static HRESULT image_and_resource_pitch(
@@ -641,29 +768,24 @@ static HRESULT WINAPI computer_get_resource_layout(
         subresource_count > obj->resolved.subresource_count - first_subresource) {
         return E_INVALIDARG;
     }
-    uint64_t end = 0;
-    const HRESULT checked = walk_placements(
-        &obj->resolved, base_offset, first_subresource, first_subresource + subresource_count, nullptr, nullptr, &end);
-    if (checked != S_OK) {
-        return checked;
-    }
-    if (end < base_offset) {
-        return E_FAIL;
+    const uint32_t last_index = first_subresource + subresource_count - 1u;
+    uint64_t allocation_end = 0;
+    Placement probe{};
+    const HRESULT ended = allocation_end_relative(obj, last_index, &allocation_end);
+    const HRESULT probed = placement_from_index(obj, last_index, base_offset, &probe);
+    if (ended != S_OK || probed != S_OK || probe.copy_end < probe.offset) {
+        return ended != S_OK ? ended : (probed != S_OK ? probed : E_FAIL);
     }
     LayoutOut out{layouts, row_counts, row_sizes_in_bytes};
-    uint64_t end_again = 0;
-    const HRESULT written = walk_placements(
-        &obj->resolved,
-        base_offset,
-        first_subresource,
-        first_subresource + subresource_count,
-        sink_layout,
-        &out,
-        &end_again);
-    if (written != S_OK || end_again != end) {
-        return written != S_OK ? written : E_FAIL;
+    for (uint32_t slot = 0; slot < subresource_count; ++slot) {
+        Placement place{};
+        const HRESULT hr = placement_from_index(obj, first_subresource + slot, base_offset, &place);
+        if (hr != S_OK) {
+            return hr;
+        }
+        write_layout(&out, slot, &place);
     }
-    *total_bytes = end - base_offset;
+    *total_bytes = allocation_end;
     return S_OK;
 }
 
@@ -676,8 +798,11 @@ static HRESULT WINAPI computer_get_resource_size_bytes(bx_xg_texture_computer* s
     if (tiled != S_OK) {
         return tiled;
     }
+    if (obj->resolved.subresource_count == 0u) {
+        return E_INVALIDARG;
+    }
     uint64_t end = 0;
-    const HRESULT hr = walk_placements(&obj->resolved, 0, 0, obj->resolved.subresource_count, nullptr, nullptr, &end);
+    const HRESULT hr = allocation_end_relative(obj, obj->resolved.subresource_count - 1u, &end);
     if (hr != S_OK) {
         return hr;
     }
@@ -720,7 +845,7 @@ static HRESULT WINAPI computer_get_mip_level_offset_bytes(
     }
     const uint32_t index = mip_level + array_slice * obj->resolved.mip_levels;
     Placement place{};
-    const HRESULT hr = placement_at(&obj->resolved, index, &place);
+    const HRESULT hr = placement_from_index(obj, index, 0, &place);
     if (hr != S_OK) {
         return hr;
     }
@@ -750,7 +875,7 @@ static HRESULT WINAPI computer_get_texel_element_offset_bytes(
     }
     const uint32_t index = mip_level + array_slice * obj->resolved.mip_levels;
     Placement place{};
-    const HRESULT hr = placement_at(&obj->resolved, index, &place);
+    const HRESULT hr = placement_from_index(obj, index, 0, &place);
     if (hr != S_OK) {
         return hr;
     }
@@ -789,7 +914,7 @@ static HRESULT WINAPI computer_copy_into_subresource(
         return tiled;
     }
     Placement place{};
-    const HRESULT placed = placement_at(&obj->resolved, subresource, &place);
+    const HRESULT placed = placement_from_index(obj, subresource, 0, &place);
     if (placed != S_OK) {
         return placed;
     }
@@ -834,7 +959,7 @@ static HRESULT WINAPI computer_copy_from_subresource(
         return tiled;
     }
     Placement place{};
-    const HRESULT placed = placement_at(&obj->resolved, subresource, &place);
+    const HRESULT placed = placement_from_index(obj, subresource, 0, &place);
     if (placed != S_OK) {
         return placed;
     }
@@ -895,6 +1020,11 @@ HRESULT WINAPI XGCreateTextureComputer(const bx_xg_resource_desc* desc, void** c
     obj->iface.lpVtbl = &kVtbl;
     obj->refcount = 1;
     obj->resolved = resolved;
+    const HRESULT built = build_linear_table(obj);
+    if (built != S_OK) {
+        HeapFree(GetProcessHeap(), 0, obj);
+        return built;
+    }
     *computer = obj;
     return S_OK;
 }

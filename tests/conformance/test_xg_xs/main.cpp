@@ -167,6 +167,8 @@ static void test_hand_layouts() {
     /* mip3 1x1: 4 -> 256, 1 row, offset 3584. total align(3840, 512) = 4096. */
     check(layouts[3].offset == 3584u && rows[3] == 1u && row_bytes[3] == 4u && layouts[3].footprint.width == 1u,
           "rgba mip3");
+    /* D3D12 copy end keeps the last row's payload and drops the 512-byte tail. */
+    check(layouts[0].copy_end == 1824u && layouts[3].copy_end == 3588u, "rgba chain copy ends");
     check_hr("rgba mip1 offset", computer->lpVtbl->GetMipLevelOffsetBytes(computer, 0, 1, &offset), S_OK);
     check(offset == 2048u, "mip helper matches the footprint");
     check_hr("rgba texel", computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 1, 3, 1, 0, &offset), S_OK);
@@ -189,6 +191,7 @@ static void test_hand_layouts() {
     /* 2x2 blocks of 8 bytes -> row 16, pitch 256, 2 rows, payload 512. mip1 one 8-byte block at 512. */
     check(layouts[0].offset == 0u && rows[0] == 2u && row_bytes[0] == 16u && total == 1024u, "bc1 mip0");
     check(layouts[1].offset == 512u && rows[1] == 1u && row_bytes[1] == 8u && layouts[1].footprint.width == 4u, "bc1 mip1");
+    check(layouts[0].copy_end == 272u && layouts[1].copy_end == 520u, "bc1 copy ends");
     check_hr("bc1 texel", computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, 4, 0, 0, &offset), S_OK);
     check(offset == 8u, "bc1 texel x=4 is the second block");
     check_hr("bc1 texel corner", computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, 7, 7, 0, &offset), S_OK);
@@ -210,7 +213,7 @@ static void test_hand_layouts() {
         return;
     }
     check_hr("bc1 4x4 layout", computer->lpVtbl->GetResourceLayout(computer, 0, 1, 0, layouts, rows, row_bytes, &total), S_OK);
-    check(row_bytes[0] == 8u && total == 512u, "bc1 4x4 row is 8 bytes");
+    check(row_bytes[0] == 8u && total == 512u && layouts[0].copy_end == 8u, "bc1 4x4 row is 8 bytes");
     release_computer(computer);
 
     desc = desc_2d(DXGI_FORMAT_BC1_UNORM, 128, 4, 1, 1, BX_XG_LAYOUT_LINEAR);
@@ -301,7 +304,8 @@ static void test_hand_layouts() {
         check_hr("rgba variant layout",
                  computer->lpVtbl->GetResourceLayout(computer, 0, 1, 0, layouts, rows, row_bytes, &total),
                  S_OK);
-        check(row_bytes[0] == 4u && total == 512u && layouts[0].footprint.format == format, "rgba variant size");
+        check(row_bytes[0] == 4u && total == 512u && layouts[0].copy_end == 4u && layouts[0].footprint.format == format,
+              "rgba variant size");
         release_computer(computer);
     }
 
@@ -511,6 +515,84 @@ static void test_swizzle_placeholder() {
           "suggest stays on the implemented mode");
 }
 
+static bool row_is(const uint8_t* row, uint8_t value) {
+    return row[0] == value && row[1] == value && row[2] == value && row[3] == value;
+}
+
+static void paint_row(uint8_t* row, uint8_t value) {
+    row[0] = value;
+    row[1] = value;
+    row[2] = value;
+    row[3] = value;
+}
+
+static void test_overlapping_copies() {
+    bx_xg_resource_desc desc = desc_2d(DXGI_FORMAT_R8G8B8A8_UNORM, 1, 3, 1, 1, BX_XG_LAYOUT_LINEAR);
+    bx_xg_texture_computer* computer = create_ok(&desc, "create overlap");
+    if (!computer) {
+        return;
+    }
+    uint8_t* buf = alloc_bytes(1024, 0);
+    if (!buf) {
+        release_computer(computer);
+        return;
+    }
+    paint_row(buf + 0, 1);
+    paint_row(buf + 128, 2);
+    paint_row(buf + 256, 3);
+    check_hr("expand pitch in place",
+             computer->lpVtbl->CopyIntoSubresource(computer, buf, 1024, 0, buf, 1024, 128, 0),
+             S_OK);
+    check(row_is(buf + 0, 1) && row_is(buf + 256, 2) && row_is(buf + 512, 3), "expanded rows stay 1, 2, 3");
+
+    std::memset(buf, 0, 1024);
+    paint_row(buf + 0, 1);
+    paint_row(buf + 256, 2);
+    paint_row(buf + 512, 3);
+    check_hr("contract pitch in place",
+             computer->lpVtbl->CopyFromSubresource(computer, buf, 1024, 128, 0, buf, 1024, 0),
+             S_OK);
+    check(row_is(buf + 0, 1) && row_is(buf + 128, 2) && row_is(buf + 256, 3), "contracted rows stay 1, 2, 3");
+    std::free(buf);
+    release_computer(computer);
+}
+
+static void test_large_array_offsets() {
+    /* 64x64 RGBA8 is 7 mips. One slice stride is 32768.
+     * mip6 sits at 32256 inside the slice.
+     * Slice 2047 therefore starts at 2047 * 32768 = 67076096,
+     * and its last mip is at 67076096 + 32256 = 67108352.
+     * The allocation is 2048 * 32768 = 67108864.
+     */
+    bx_xg_resource_desc desc = desc_2d(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 2048, 7, BX_XG_LAYOUT_LINEAR);
+    bx_xg_texture_computer* computer = create_ok(&desc, "create 2048x7");
+    if (!computer) {
+        return;
+    }
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    check_hr("slice 0 mip6", computer->lpVtbl->GetMipLevelOffsetBytes(computer, 0, 6, &offset), S_OK);
+    check(offset == 32256u, "first slice last mip is 32256");
+    check_hr("last slice mip0", computer->lpVtbl->GetMipLevelOffsetBytes(computer, 2047, 0, &offset), S_OK);
+    check(offset == 67076096ull, "last slice starts at 67076096");
+    check_hr("last mip", computer->lpVtbl->GetMipLevelOffsetBytes(computer, 2047, 6, &offset), S_OK);
+    check(offset == 67108352ull, "last subresource offset is 67108352");
+    check_hr("array allocation", computer->lpVtbl->GetResourceSizeBytes(computer, &size), S_OK);
+    check(size == 67108864ull, "2048 slices allocate 67108864 bytes");
+
+    bx_xg_placed_footprint layout{};
+    uint32_t rows = 0;
+    uint64_t row_bytes = 0;
+    uint64_t total = 0;
+    const uint32_t last_index = 6u + 2047u * 7u;
+    check_hr("last layout",
+             computer->lpVtbl->GetResourceLayout(computer, last_index, 1, 0, &layout, &rows, &row_bytes, &total),
+             S_OK);
+    check(layout.offset == 67108352ull && layout.copy_end == 67108356ull && total == 67108864ull,
+          "last footprint copy end is 4 bytes past its offset");
+    release_computer(computer);
+}
+
 static void test_refcount() {
     bx_xg_resource_desc desc = desc_2d(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 2, 1, 1, BX_XG_LAYOUT_LINEAR);
     bx_xg_texture_computer* computer = create_ok(&desc, "create refcount");
@@ -557,6 +639,8 @@ int main() {
     test_monotonic_chain(DXGI_FORMAT_BC1_UNORM, 33, 17, "bc1 chain");
     test_monotonic_chain(DXGI_FORMAT_BC7_UNORM, 32, 32, "bc7 chain");
     test_copies();
+    test_overlapping_copies();
+    test_large_array_offsets();
     test_swizzle_placeholder();
     test_refcount();
 

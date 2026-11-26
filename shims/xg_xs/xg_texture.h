@@ -86,6 +86,14 @@ typedef struct bx_xg_subresource_footprint {
 typedef struct bx_xg_placed_footprint {
     uint64_t offset;
     bx_xg_subresource_footprint footprint;
+    /*
+     * Absolute byte just past this subresource's last payload byte:
+     * offset + (row_count - 1) * row_pitch + row_bytes.
+     * That is the D3D12 GetCopyableFootprints end. It does not include the
+     * last row's pitch padding or the 512-byte tail. The copy span of a
+     * GetResourceLayout call is layouts[last].copy_end - base_offset.
+     */
+    uint64_t copy_end;
 } bx_xg_placed_footprint;
 
 /* {B7E4C8A1-6F2D-4C55-8A19-3D0E5F7B91C4} BetterXen IXGTextureAddressComputer */
@@ -99,9 +107,10 @@ static const GUID BX_IID_IUnknown = {
 /*
  * GetResourceLayout places every subresource at its absolute offset from
  * base_offset, including subresources before first_subresource. total_bytes
- * runs from base_offset through the aligned end of the last requested
- * subresource, so a partial range still reports a total that covers the
- * earlier subresources.
+ * is the BetterXen allocation span: the 512-aligned end of the last requested
+ * subresource, measured from base_offset, so a partial range still covers the
+ * earlier subresources and a 1x1 RGBA8 texture reports 512. copy_end on each
+ * footprint is the separate D3D12-style copy span end described above.
  */
 typedef struct bx_xg_texture_computer bx_xg_texture_computer;
 
