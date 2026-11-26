@@ -9,9 +9,12 @@
 #include "bx_shader_bridge.h"
 
 /*
- * The bridge is loaded on first use, from this DLL's own directory first (where the shims are
- * staged together), then by name. It is optional at load time so a missing bridge is a logged
- * condition rather than a failure to load d3d12_xs.dll.
+ * The bridge is loaded on first use, only by full path from this DLL's own directory, where
+ * build-shims.sh stages it with the shims (#484). A bare-name load would search the guest EXE's
+ * directory and PATH first and could pick up a different copy. It is optional at load time, so a
+ * missing bridge is a logged condition rather than a failure to load d3d12_xs.dll. Without it,
+ * shaders are not classified, but a container that has an ACCC chunk and no DXIL chunk is still
+ * refused, from a bounds-checked chunk scan, so it never reaches the host device.
  *
  * Constraint flags come from two public DXIL container parts, read here with bounds checks:
  *  - SFI0 is one uint64 of feature flags (DXC DxilContainer.h, DxilShaderFeatureInfo). The bit
@@ -60,7 +63,6 @@ BOOL CALLBACK load_bridge(PINIT_ONCE, PVOID, PVOID*) {
             module = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         }
     }
-    if (!module) module = LoadLibraryW(L"bx_shader_bridge.dll");
     if (module) {
         g_bridge.inspect = proc<InspectFn>(module, "bx_shader_inspect");
         g_bridge.prepare = proc<PrepareFn>(module, "bx_shader_prepare_for_d3dmetal");
@@ -69,8 +71,9 @@ BOOL CALLBACK load_bridge(PINIT_ONCE, PVOID, PVOID*) {
     if (!g_bridge.inspect || !g_bridge.prepare || !g_bridge.release) {
         g_bridge = {};
         bx_log_emit(BX_LOG_WARN, "d3d12_xs", "shader_bridge_missing",
-                    module ? "bx_shader_bridge.dll lacks an entry point; shaders pass unclassified"
-                           : "bx_shader_bridge.dll not found; shaders pass unclassified");
+                    module ? "bx_shader_bridge.dll lacks an entry point; shaders pass unclassified, ACCC-only refused"
+                           : "bx_shader_bridge.dll not found beside d3d12_xs.dll; shaders pass unclassified, "
+                             "ACCC-only refused");
     }
     return TRUE;
 }
@@ -86,8 +89,8 @@ uint32_t read_u32(const uint8_t* at) {
     return value;
 }
 
-/* The payload of the first chunk named `fourcc`, or null. The bridge has already validated the
- * chunk table of any container this is called on; the checks here only keep reads in bounds. */
+/* The payload of the first chunk named `fourcc`, or null. Every read is bounds-checked, so this
+ * is safe on a container nobody has validated (the no-bridge path relies on that). */
 const uint8_t* find_chunk(const uint8_t* bytes, size_t len, const char* fourcc, uint32_t* size) {
     if (len < 32) return nullptr;
     const uint32_t count = read_u32(bytes + 28);
@@ -101,6 +104,17 @@ const uint8_t* find_chunk(const uint8_t* bytes, size_t len, const char* fourcc, 
         return bytes + offset + 8;
     }
     return nullptr;
+}
+
+/* True when any chunk header in the table is tagged `fourcc`, whatever its declared size. */
+bool has_chunk_tag(const uint8_t* bytes, size_t len, const char* fourcc) {
+    if (len < 32) return false;
+    const uint32_t count = read_u32(bytes + 28);
+    for (uint32_t i = 0; i < count && 32 + 4 * static_cast<size_t>(i) + 4 <= len; ++i) {
+        const uint32_t offset = read_u32(bytes + 32 + 4 * static_cast<size_t>(i));
+        if (offset <= len && len - offset >= 4 && std::memcmp(bytes + offset, fourcc, 4) == 0) return true;
+    }
+    return false;
 }
 
 struct Constraints {
@@ -199,6 +213,14 @@ HRESULT BxShaderGate::admit(const char* pso_kind, const char* stage, const D3D12
 
     const Bridge* b = bridge();
     if (!b) {
+        /* No classifier: still keep ACCC-only containers away from the host (#478 review). */
+        /* Any ACCC tag counts; only a DXIL chunk that fits counts as DXIL, so doubt refuses. */
+        uint32_t size = 0;
+        const bool dxbc = len >= 4 && std::memcmp(bytes, "DXBC", 4) == 0;
+        if (dxbc && has_chunk_tag(bytes, len, "ACCC") && !find_chunk(bytes, len, "DXIL", &size)) {
+            log_gate(pso_kind, stage, len, nullptr, nullptr, "reject_accc_only_unclassified", E_NOTIMPL);
+            return E_NOTIMPL;
+        }
         log_gate(pso_kind, stage, len, nullptr, nullptr, "pass_unclassified", S_OK);
         return S_OK;
     }

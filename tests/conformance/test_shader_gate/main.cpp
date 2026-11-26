@@ -11,6 +11,9 @@
  *     gate to log their constraints;
  *  4. checks the structured `shader_gate` JSONL records.
  *
+ * It then runs a copy of itself with --no-bridge from a directory holding d3d12_xs.dll but not
+ * the bridge, which must still run DXIL and refuse ACCC-only with E_NOTIMPL.
+ *
  * Expected values come from the D3D12 contract, the DXBC layout and the documented kernel, not
  * from the shim. Needs bx_shader_bridge.dll next to the shims and BX_LOG_FILE (bx-cli --log).
  * It also checks that the bridge was loaded from d3d12_xs.dll's directory; run it with the EXE
@@ -28,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <string>
 #include <vector>
 
@@ -260,9 +264,94 @@ void run_dxil(ID3D12Device* device, ID3D12RootSignature* root, ID3D12PipelineSta
     if (queue) queue->Release();
 }
 
+std::wstring directory_of(const wchar_t* path) {
+    const std::wstring text(path);
+    return text.substr(0, text.find_last_of(L'\\'));
+}
+
+/* --no-bridge: run from a directory that holds d3d12_xs.dll and its BetterXen imports but no
+ * bx_shader_bridge.dll. DXIL must still run and ACCC-only must still be refused. */
+int no_bridge_main() {
+    ID3D12Device* device = nullptr;
+    HRESULT hr = D3D12XboxCreateDevice(nullptr, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
+    if (!check(SUCCEEDED(hr) && device, "no-bridge: D3D12XboxCreateDevice hr=0x%08lx", ul(hr))) return finish();
+    D3D12_ROOT_PARAMETER uav = {};
+    uav.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    uav.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    ID3D12RootSignature* root = make_root(device, uav);
+    if (!root) return finish();
+    ID3D12PipelineState* pso = nullptr;
+    hr = create_compute(device, root, g_fill_cs66, sizeof(g_fill_cs66), &pso);
+    check(SUCCEEDED(hr) && pso, "no-bridge: DXIL CreateComputePipelineState hr=0x%08lx", ul(hr));
+    if (pso) {
+        run_dxil(device, root, pso);
+        pso->Release();
+    }
+    check(GetModuleHandleW(L"bx_shader_bridge.dll") == nullptr, "no-bridge: a bx_shader_bridge.dll was loaded anyway");
+    const std::vector<uint8_t> accc = accc_only_container();
+    hr = create_compute(device, root, accc.data(), accc.size(), &pso);
+    check(hr == E_NOTIMPL && !pso, "no-bridge: ACCC-only compute hr=0x%08lx (want E_NOTIMPL)", ul(hr));
+    if (pso) pso->Release();
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics = {};
+    graphics.pRootSignature = root;
+    graphics.VS.pShaderBytecode = accc.data();
+    graphics.VS.BytecodeLength = accc.size();
+    graphics.SampleMask = UINT_MAX;
+    graphics.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    graphics.SampleDesc.Count = 1;
+    hr = device->CreateGraphicsPipelineState(&graphics, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&pso));
+    check(hr == E_NOTIMPL && !pso, "no-bridge: ACCC-only graphics VS hr=0x%08lx (want E_NOTIMPL)", ul(hr));
+    if (pso) pso->Release();
+    root->Release();
+    device->Release();
+    return finish();
+}
+
+/* Copies this EXE and d3d12_xs.dll's directory minus the bridge into a scratch directory, runs
+ * the copy with --no-bridge, and requires it to pass. */
+void run_no_bridge_child() {
+    wchar_t exe[MAX_PATH] = {}, shim[MAX_PATH] = {}, temp[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    GetModuleFileNameW(GetModuleHandleW(L"d3d12_xs.dll"), shim, MAX_PATH);
+    GetTempPathW(MAX_PATH, temp);
+    wchar_t dir[MAX_PATH];
+    std::swprintf(dir, MAX_PATH, L"%lsbx_shader_gate_nobridge_%lu", temp, GetCurrentProcessId());
+    if (!check(CreateDirectoryW(dir, nullptr) || GetLastError() == ERROR_ALREADY_EXISTS,
+               "no-bridge: cannot create %ls", dir)) {
+        return;
+    }
+    const std::wstring from = directory_of(shim);
+    const std::wstring to(dir);
+    const wchar_t* files[] = {L"d3d12_xs.dll", L"xmem.dll", L"bx_runtime_veh.dll"};
+    bool copied = CopyFileW(exe, (to + L"\\test_shader_gate.exe").c_str(), FALSE) != 0;
+    for (const wchar_t* name : files) {
+        copied = copied && CopyFileW((from + L"\\" + name).c_str(), (to + L"\\" + name).c_str(), FALSE) != 0;
+    }
+    if (check(copied, "no-bridge: copying the shims to %ls failed (error %lu)", dir, GetLastError())) {
+        std::wstring command = L"\"" + to + L"\\test_shader_gate.exe\" --no-bridge";
+        STARTUPINFOW startup = {};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION child = {};
+        if (check(CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr, dir, &startup, &child),
+                  "no-bridge: CreateProcessW error %lu", GetLastError())) {
+            DWORD code = 99;
+            check(WaitForSingleObject(child.hProcess, 60000) == WAIT_OBJECT_0, "no-bridge: child did not finish in 60 s");
+            GetExitCodeProcess(child.hProcess, &code);
+            check(code == 0, "no-bridge: child exited %lu (a crash shows as an exception code)", code);
+            CloseHandle(child.hThread);
+            CloseHandle(child.hProcess);
+        }
+    }
+    DeleteFileW((to + L"\\test_shader_gate.exe").c_str());
+    for (const wchar_t* name : files) DeleteFileW((to + L"\\" + name).c_str());
+    RemoveDirectoryW(dir);
+}
+
 } // namespace
 
 int main() {
+    if (std::wcsstr(GetCommandLineW(), L" --no-bridge")) return no_bridge_main();
+
     // Self-check of the reference against values computed independently for d3dmetal-harness.
     check(expected_word(0) == 0x01234567u && expected_word(1) == 0x9f598b46u && expected_word(255) == 0x9a664b32u,
           "expected_word reference values");
@@ -297,8 +386,8 @@ int main() {
     check(SUCCEEDED(hr) && pso, "DXIL SM 6.6 CreateComputePipelineState hr=0x%08lx", ul(hr));
     const HMODULE bridge = GetModuleHandleW(L"bx_shader_bridge.dll");
     if (!check(bridge != nullptr,
-               "bx_shader_bridge.dll was not loaded: build it with shader-transpiler/crates/dxbc-accc/guest/build.sh "
-               "(#445) and place it next to the shims")) {
+               "bx_shader_bridge.dll was not loaded beside d3d12_xs.dll: scripts/build-shims.sh stages it in "
+               "build-shims/bin (#484)")) {
         if (pso) pso->Release();
         return finish();
     }
@@ -344,7 +433,10 @@ int main() {
     std::printf("atomic64 typed PSO hr=0x%08lx\n", ul(hr));
     if (pso) pso->Release();
 
-    // 4. The JSONL records.
+    // 4. Without the bridge (a separate process from a directory without it).
+    run_no_bridge_child();
+
+    // 5. The JSONL records.
     const std::string log = read_log();
     char fill_bytes[32];
     std::snprintf(fill_bytes, sizeof(fill_bytes), "bytes=%u ", static_cast<unsigned>(sizeof(g_fill_cs66)));
@@ -364,7 +456,15 @@ int main() {
           "shader_gate record with 64-bit typed atomics");
     check(log_has(log, {"\"event\":\"shader_d3dmetal_gap\"", "atomic64_flags=0x400000"}),
           "shader_d3dmetal_gap record for 64-bit typed atomics");
-    check(!log_has(log, {"\"event\":\"shader_bridge_missing\""}), "no shader_bridge_missing record");
+    check(log_has(log, {"\"event\":\"shader_bridge_missing\"", "not found beside d3d12_xs.dll"}),
+          "shader_bridge_missing record from the no-bridge child");
+    check(log_has(log, {"\"event\":\"shader_gate\"", "pso=compute", "decision=reject_accc_only_unclassified",
+                        "hr=0x80004001"}),
+          "no-bridge child refused the ACCC-only compute shader");
+    check(log_has(log, {"\"event\":\"shader_gate\"", "pso=graphics", "decision=reject_accc_only_unclassified"}),
+          "no-bridge child refused the ACCC-only vertex shader");
+    check(log_has(log, {"\"event\":\"shader_gate\"", "pso=compute", "decision=pass_unclassified"}),
+          "no-bridge child passed DXIL unclassified");
 
     root_table->Release();
     root_uav->Release();

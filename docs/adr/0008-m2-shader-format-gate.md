@@ -21,7 +21,7 @@ The gate needs a classifier that guest pipeline creation actually reaches, plus 
   - **DXIL and dual containers:** go to the host as the bridge's prepared copy (`bx_shader_prepare_for_d3dmetal`).
   - **ACCC-only containers:** are refused with `E_NOTIMPL` before the host device is called.
   - **Legacy DXBC and unclassifiable input:** pass unchanged.
-  - **A missing bridge:** is logged once (`shader_bridge_missing`), and shaders then pass unclassified.
+  - **A missing bridge:** is logged once (`shader_bridge_missing`). Shaders then pass unclassified, except that a container with an `ACCC` chunk and no `DXIL` chunk is still refused with `E_NOTIMPL`, found by a bounds-checked chunk scan, because D3DMetal crashes on it. The bridge is loaded only by full path from `d3d12_xs.dll`'s own directory.
 - **Known D3DMetal gaps:** a stage that needs a wave wider than 32 lanes, or 64-bit atomics, also gets a `shader_d3dmetal_gap` record.
 
 `tests/conformance/test_shader_gate` exercises all of this.
@@ -62,10 +62,8 @@ Revisit this ADR in any of these cases:
 
 ## Consequences
 
-- **Pipeline creation:** `CreateComputePipelineState` and `CreateGraphicsPipelineState` now depend on `bx_shader_bridge.dll` for classification. Without it, they still work and say so in the log.
-- **Packaging:** the bridge is built by `shader-transpiler/crates/dxbc-accc/guest/build.sh`. Two pieces of follow-up wiring are outside this ADR:
-  - staging it in `scripts/build-shims.sh` (Track A);
-  - an `abi/defs/bx_shader_bridge.def` export list (`[ABI]`).
+- **Pipeline creation:** `CreateComputePipelineState` and `CreateGraphicsPipelineState` now depend on `bx_shader_bridge.dll` for classification. Without it, they still work, refuse ACCC-only containers, and say so in the log.
+- **Packaging:** `scripts/build-shims.sh` builds the bridge, links it with `abi/defs/bx_shader_bridge.def`, and stages it in `build-shims/bin` beside `d3d12_xs.dll` (#484).
 - **Not covered by the gate yet:**
   - **Stream PSOs:** `ID3D12Device2::CreatePipelineState` stream descriptions are still forwarded unparsed.
   - **Raw-buffer 64-bit atomics:** these cannot be flagged from `SFI0`; the DXIL bitcode would have to be read.

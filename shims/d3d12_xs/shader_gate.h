@@ -24,7 +24,8 @@ public:
      * host gets: the bridge's prepared DXIL copy for DXIL and dual containers, or `in` unchanged
      * for legacy DXBC, unclassifiable input, or when the bridge is missing (logged once as
      * `shader_bridge_missing`). Returns E_NOTIMPL for an ACCC-only container, which has no
-     * DXIL for D3DMetal until M3 Branch D2. Copies live until this object is destroyed.
+     * DXIL for D3DMetal until M3 Branch D2, with or without the bridge. Copies live until this
+     * object is destroyed.
      */
     HRESULT admit(const char* pso_kind, const char* stage, const D3D12_SHADER_BYTECODE& in,
                   D3D12_SHADER_BYTECODE& out);
