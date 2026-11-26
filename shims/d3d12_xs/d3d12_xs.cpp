@@ -77,9 +77,9 @@ HRESULT WINAPI D3D12XboxCreateDevice(PVOID params, REFIID riid, void** ppv) {
     for (int i = 0; i < 10; ++i) {
         if (levels[i]) highest = i + 1;
     }
-    char detail[160];
+    char detail[192];
     std::snprintf(detail, sizeof(detail),
-                  "host device wrapped; highest_host_interface=ID3D12Device%d params=%s (not interpreted) trace_d3d=%u",
+                  "host device wrapped; highest_host_interface=ID3D12Device%d feature_level=11_0 params=%s (not interpreted) trace_d3d=%u",
                   highest, params ? "non-null" : "null", g_bx_trace_d3d);
     bx_log_emit(BX_LOG_INFO, "d3d12_xs", "D3D12XboxCreateDevice", detail);
 
@@ -88,6 +88,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(PVOID params, REFIID riid, void** ppv) {
     return hr;
 }
 
+/* Logged no-op: console startup sequences check SUCCEEDED(hr) before reserving virtual memory. */
 HRESULT WINAPI D3D12ConfigureVirtualMemoryX(PVOID /*config*/) {
     BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
     return S_OK;

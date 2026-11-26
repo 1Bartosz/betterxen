@@ -100,10 +100,14 @@ void put_fourcc(char* dst, const uint8_t* src) {
 /*
  * Logs what kind of container a shader stage carries: size, magic and (for DXBC) the chunk FourCCs,
  * so the M2 shader-format gate can tell DXIL from other payloads. Nothing is modified or copied.
+ *
+ * Returns false when a non-empty DXBC container is malformed or has no shader program chunk
+ * (DXIL/SHEX/SHDR), so we return E_INVALIDARG instead of forwarding a container that crashes
+ * D3DMetal 3.0.
  */
-void log_shader(const char* pso_kind, const char* stage, const D3D12_SHADER_BYTECODE& code) {
+bool log_shader(const char* pso_kind, const char* stage, const D3D12_SHADER_BYTECODE& code) {
     if (!code.pShaderBytecode || code.BytecodeLength == 0) {
-        return;
+        return true;
     }
     auto* bytes = static_cast<const uint8_t*>(code.pShaderBytecode);
     size_t len = code.BytecodeLength;
@@ -114,24 +118,33 @@ void log_shader(const char* pso_kind, const char* stage, const D3D12_SHADER_BYTE
     char chunks[128] = "";
     uint32_t chunk_count = 0;
     bool well_formed = false;
+    bool is_dxbc = len >= 4 && std::memcmp(bytes, "DXBC", 4) == 0;
+    bool has_shader_chunk = false;
     /* DXBC header: magic[4] digest[16] version[4] total_size[4] chunk_count[4] chunk_offsets[4*n]. */
-    if (len >= 32 && std::memcmp(bytes, "DXBC", 4) == 0) {
+    if (is_dxbc && len >= 32) {
+        uint32_t declared = read_u32(bytes + 24);
         chunk_count = read_u32(bytes + 28);
-        well_formed = read_u32(bytes + 24) == len && chunk_count <= (len - 32) / 4;
+        well_formed = declared >= 32 && declared <= len && chunk_count <= (declared - 32) / 4;
         size_t used = 0;
-        for (uint32_t i = 0; well_formed && i < chunk_count && i < 16; ++i) {
+        for (uint32_t i = 0; well_formed && i < chunk_count; ++i) {
             uint32_t off = read_u32(bytes + 32 + 4 * static_cast<size_t>(i));
-            if (off > len || len - off < 8) {
+            if (off > declared || declared - off < 8) {
                 well_formed = false;
                 break;
             }
-            char cc[5];
-            put_fourcc(cc, bytes + off);
-            int n = std::snprintf(chunks + used, sizeof(chunks) - used, "%s%s", used ? "," : "", cc);
-            if (n < 0 || static_cast<size_t>(n) >= sizeof(chunks) - used) {
-                break;
+            if (std::memcmp(bytes + off, "DXIL", 4) == 0 ||
+                std::memcmp(bytes + off, "SHEX", 4) == 0 ||
+                std::memcmp(bytes + off, "SHDR", 4) == 0) {
+                has_shader_chunk = true;
             }
-            used += static_cast<size_t>(n);
+            if (i < 16) {
+                char cc[5];
+                put_fourcc(cc, bytes + off);
+                int n = std::snprintf(chunks + used, sizeof(chunks) - used, "%s%s", used ? "," : "", cc);
+                if (n > 0 && static_cast<size_t>(n) < sizeof(chunks) - used) {
+                    used += static_cast<size_t>(n);
+                }
+            }
         }
     }
     char detail[320];
@@ -139,6 +152,7 @@ void log_shader(const char* pso_kind, const char* stage, const D3D12_SHADER_BYTE
                   pso_kind, stage, static_cast<unsigned long long>(len), magic, well_formed ? 1 : 0,
                   static_cast<unsigned long>(chunk_count), chunks);
     bx_log_emit(BX_LOG_INFO, "d3d12_xs", "pso_shader", detail);
+    return !is_dxbc || (well_formed && has_shader_chunk);
 }
 
 void log_created(const char* what, HRESULT hr) {
@@ -318,12 +332,18 @@ HRESULT STDMETHODCALLTYPE BxDeviceProxy::CreateCommandList1(UINT node_mask, D3D1
 
 HRESULT STDMETHODCALLTYPE BxDeviceProxy::CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
     BX_D3D_TRACE("ID3D12Device", "CreateGraphicsPipelineState");
+    bool shaders_ok = true;
     if (desc) {
-        log_shader("graphics", "VS", desc->VS);
-        log_shader("graphics", "PS", desc->PS);
-        log_shader("graphics", "DS", desc->DS);
-        log_shader("graphics", "HS", desc->HS);
-        log_shader("graphics", "GS", desc->GS);
+        shaders_ok &= log_shader("graphics", "VS", desc->VS);
+        shaders_ok &= log_shader("graphics", "PS", desc->PS);
+        shaders_ok &= log_shader("graphics", "DS", desc->DS);
+        shaders_ok &= log_shader("graphics", "HS", desc->HS);
+        shaders_ok &= log_shader("graphics", "GS", desc->GS);
+    }
+    if (!shaders_ok) {
+        if (ppv) *ppv = nullptr;
+        log_created("graphics pipeline state", E_INVALIDARG);
+        return E_INVALIDARG;
     }
     HRESULT hr = h_ID3D12Device->CreateGraphicsPipelineState(desc, riid, ppv);
     log_created("graphics pipeline state", hr);
@@ -332,8 +352,10 @@ HRESULT STDMETHODCALLTYPE BxDeviceProxy::CreateGraphicsPipelineState(const D3D12
 
 HRESULT STDMETHODCALLTYPE BxDeviceProxy::CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** ppv) {
     BX_D3D_TRACE("ID3D12Device", "CreateComputePipelineState");
-    if (desc) {
-        log_shader("compute", "CS", desc->CS);
+    if (desc && !log_shader("compute", "CS", desc->CS)) {
+        if (ppv) *ppv = nullptr;
+        log_created("compute pipeline state", E_INVALIDARG);
+        return E_INVALIDARG;
     }
     HRESULT hr = h_ID3D12Device->CreateComputePipelineState(desc, riid, ppv);
     log_created("compute pipeline state", hr);
