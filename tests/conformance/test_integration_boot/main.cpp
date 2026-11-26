@@ -651,7 +651,8 @@ void stage_acphal_heap() {
 
 /*
  * 100x50 R8G8B8A8 with two mips, so both public D3D12 alignments matter. By hand:
- *   mip 0: 100 * 4 = 400 bytes per row, pitch 512; ends at 49 * 512 + 400 = 25488.
+ *   mip 0: 100 * 4 = 400 bytes per row, pitch 512 (256-byte pitch alignment);
+ *          ends at 49 * 512 + 400 = 25488.
  *   mip 1: starts at the next 512 boundary, 25600; 50 * 4 = 200 bytes per row,
  *          pitch 256; ends at 25600 + 24 * 256 + 200 = 31944.
  *   total: 31944 rounded up to 512 = 32256.
@@ -682,13 +683,17 @@ void* stage_xg_texture_computer() {
     uint64_t row_bytes[2] = {};
     uint64_t total = 0;
     hr = computer->lpVtbl->GetResourceLayout(computer, 0, 2, 0, mips, rows, row_bytes, &total);
-    const bool mip0 = mips[0].offset == 0 && mips[0].footprint.row_pitch == 512 && mips[0].copy_end == 25488 &&
+    auto shape_is = [](const bx_xg_subresource_footprint& f, uint32_t width, uint32_t height, uint32_t pitch) {
+        return f.format == DXGI_FORMAT_R8G8B8A8_UNORM && f.width == width && f.height == height && f.depth == 1 &&
+               f.row_pitch == pitch;
+    };
+    const bool mip0 = mips[0].offset == 0 && shape_is(mips[0].footprint, 100, 50, 512) && mips[0].copy_end == 25488 &&
                       rows[0] == 50 && row_bytes[0] == 400;
-    const bool mip1 = mips[1].offset == 25600 && mips[1].footprint.row_pitch == 256 && mips[1].copy_end == 31944 &&
+    const bool mip1 = mips[1].offset == 25600 && shape_is(mips[1].footprint, 50, 25, 256) && mips[1].copy_end == 31944 &&
                       rows[1] == 25 && row_bytes[1] == 200;
     if (hr == S_OK && mip0 && mip1 && total == 32256) {
         checkpoint("xg_xs_texture_computer", Status::Pass,
-                   "100x50 RGBA8 two-mip linear layout matches hand-computed offsets, pitches and 32256 total bytes");
+                   "100x50 RGBA8 two-mip linear footprints and 32256 total bytes match hand-computed values");
     } else {
         checkpoint("xg_xs_texture_computer", Status::Fail,
                    "GetResourceLayout hr=0x%08lx mip0_ok=%d mip1_ok=%d total=%llu",
@@ -862,10 +867,11 @@ int main(int argc, char** argv) {
     /* --- Shutdown (reverse order) ----------------------------------------- */
     begin_stage("shutdown");
     release_com(device);
-    /* The fixture holds the only reference, so releasing it must destroy the computer. */
+    /* The fixture holds the only reference, so this Release must return 0. */
     ULONG texture_refs = 0;
     if (texture_computer) {
-        texture_refs = static_cast<IUnknown*>(texture_computer)->Release();
+        auto* computer = static_cast<bx_xg_texture_computer*>(texture_computer);
+        texture_refs = computer->lpVtbl->Release(computer);
     }
     release_com(game_input);
     bool dsp_closed = true;
