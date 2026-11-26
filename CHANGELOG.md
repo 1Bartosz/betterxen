@@ -10,6 +10,7 @@ Guest execution uses original, purpose-built test programs. Commercial Xbox game
 remains unsupported.
 
 ### Added
+- Added file-mapping-backed 64 KiB and 2 MiB physical pages, contiguous and scatter aliases (including intra-span duplicate-tag aliasing), exact-span unmap validation, physical region queries (`bx_xmem_query_region`), and shared working-set accounting / combined title memory budget enforcement across heap, virtual, and physical allocations in `xmem.dll`. Synthetic `XMemAllocatePhysicalPages` / `XMemFreePhysicalPages` signatures follow Win32 AWE (`memoryapi.h`) pending a public console flag encoding (#412).
 - Added Win32 bridge conformance coverage for a hidden window, message dispatch, concurrent PSM registrations, and per-event JSONL log verification. Offline PSM registration tokens are tracked without C++ exceptions using disjoint family tags so cross-family unregisters log `foreign_token` and retired or invalid tokens log `unknown_token` (#410).
 - Implemented synthetic APU heap mappings, per-connection APU and DSP queues, and the GameInput ordinal 1 COM stub. Added an audio/input conformance executable covering all four shim DLLs (#419).
 - Added structured unhandled exception logging with module-relative addresses and x64 registers, and expanded the CLWB conformance test to require six traps across ModRM, SIB, REX and RIP-relative operands (#409).
