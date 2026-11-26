@@ -10,6 +10,7 @@ Guest execution uses original, purpose-built test programs. Commercial Xbox game
 remains unsupported.
 
 ### Added
+- Added Win32 bridge conformance coverage for a hidden window, message dispatch, concurrent PSM registrations, and per-event JSONL log verification. Offline PSM registration tokens are tracked without C++ exceptions using disjoint family tags so cross-family unregisters log `foreign_token` and retired or invalid tokens log `unknown_token` (#410).
 - Implemented synthetic APU heap mappings, per-connection APU and DSP queues, and the GameInput ordinal 1 COM stub. Added an audio/input conformance executable covering all four shim DLLs (#419).
 - Added structured unhandled exception logging with module-relative addresses and x64 registers, and expanded the CLWB conformance test to require six traps across ModRM, SIB, REX and RIP-relative operands (#409).
 - Enforced the configured title memory cap for default heap allocations and virtual commits in `xmem.dll`. Added working-set accounting and a synthetic fixture for alignment, commit overlap, decommit, release, and memory transfer (#411).
