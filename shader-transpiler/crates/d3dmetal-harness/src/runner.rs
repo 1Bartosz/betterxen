@@ -209,19 +209,17 @@ mod tests {
     #[test]
     fn kills_a_probe_that_exceeds_the_timeout() {
         let pid_file = PidFile(
-            std::env::temp_dir().join(format!("bx-harness-hang-{}.pid", std::process::id())),
+            std::env::temp_dir().join(format!("bx-harness-probe's-{}.pid", std::process::id())),
         );
         let _ = std::fs::remove_file(&pid_file.0);
+        // Pass the path as the value of --framework. The apostrophe tests literal path handling.
         // `exec` keeps the pid, so the recorded pid is the process that has to be killed.
         let script = Script::new(
             "hang",
-            &format!(
-                "echo $$ > '{}'; echo started; exec sleep 30",
-                pid_file.0.display()
-            ),
+            "echo $$ > \"$2\" || exit 1; echo started; exec sleep 30",
         );
         let started = Instant::now();
-        let run = run_probe(&script.0, Path::new("/fw"), START_MARGIN).unwrap();
+        let run = run_probe(&script.0, &pid_file.0, START_MARGIN).unwrap();
         let elapsed = started.elapsed();
         assert!(run.status.is_none());
         // Output written before the kill is kept.
