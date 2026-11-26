@@ -2,7 +2,7 @@
  *
  * Guest-side check for bx_shader_bridge.dll, the x86-64 Windows build of this crate (#445).
  *
- * Runs as a PE32+ guest under CrossOver/Wine, loads the DLL by name from its own directory,
+ * Runs as a PE32+ guest under CrossOver/Wine, loads the DLL by full path from its own directory,
  * and drives the three entry points from abi/include/bx_shader_bridge.h with synthetic
  * containers plus one real DXC SM 6.6 compute blob. It counts the classifications and checks
  * them, and the prepare/free behaviour, against expectations written here from the DXBC
@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #include "bx_shader_bridge.h"
 #include "fill_cs66.h" /* g_fill_cs66: DXC 1.9.2609 output, see d3dmetal-harness */
@@ -92,6 +93,25 @@ static void dxil_program(uint8_t out[28], uint32_t kind, uint32_t major, uint32_
     put32(out + 24, 0xDEC011D1u);
 }
 
+/* Size of the first chunk named fourcc in a well-formed container, 0 if absent. Written from
+ * the DXBC layout, independently of the Rust parser. */
+static uint32_t get32(const uint8_t* at) {
+    return (uint32_t)at[0] | (uint32_t)at[1] << 8 | (uint32_t)at[2] << 16 | (uint32_t)at[3] << 24;
+}
+
+static int chunk(const uint8_t* bytes, size_t len, const char* fourcc, uint32_t* size) {
+    if (len < 32 || memcmp(bytes, "DXBC", 4) != 0) return 0;
+    const uint32_t count = get32(bytes + 28);
+    for (uint32_t i = 0; i < count && 36 + 4 * (size_t)i <= len; ++i) {
+        const uint32_t offset = get32(bytes + 32 + 4 * i);
+        if (offset + 8 <= len && memcmp(bytes + offset, fourcc, 4) == 0) {
+            *size = get32(bytes + offset + 4);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* --- Cases --- */
 
 typedef struct {
@@ -102,7 +122,7 @@ typedef struct {
     bx_shader_kind_t kind;
     bx_shader_stage_t stage;
     uint32_t sm_major, sm_minor;
-    uint32_t has_root_signature; /* checked only when not 2 */
+    uint32_t container_size; /* the container's declared size, which may be less than len */
     bx_shader_status_t prepare_status;
 } case_t;
 
@@ -117,7 +137,16 @@ static const char* kind_name(bx_shader_kind_t kind) {
 }
 
 int main(void) {
-    HMODULE dll = LoadLibraryW(L"bx_shader_bridge.dll");
+    /* By full path beside this EXE, as a caller should (see the crate README). */
+    wchar_t path[MAX_PATH];
+    const DWORD path_len = GetModuleFileNameW(NULL, path, MAX_PATH);
+    wchar_t* slash = path_len && path_len < MAX_PATH ? wcsrchr(path, L'\\') : NULL;
+    if (!slash || (size_t)(slash + 1 - path) + 21 > MAX_PATH) {
+        fprintf(stderr, "FAIL: check_bridge: executable path too long\n");
+        return 2;
+    }
+    wcscpy(slash + 1, L"bx_shader_bridge.dll");
+    HMODULE dll = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!dll) {
         fprintf(stderr, "FAIL: check_bridge: bx_shader_bridge.dll not loaded (error %lu)\n", GetLastError());
         return 2;
@@ -165,22 +194,28 @@ int main(void) {
     const uint32_t accc_v0_len = build_dxbc(accc_v0, sizeof(accc_v0), accc_v0_chunks, 1);
     const uint32_t dual_len = build_dxbc(dual, sizeof(dual), dual_chunks, 2);
     const uint32_t legacy_len = build_dxbc(legacy, sizeof(legacy), legacy_chunks, 1);
+    /* The pixel shader again, followed by 16 bytes that are not part of the container. */
+    static uint8_t padded[256 + 16];
+    memcpy(padded, ps60, ps60_len);
+    memset(padded + ps60_len, 0xEE, 16);
     static const uint8_t truncated[20] = {'D', 'X', 'B', 'C'};
     static const uint8_t not_dxbc[64] = {'X', 'X', 'X', 'X'};
 
     const case_t cases[] = {
         {"dxc_cs_6_6", g_fill_cs66, sizeof(g_fill_cs66), BX_SHADER_OK, BX_SHADER_DXBC_DXIL, BX_STAGE_COMPUTE, 6, 6,
-         2, BX_SHADER_OK},
-        {"synthetic_ps_6_0", ps60, ps60_len, BX_SHADER_OK, BX_SHADER_DXBC_DXIL, BX_STAGE_PIXEL, 6, 0, 1,
+         sizeof(g_fill_cs66), BX_SHADER_OK},
+        {"synthetic_ps_6_0", ps60, ps60_len, BX_SHADER_OK, BX_SHADER_DXBC_DXIL, BX_STAGE_PIXEL, 6, 0, ps60_len,
          BX_SHADER_OK},
-        {"accc_fspx_v1", accc_v1, accc_v1_len, BX_SHADER_OK, BX_SHADER_DXBC_ACCC, BX_STAGE_COMPUTE, 6, 0, 0,
-         BX_SHADER_ERR_UNSUPPORTED},
-        {"accc_fspx_v0", accc_v0, accc_v0_len, BX_SHADER_OK, BX_SHADER_DXBC_ACCC, BX_STAGE_UNKNOWN, 0, 0, 0,
-         BX_SHADER_ERR_UNSUPPORTED},
-        {"dual_dxil_accc", dual, dual_len, BX_SHADER_OK, BX_SHADER_DXBC_DUAL, BX_STAGE_COMPUTE, 6, 6, 0,
+        {"trailing_bytes", padded, ps60_len + 16, BX_SHADER_OK, BX_SHADER_DXBC_DXIL, BX_STAGE_PIXEL, 6, 0, ps60_len,
          BX_SHADER_OK},
-        {"legacy_shex_5_0", legacy, legacy_len, BX_SHADER_OK, BX_SHADER_DXBC_LEGACY, BX_STAGE_COMPUTE, 5, 0, 0,
+        {"accc_fspx_v1", accc_v1, accc_v1_len, BX_SHADER_OK, BX_SHADER_DXBC_ACCC, BX_STAGE_COMPUTE, 6, 0, accc_v1_len,
          BX_SHADER_ERR_UNSUPPORTED},
+        {"accc_fspx_v0", accc_v0, accc_v0_len, BX_SHADER_OK, BX_SHADER_DXBC_ACCC, BX_STAGE_UNKNOWN, 0, 0, accc_v0_len,
+         BX_SHADER_ERR_UNSUPPORTED},
+        {"dual_dxil_accc", dual, dual_len, BX_SHADER_OK, BX_SHADER_DXBC_DUAL, BX_STAGE_COMPUTE, 6, 6, dual_len,
+         BX_SHADER_OK},
+        {"legacy_shex_5_0", legacy, legacy_len, BX_SHADER_OK, BX_SHADER_DXBC_LEGACY, BX_STAGE_COMPUTE, 5, 0,
+         legacy_len, BX_SHADER_ERR_UNSUPPORTED},
         {"truncated", truncated, sizeof(truncated), BX_SHADER_ERR_INVALID_BLOB, BX_SHADER_UNKNOWN, BX_STAGE_UNKNOWN,
          0, 0, 0, BX_SHADER_ERR_INVALID_BLOB},
         {"not_dxbc", not_dxbc, sizeof(not_dxbc), BX_SHADER_ERR_INVALID_BLOB, BX_SHADER_UNKNOWN, BX_STAGE_UNKNOWN, 0,
@@ -205,13 +240,19 @@ int main(void) {
             CHECK(info.kind == c->kind);
             CHECK(info.stage == c->stage);
             CHECK(info.shader_model_major == c->sm_major && info.shader_model_minor == c->sm_minor);
-            CHECK(info.container_size == c->len);
-            CHECK((info.dxil_chunk_size != 0) == (c->kind == BX_SHADER_DXBC_DXIL || c->kind == BX_SHADER_DXBC_DUAL));
-            CHECK((info.accc_chunk_size != 0) == (c->kind == BX_SHADER_DXBC_ACCC || c->kind == BX_SHADER_DXBC_DUAL));
-            if (c->has_root_signature != 2) CHECK(info.has_root_signature == c->has_root_signature);
-            if (c->bytes != g_fill_cs66) {
-                for (int b = 0; b < 16; ++b) CHECK(info.digest_hash[b] == 0x5A);
-            }
+            CHECK(info.container_size == c->container_size);
+            /* Exact chunk sizes and the root signature flag, from this file's own chunk walk. */
+            uint32_t want_dxil = 0, want_accc = 0, rts0_size = 0;
+            chunk(c->bytes, c->len, "DXIL", &want_dxil);
+            chunk(c->bytes, c->len, "ACCC", &want_accc);
+            const uint32_t want_rts0 = (uint32_t)chunk(c->bytes, c->len, "RTS0", &rts0_size);
+            CHECK(info.dxil_chunk_size == want_dxil);
+            CHECK(info.accc_chunk_size == want_accc);
+            CHECK(info.has_root_signature == want_rts0);
+            CHECK((want_dxil != 0) == (c->kind == BX_SHADER_DXBC_DXIL || c->kind == BX_SHADER_DXBC_DUAL));
+            CHECK((want_accc != 0) == (c->kind == BX_SHADER_DXBC_ACCC || c->kind == BX_SHADER_DXBC_DUAL));
+            /* The digest is the container header's bytes 4..20, for every case. */
+            CHECK(memcmp(info.digest_hash, c->bytes + 4, 16) == 0);
         } else {
             ++invalid;
             const bx_shader_inspection_t zero = {0};
@@ -223,7 +264,8 @@ int main(void) {
         const bx_shader_status_t prepared = prepare(c->bytes, c->len, &copy, &copy_len);
         CHECK(prepared == c->prepare_status);
         if (prepared == BX_SHADER_OK) {
-            CHECK(copy && copy_len == c->len && memcmp(copy, c->bytes, c->len) == 0);
+            /* Only the declared container is copied, never bytes past it. */
+            CHECK(copy && copy_len == c->container_size && memcmp(copy, c->bytes, c->container_size) == 0);
             release(copy, copy_len);
         } else {
             CHECK(copy == NULL && copy_len == 0);
@@ -242,7 +284,7 @@ int main(void) {
     printf("BXSHADER counts dxil=%u accc_only=%u dual=%u legacy=%u unknown=%u invalid=%u\n",
            tally[BX_SHADER_DXBC_DXIL], tally[BX_SHADER_DXBC_ACCC], tally[BX_SHADER_DXBC_DUAL],
            tally[BX_SHADER_DXBC_LEGACY], tally[BX_SHADER_UNKNOWN], invalid);
-    CHECK(tally[BX_SHADER_DXBC_DXIL] == 2 && tally[BX_SHADER_DXBC_ACCC] == 2 && tally[BX_SHADER_DXBC_DUAL] == 1);
+    CHECK(tally[BX_SHADER_DXBC_DXIL] == 3 && tally[BX_SHADER_DXBC_ACCC] == 2 && tally[BX_SHADER_DXBC_DUAL] == 1);
     CHECK(tally[BX_SHADER_DXBC_LEGACY] == 1 && tally[BX_SHADER_UNKNOWN] == 0 && invalid == 2);
 
     if (failures) {
