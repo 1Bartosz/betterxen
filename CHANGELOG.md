@@ -10,6 +10,11 @@ Guest execution uses original, purpose-built test programs. Commercial Xbox game
 remains unsupported.
 
 ### Added
+- M2 Shader Format Gate (#466). `d3d12_xs.dll`'s `CreateComputePipelineState` and `CreateGraphicsPipelineState` classify every stage through `bx_shader_bridge.dll` (#445) and log one `shader_gate` JSONL record per stage: kind, stage, shader model, chunk sizes, `SFI0` feature flags and `PSV0` wave lane range.
+  - **Decisions:** DXIL and dual containers go to the host as the bridge's prepared copy. ACCC-only containers are refused with `E_NOTIMPL` before the host is called. Legacy DXBC and unclassifiable input pass unchanged. A missing bridge is logged once as `shader_bridge_missing`, and shaders then pass unclassified.
+  - **D3DMetal gaps:** stages needing a wave wider than 32 lanes or 64-bit atomics also log `shader_d3dmetal_gap`, the cases #453 measured as created but not run. The structural check now counts an `ACCC` chunk as a shader chunk, so the gate decides it.
+  - **Test:** `tests/conformance/test_shader_gate/` runs a real DXC SM 6.6 compute shader through `d3d12_xs` and checks 256/256 output words. It requires `E_NOTIMPL` for an ACCC-only compute and graphics shader, and checks the logged wave64 and typed 64-bit-atomic constraints and every JSONL record. It passed on one Apple M5 Pro in a CrossOver 26.3 D3DMetal bottle. A bare prefix's vkd3d cannot load a DXIL converter, so the DXIL part needs the D3DMetal backend. Running it needs `bx_shader_bridge.dll` next to the shims, built by `shader-transpiler/crates/dxbc-accc/guest/build.sh` (#476).
+  - **ADR:** [ADR 0008](docs/adr/0008-m2-shader-format-gate.md) proposes Branch D1 for M3, with the evidence; it is pending maintainer acceptance.
 - Added `docs/research/d3dmetal-gpu-limits.md` and `tests/conformance/test_d3dmetal_gpu_limits/` (#453). The fixture is an original D3D12 compute test that loads the host `d3d12.dll` directly, with four original HLSL kernels and committed DXC 1.9.2609 output (`shaders/compile.sh` regenerates them). It skips with exit 77 below shader model 6.6. Required checks:
   - a kernel without `WaveSize` runs, and its lane indices form a permutation within each wave;
   - a per-texel spin lock with acquire and release fences and a 1024-try cap emulates 64-bit add and max with no dropped update and exact values.
