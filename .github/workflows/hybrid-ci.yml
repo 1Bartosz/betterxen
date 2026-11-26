@@ -1,0 +1,53 @@
+name: Hybrid build and shim checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hybrid-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arm64-host-and-shims:
+    name: ARM64 host Rust + x86-64 PE32+ shims
+    runs-on: macos-26
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: 3
+      CARGO_BUILD_TARGET: aarch64-apple-darwin
+      RUSTUP_TOOLCHAIN: 1.100.0-aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Apple Silicon runner
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(sysctl -n sysctl.proc_translated)" = 0
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustc -vV
+      - name: Check ARM64 Rust workspace (launcher + shader-transpiler)
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+          cargo build --locked -p bx-cli
+          binary=target/aarch64-apple-darwin/debug/bx-cli
+          file "$binary"
+          test "$(lipo -archs "$binary")" = arm64
+      - name: Install mingw-w64 and CMake
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: |
+          brew install mingw-w64 cmake
+          x86_64-w64-mingw32-g++ --version | head -n 1
+      - name: Cross-compile all x86-64 PE32+ shim DLLs and verify exports
+        run: scripts/build-shims.sh

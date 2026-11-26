@@ -1,5 +1,0 @@
-module CXenora [system] {
-    header "../../../crates/ffi/include/xenora.h"
-    link "xenora_ffi"
-    export *
-}

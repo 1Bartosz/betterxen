@@ -1,0 +1,4 @@
+LIBRARY ext-ms-win-rtcore-ntuser-message-ansi-l1-1-0.dll
+EXPORTS
+    DispatchMessageA = user32.DispatchMessageA
+    PeekMessageA = user32.PeekMessageA

@@ -37,7 +37,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           changed="$(git diff --name-only "$BASE_SHA"...HEAD || true)"
-          if printf '%s\n' "$changed" | grep -Eq '^(crates|scripts|shaders|fixtures)/' \
+          if printf '%s\n' "$changed" | grep -Eq '^(abi|launcher|shims|shader-transpiler|scripts|tests)/' \
              && ! printf '%s\n' "$changed" | grep -qx 'CHANGELOG.md'; then
             echo "::warning title=Changelog::Source or script files changed without a CHANGELOG.md update."
           fi

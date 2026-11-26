@@ -1,2 +1,34 @@
-# Every change needs a review from the maintainers team.
-* @MacosPorters/maintainers
+# Global fallback: every file in the repository requires maintainer review.
+*                               @MacosPorters/maintainers
+
+# Frozen cross-track ABI contracts (fast-tracked [ABI] PRs)
+/abi/                           @MacosPorters/maintainers
+/Cargo.toml                     @MacosPorters/maintainers
+/shims/CMakeLists.txt           @MacosPorters/maintainers
+
+# Track A: Host launcher, CrossOver/Rosetta runner, runtime VEH & Win32 forwarders
+/launcher/                      @MacosPorters/maintainers
+/shims/runtime_veh/             @MacosPorters/maintainers
+/shims/win32_bridge/            @MacosPorters/maintainers
+/scripts/build-shims.sh         @MacosPorters/maintainers
+
+# Track B: Memory (xmem) & Storage (XCRDAPI / DirectStorage)
+/shims/xmem/                    @MacosPorters/maintainers
+/shims/xcrdapi/                 @MacosPorters/maintainers
+
+# Track C: Graphics (d3d12_xs, xg_xs, FidelityFX/BVH hooks)
+/shims/d3d12_xs/                @MacosPorters/maintainers
+/shims/xg_xs/                   @MacosPorters/maintainers
+/shims/ffx_bvh_hooks/           @MacosPorters/maintainers
+
+# Track D: Shader pipeline (DXBC/DXIL/ACCC/FSPX & RDNA2 transpiler)
+/shader-transpiler/             @MacosPorters/maintainers
+
+# Track E: Platform runtime (xgameruntime), Input (GameInput) & Audio/DSP
+/shims/xgameruntime/            @MacosPorters/maintainers
+/shims/gameinput/               @MacosPorters/maintainers
+/shims/audio/                   @MacosPorters/maintainers
+
+# Track F: Conformance tests & documentation
+/tests/conformance/             @MacosPorters/maintainers
+/docs/                          @MacosPorters/maintainers

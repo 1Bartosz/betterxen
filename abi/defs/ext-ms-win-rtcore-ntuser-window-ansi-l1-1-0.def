@@ -1,0 +1,5 @@
+LIBRARY ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll
+EXPORTS
+    CreateWindowExA = user32.CreateWindowExA
+    DefWindowProcA = user32.DefWindowProcA
+    RegisterClassExA = user32.RegisterClassExA

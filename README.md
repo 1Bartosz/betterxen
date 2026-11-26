@@ -2,449 +2,197 @@
 
 # BetterXen
 
-**Hybrid-first Apple Silicon compatibility research built around CrossOver, with preserved independent native ARM64 and Metal research (paused).**
+**Modular Xbox Series (`Scarlett`) compatibility layer for Apple Silicon macOS — built on CrossOver, Rosetta 2, and D3DMetal 3.0.**
 
-[![Native Rust checks](https://github.com/MacosPorters/betterxen/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MacosPorters/betterxen/actions/workflows/ci.yml)
+[![Hybrid build and shim checks](https://github.com/MacosPorters/betterxen/actions/workflows/hybrid-ci.yml/badge.svg?branch=main)](https://github.com/MacosPorters/betterxen/actions/workflows/hybrid-ci.yml)
+[![Repository hygiene](https://github.com/MacosPorters/betterxen/actions/workflows/hygiene.yml/badge.svg?branch=main)](https://github.com/MacosPorters/betterxen/actions/workflows/hygiene.yml)
 ![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon%20(ARM64)-1f6feb?logo=apple&logoColor=white)
-![Graphics: Metal](https://img.shields.io/badge/graphics-native%20Metal-8957e5)
-![Language: Rust](https://img.shields.io/badge/language-Rust%201.100-dea584?logo=rust&logoColor=white)
-![Status: experimental](https://img.shields.io/badge/status-experimental-d29922)
+![Graphics: D3DMetal 3.0](https://img.shields.io/badge/graphics-D3DMetal%203.0%20%2F%20Metal-8957e5)
+![Stack: Rust + C++20 PE32+](https://img.shields.io/badge/stack-Rust%20%2B%20C%2B%2B20%20PE32%2B-dea584)
+![Status: experimental](https://img.shields.io/badge/status-experimental%20(M0)-d29922)
 ![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-2ea043)
-
-**The paused native implementation described below uses no Wine, CrossOver, Rosetta or Vulkan runtime. The active hybrid direction intends to use CrossOver and Rosetta 2, subject to research and licensing review.**
-
-> [!IMPORTANT]
-> **Current direction.** BetterXen's only active development track is a CrossOver-based hybrid architecture: CrossOver (installed externally) as the compatibility foundation, with BetterXen providing whatever integration, configuration, diagnostics, benchmarking and optimization research shows is missing. This is the *intended* architecture, **not a verified Xbox compatibility stack**: no Xbox title has been shown to run through it, and CrossOver is not assumed to provide Xbox runtime compatibility. Work is at the research stage (Phase 1). Planning is progressive: only the current phase has open issues. The independent native implementation described below is **preserved but paused indefinitely**. See the [roadmap](docs/roadmap.md), [ADR 0005](docs/adr/0005-crossover-hybrid-direction.md), the [upstream research registry](docs/research/upstream-registry.md) and the [deferred native roadmap](docs/research/native-roadmap.md). The rewritten engineering rules are in [AGENTS.md](AGENTS.md).
 
 </div>
 
-BetterXen is a community-maintained, open-source project written primarily in Rust. Its native research implementation (paused) builds and verifies a native, bounded execution environment on Apple Silicon: an independent x86-64 guest path, original PE32+ loading, AMD RDNA 2 shader translation, and a native Apple Metal graphics backend. The host runs as ARM64 code; the x86-64 code being emulated is guest data.
-
 > [!IMPORTANT]
-> **BetterXen is experimental.** Verified work is restricted to independently authored synthetic programs and shaders. Authentic Xbox executable loading, system-service compatibility and commercial game execution are **not supported**. Progress is measured by reproducible tests, not by estimated game compatibility percentages. See the [current limitations](#current-limitations).
+> **Experimental status.** BetterXen is an active, open-source compatibility engineering project currently at **Milestone M0** (cross-compiled shim foundation and live CrossOver/Rosetta smoke tests verified on synthetic PE32+ workloads). **Commercial Xbox game execution is not yet supported.** CrossOver, Rosetta 2, and D3DMetal are externally installed dependencies and are never bundled or redistributed.
+
+BetterXen builds the missing Xbox Game OS layer around **CrossOver 26.3+**, **Rosetta 2**, and **D3DMetal 3.0** on Apple Silicon:
+- **Native ARM64 macOS tooling** (`launcher/`, Rust) for host diagnostics, PE32+ static probing, CrossOver bottle orchestration, and structured trace aggregation.
+- **Cross-compiled x86-64 Windows PE32+ shim DLLs** (`shims/`, C++20 via `mingw-w64`) implementing Xbox runtime APIs (`xmem`, `XCRDAPI`, `d3d12_xs`, `xg_xs`, `xgameruntime`, `GameInput`, `AcpHal`/`xapu`/`chad`, Win32/PSM forwarders, and a `clwb` Vectored Exception Handler).
+- **Shader pipeline** (`shader-transpiler/`, Rust) for classifying `DXBC` containers (`DXIL` vs. `ACCC`/`FSPX` RDNA 2 machine code) and handling console shader translation where required.
 
 > [!CAUTION]
-> **BetterXen strictly opposes piracy.** BetterXen is an independent, clean-room, general-purpose emulation research project that neither distributes copyrighted game files nor supports unauthorized content, DRM circumvention, or leaked materials. Use only legally obtained software. BetterXen is not affiliated with Microsoft or any other publisher or platform holder.
+> **Clean-room and anti-piracy policy.** BetterXen strictly opposes piracy and does not distribute copyrighted game files, firmware, decryption keys, or DRM circumvention tooling. Zero proprietary binaries, assets, or leaked materials are permitted in this repository or its Git history. All in-repo tests use independently authored synthetic PE32+ workloads.
 
 ---
-
-## How it fits together
-
-One guest program travels through three native subsystems. Every stage is checked against an independently derived expectation.
-
-```mermaid
-%%{init: {'theme':'base','themeVariables':{'fontFamily':'system-ui, sans-serif','lineColor':'#6e7781'}}}%%
-flowchart LR
-    A["Original PE32+<br/>test program"]:::guest --> B["Loader<br/>relocations, TLS, imports"]:::guest
-    B --> C["x86-64 interpreter<br/>+ ARM64 translator"]:::cpu
-    C --> D["Typed runtime<br/>services"]:::cpu
-    D --> E["Guest graphics<br/>commands"]:::gpu
-    S["Original gfx1030<br/>shader bytes"]:::shader --> T["RDNA 2 decoder<br/>+ validated IR"]:::shader --> U["Metal Shading<br/>Language"]:::shader
-    E --> M["Native Metal<br/>pipelines"]:::gpu
-    U --> M
-    M --> G["Apple Silicon GPU<br/>+ readback"]:::gpu
-    G --> V{"Matches the<br/>independent<br/>CPU reference?"}:::check
-    S -.-> R["Independent<br/>CPU reference"]:::check -.-> V
-
-    classDef guest fill:#ddf4ff,stroke:#0969da,color:#0a3069
-    classDef cpu fill:#dafbe1,stroke:#1a7f37,color:#0f5323
-    classDef shader fill:#fbefff,stroke:#8250df,color:#512a97
-    classDef gpu fill:#fff8c5,stroke:#9a6700,color:#4d2d00
-    classDef check fill:#ffebe9,stroke:#cf222e,color:#82071e
-```
-
-Legend: 🟦 guest loading · 🟩 guest CPU and services · 🟪 shader translation · 🟨 native Metal · 🟥 independent verification.
-
----
-
-## Roadmap
-
-The active plan is the [roadmap](docs/roadmap.md): **Phase 1 — CrossOver Research, Feasibility and Baseline** is the only active phase, and later phases are provisional and will be defined from its findings. The current issues are in the [Phase 1 milestone](https://github.com/MacosPorters/betterxen/milestone/9). The native implementation's six phases and the X1 to X25 capability map are archived in [docs/archive/readme-native-milestones.md](docs/archive/readme-native-milestones.md) and the [native-first plan](docs/archive/development-phases-native-first.md). Native work is paused indefinitely and resumes only after an explicit maintainer decision.
-
-
-All existing verification refers to independently authored synthetic programs and shaders. Commercial-game compatibility remains unverified.
-
----
-
-## Repository at a glance
-
-Counts below come from the generated registries and were read from the repository, not measured on new runs. They describe synthetic fixtures only.
-
-| Area | Where | What exists today |
-| --- | --- | --- |
-| Guest CPU | `crates/loader` | A generated x86-64 decoder and interpreter, plus a native ARM64 dynamic binary translator (DBT) for a bounded subset. The instruction registry declares 213 operations, 403 forms and 498 opcode slots; 93 operations have at least one form lowered to ARM64 and the rest run through shared interpreter semantics. See the [instruction registry](docs/cpu/instruction-registry.md). |
-| Executable loading | `crates/loader` | PE32+ loading, relocations, thread-local storage, import binding and a static inspection report. |
-| Runtime services | `crates/loader`, `crates/import-gen` | A typed service registry: 47 declared services (7 implemented, 37 partial, 3 stubs), all exercised through guest dispatch, none independently accepted. See the [registry](docs/runtime/registry.md) and [generated coverage](docs/runtime/services.md). Guest threads run on a deterministic scheduler on one host thread. |
-| Shader ISA | `crates/isa`, `crates/decoder`, `crates/shader`, `crates/ref` | The RDNA 2 (gfx1030) instruction snapshot lists 1,465 forms; 189 are decoder-supported, 185 are lowered to Metal Shading Language, and 18 are Metal-verified on fixtures. See the [semantic coverage](docs/shaders/semantic-coverage.md). An independent CPU reference checks GPU output. |
-| Metal backend | `crates/metal` | Native compute, blend, indexed-draw, depth and sampled-texture passes, with Metal API and shader validation. |
-| Textures | `crates/texture` | Upload, readback, BC1 to BC7 decoding and sampler code. |
-| Application | `app`, `crates/ffi` | A Swift macOS app over a versioned C interface: frame loop, interactive input, persistent resources, audio and a sandboxed virtual filesystem, all against synthetic guests. |
-| Test and tooling | `tests`, `fuzz`, `benchmarks`, `scripts` | Original guest programs, independent validation, fuzz targets (CPU decode, PE parse, instruction streams, fixtures, reference, runtime services), mutation testing, correctness-gated benchmarks, and audit scripts for claims, status tables and dependency direction. |
-
-The `betterxen` command-line tool provides `info`, `demo`, `inspect <pe>`, `probe --pe <path> --mode static`, `run`, `imports` and `shaders`. Run `cargo run -p betterxen` with no arguments to see its usage.
-
-
-### Where the numbers stand
-
-Counts come from the repository's generated registries at this revision. They describe synthetic fixtures only and are not compatibility percentages.
-
-```mermaid
-%%{init: {'theme':'base','themeVariables':{'pie1':'#1a7f37','pie2':'#d0d7de','pieTitleTextSize':'16px','pieStrokeColor':'#ffffff','pieOuterStrokeColor':'#ffffff','fontFamily':'system-ui, sans-serif'}}}%%
-pie showData title Guest CPU — 213 declared x86-64 operations
-    "Lowered to ARM64 (at least one native form)" : 93
-    "Shared interpreter semantics only" : 120
-```
-
-```mermaid
-%%{init: {'theme':'base','themeVariables':{'pie1':'#1a7f37','pie2':'#d4a72c','pie3':'#cf222e','pieStrokeColor':'#ffffff','pieOuterStrokeColor':'#ffffff','fontFamily':'system-ui, sans-serif'}}}%%
-pie showData title Runtime services — 47 declared, none independently accepted
-    "Implemented" : 7
-    "Partial" : 37
-    "Stub" : 3
-```
-
-```mermaid
-%%{init: {'theme':'base','themeVariables':{'xyChart':{'plotColorPalette':'#8250df'}}}}%%
-xychart-beta
-    title "gfx1030 instruction forms by stage (1,465 identified)"
-    x-axis ["Decoder-supported", "Lowered to MSL", "Metal-verified"]
-    y-axis "Forms" 0 --> 200
-    bar [189, 185, 18]
-```
-
----
-
-## Native graphics translation
-
-BetterXen's graphics pipeline translates a supported subset of AMD RDNA 2 instructions into Metal Shading Language.
-
-The translation process is:
-
-```mermaid
-
-flowchart TD
-    A["Original gfx1030 Machine Code"]
-    B["RDNA2 ISA Decoder"]
-    C["Validated Shader IR"]
-    D["Metal Shader Generation (MSL)"]
-    E["Native Metal Pipeline"]
-    F["Apple Silicon GPU"]
-    G["GPU Readback"]
-    H["Independent CPU Validation"]
-
-    A --> B
-    B --> C
-    C --> D
-    D --> E
-    E --> F
-    F --> G
-    G --> H
-```
-
-The initial implementation focused on compute shaders. X9 extends this to actual translated **vertex and fragment/pixel shader stages**.
-
-### Translated rendering
-
-The current graphics subset supports:
-
-- Original gfx1030 vertex and pixel shader fixtures.
-- Decoding and translation into Metal shader functions.
-- Vertex position transformation.
-- Constant-color output and clipping.
-- Interpolated vertex attributes.
-- Offscreen RGBA8 render targets.
-- Native GPU readback and pixel-by-pixel validation.
-- Explicit rejection of unsupported shader forms.
-- Flat-coloured triangle draws with colour write masks and blending (see [Blend pass](#blend-pass)).
-- Indexed triangle draws (see [Indexed draws](#indexed-draws)).
-- Depth testing with an optional `Depth32Float` attachment (see [Depth pass](#depth-pass)).
-
-These are genuine translated shader stages, not merely demonstrations using handwritten Metal vertex and fragment programs.
-
-The current rendering tests are deliberately narrow: original fixtures, a single triangle per draw, and controlled shader inputs and outputs.
-
-### Blend pass
-
-`NativeCompute::render_blend` draws up to 16 flat-coloured triangles in order into an offscreen RGBA8 target. Each draw has its own colour write mask (any subset of R, G, B, A) and either blending disabled or separate RGB and alpha blend factors (Zero, One, source and destination colour and alpha, and their one-minus forms) and operations (Add, Subtract, ReverseSubtract, and Min and Max). Colours are compared per channel against images derived independently (in exact fractions) from the public Metal blend equations.
-
-GPU verification (Metal API and shader validation enabled): 39 Metal-validated passes over two original overlapping triangles — a clear-only pass; blending disabled; each source factor with the destination term zeroed and each destination factor with the source term zeroed; every operation; additive clamping; separate alpha factors; a separate alpha operation; eight write masks; and a pass whose first draw is itself blended and masked. On an Apple M5 Pro every rounded channel matched round-to-nearest exactly.
-
-### Indexed draws
-
-`NativeCompute::render_indexed` issues one real `drawIndexedPrimitives` call per draw (up to 16) on a 16- or 32-bit index buffer with a start index and a signed base vertex, into an offscreen RGBA8 target. A draw can sample an original BC1 texture uploaded natively.
-
-GPU verification (Metal API and shader validation enabled): 16 Metal-validated passes (both index sizes, 32-bit indices above 16 bits, odd 16-bit start, positive and negative base vertex, reversed winding, flat and textured two-triangle draws, draw order, BC1-textured draws), compared per pixel against images derived independently from the geometry, the public D3D12 and Metal index semantics and the public BC1 rules.
-
-### Depth pass
-
-`NativeCompute::render_depth` draws up to 16 triangles in order into an offscreen RGBA8 target with an optional `Depth32Float` attachment, a chosen clear depth, a per-draw depth compare function (all eight) and depth write enable. Colour and the stored depth are both read back.
-
-GPU verification (Metal API and shader validation enabled): 30 Metal-validated passes of original overlapping triangles: clear, every compare function at three depths, write enabled and disabled, depth test disabled with an attachment and no attachment at all, and a BC1-textured draw.
-
-### Verified Apple M5 results
-
-The X9 native Metal acceptance run reported **20 passing tests, zero failures and zero ignored tests**, with Metal API and GPU validation enabled. The newer passes below are separate Metal-validated campaigns, also with Metal API and shader validation enabled.
-
-Representative checks include:
-
-| Test | Verified behavior |
-| --- | --- |
-| Constant-color rendering | 12 red pixels and 12 clear pixels |
-| Vertex transformation | 3 rendered pixels versus 7 for a pass-through control |
-| Perspective interpolation | Exact checks of 16 pixels and another 16 after swapping vertex color channels |
-| BC1 texture handling | 33 texels across selected mip levels and array layers |
-| Guest rendering | PE32+ guest receives and checks the translated render output |
-| Blend pass | 39 Metal-validated passes over two overlapping triangles |
-| Indexed draws | 16 Metal-validated passes (both index sizes, signed base vertices, draw order) |
-| Depth pass | 30 Metal-validated passes (all eight compare functions, no-attachment case) |
-
-The expected results were calculated independently of the production shader translation path.
-
-**Important:** Correct output for these fixtures does not prove general RDNA2 compatibility or correctness for arbitrary Xbox shaders.
-
-## Persistent GPU resources
-
-X9 introduces a bounded GPU resource-management system for synthetic guest programs.
-
-The implementation includes:
-
-- Generation-checked guest resource handles.
-- Buffer creation, updates, reuse and destruction.
-- Checked buffer views and memory permissions.
-- Repeated compute submissions.
-- Resource lifetime validation.
-- Snapshot behavior for queued submissions.
-- Rejection of stale handles and malformed resource requests.
-- Guest-visible readback and result verification.
-
-The original X9 PE fixtures exercise these services through the guest execution environment.
-
-The resource system remains experimental. Native GPU work already in flight during resource release, persistent Metal texture residency across guest calls, and general asynchronous execution are not yet implemented.
-
-## Texture support
-
-BetterXen includes original texture upload, readback and block-compression paths.
-
-Implemented and tested functionality includes:
-
-- Validated mip levels and array layers.
-- Pitched texture uploads.
-- Block-compressed texture handling, including BC4/BC5 upload and readback and a CPU BC7 decoder for the eight modes.
-- Native Metal texture readback.
-- Edge-block and transparency tests.
-- Invalid descriptor and bounds rejection.
-
-**Translated texture sampling covers one instruction and one sampler mode.** A guest draw with the translated `image_sample_lz` pixel stage and a point/clamp sampler matched the software reference and hand-derived images on a local Apple M5 Pro run (one-level RGBA8 and an 8×8 BC1 texture). Other image instructions, filtering modes and formats are not implemented, and this is local verification, not independent acceptance.
-
-The texture upload and readback paths use authored Metal kernels. They should not be confused with executing arbitrary RDNA2 texture-fetch instructions.
-
-Xbox-specific texture layouts and additional compression formats require further research and validation.
 
 ## Architecture
 
-BetterXen is organized around three connected subsystems: guest execution, shader translation and native GPU execution.
+Rosetta 2 executes x86-64 CPU code (including AVX/AVX2/FMA/F16C/BMI1/BMI2/128-bit VAES when launched with `ROSETTA_ADVERTISE_AVX=1`), CrossOver/Wine provides Win32/NT/CRT/XAudio2/WinHTTP, and D3DMetal 3.0 translates Direct3D 12 + DXR onto Metal. BetterXen supplies the modular Xbox Game OS shims, `clwb` exception handling, shader bridge, and ARM64 orchestration around that stack.
 
 ```mermaid
 flowchart TD
-    subgraph Guest["Guest execution"]
-        A["Original PE32+ test program"]
-        B["Bounded x86-64 interpreter"]
-        C["Synthetic imported services"]
-        D["Validated GPU resources and commands"]
+    Guest["Scarlett x86-64 PE32+ Executable"]
 
-        A --> B
-        B --> C
-        C --> D
+    subgraph Shims["BetterXen x86-64 Wine Shims (Cross-Compiled on macOS)"]
+        VEH["bx_runtime_veh.dll (clwb VEH trap, JSONL trace, Lockhart cap)"]
+        XMem["xmem.dll (Physical/Virtual/Scatter Allocator)"]
+        DS["XCRDAPI.dll (DirectStorage Async I/O)"]
+        D3DX["d3d12_xs.dll + xg_xs.dll (Xbox D3D12 COM Proxy & RDNA2 Tiling)"]
+        XGR["xgameruntime.dll + GameInput.dll + Audio/DSP"]
+        Bridge["PSM AppNotify & ntuser Win32 Forwarders"]
     end
 
-    subgraph Shader["RDNA2 shader translation"]
-        E["Original gfx1030 shader bytes"]
-        F["ISA decoder"]
-        G["Validated intermediate representation"]
-        H["MSL generation"]
-
-        E --> F
-        F --> G
-        G --> H
+    subgraph Shaders["Shader & DXR Bridge"]
+        DXIL["DXIL Fast Path (SM 6.5/6.6)"]
+        ACCC["ACCC / FSPX RDNA2 Transpiler"]
     end
 
-    subgraph Metal["Native Apple Metal"]
-        I["Compute or render pipeline"]
-        J["Apple Silicon GPU"]
-        K["GPU readback"]
-
-        D --> I
-        H --> I
-        I --> J
-        J --> K
+    subgraph External["External Foundation (User-Installed)"]
+        Wine["CrossOver 26.3 / Wine (Win32, CRT, XAudio2, WinHTTP)"]
+        Rosetta["Rosetta 2 (ROSETTA_ADVERTISE_AVX=1)"]
+        D3DM["D3DMetal 3.0 (D3D12 + DXR on Apple Silicon Metal)"]
     end
 
-    subgraph Validation["Correctness verification"]
-        L["Independent CPU reference"]
-        M{"Expected output matches?"}
+    CLI["bx-cli (Native ARM64 macOS Launcher, Probe & Telemetry)"]
 
-        E --> L
-        L --> M
-        K --> M
-    end
-
-    classDef guestNode fill:#dafbe1,stroke:#1a7f37,color:#0f5323
-    classDef shaderNode fill:#fbefff,stroke:#8250df,color:#512a97
-    classDef metalNode fill:#fff8c5,stroke:#9a6700,color:#4d2d00
-    classDef checkNode fill:#ffebe9,stroke:#cf222e,color:#82071e
-    class A,B,C,D guestNode
-    class E,F,G,H shaderNode
-    class I,J,K metalNode
-    class L,M checkNode
+    Guest --> Shims
+    D3DX --> DXIL --> D3DM
+    D3DX --> ACCC --> D3DM
+    XMem --> Wine
+    DS --> Wine
+    XGR --> Wine
+    Bridge --> Wine
+    VEH --> Rosetta
+    Wine --> Rosetta
+    CLI -.->|"Launches, sets overrides, summarizes traces"| External
 ```
 
-BetterXen's host execution environment is native ARM64. The guest architecture being interpreted is x86-64.
+---
 
-The native graphics pipeline runs translated vertex and pixel stages, the indexed-draw and blend passes and the depth pass into offscreen Metal targets, with GPU readback compared against independent CPU references.
+## Repository Layout
 
-The native ARM64 dynamic recompiler covers a bounded subset of x86-64 instructions; the rest run through the shared interpreter semantics (see the [CPU coverage map](docs/testing/cpu-coverage.md) once it lands). The project does not provide a complete Xbox operating-system implementation.
+The repository is organized into disjoint track directories around a single frozen `abi/` contract so **5–8+ contributors (and coding agents)** can work concurrently with minimal merge conflicts.
 
-See [Interface Contracts](docs/interfaces.md) for the documented execution and resource boundaries.
+| Directory | Track | Stack | Contents |
+| --- | --- | --- | --- |
+| [`abi/`](abi/README.md) | Shared (frozen) | C headers + `.def` | Versioned cross-DLL headers (`bx_config.h`, `bx_log.h`, `bx_xmem_internal.h`, `bx_shader_bridge.h`) and canonical export tables for all 16 shim DLLs |
+| `launcher/` | Track A | Rust (`arm64`) | `bx-cli` (`doctor`, `probe`, `shader`, `trace`, `run`), `bx-probe` (PE32+ import classifier), `bx-telemetry` (JSONL trace aggregator) |
+| `shims/runtime_veh/` | Track A | C++20 (`x86_64` PE) | `bx_runtime_veh.dll`: `clwb` VEH trap, `adcx`/`adox` tripwire, Lockhart/Anaconda memory profile config, structured JSONL logging |
+| `shims/win32_bridge/` | Track A | C++20 (`x86_64` PE) | `api-ms-win-core-psm-appnotify-l1-1-0/1.dll` stubs and `ext-ms-win-rtcore-ntuser-*` → `user32.dll` forwarders |
+| `shims/xmem/`, `shims/xcrdapi/` | Track B | C++20 (`x86_64` PE) | `xmem.dll` (13 Xbox memory APIs + internal region stats) and `XCRDAPI.dll` (`DStorageGetFactory` async I/O) |
+| `shims/d3d12_xs/`, `shims/xg_xs/`, `shims/ffx_bvh_hooks/` | Track C | C++20 (`x86_64` PE) | Xbox D3D12 COM proxy over D3DMetal 3.0, RDNA 2 texture tiling (`XG`), and future FidelityFX/BVH4 hooks |
+| `shader-transpiler/` | Track D | Rust (`arm64`) | `dxbc-accc` (`DXBC`/`DXIL`/`ACCC`/`FSPX` classifier), future RDNA 2 transpiler & `d3dmetal-native` isolation harness |
+| `shims/xgameruntime/`, `shims/gameinput/`, `shims/audio/` | Track E | C++20 (`x86_64` PE) | Offline GDK runtime (`xgameruntime.dll`), `GameInput.dll` (`@1`), and `AcpHal.dll`/`xapu.dll`/`chad.dll` |
+| [`tests/conformance/`](tests/conformance/README.md) | Track F | C++20 (`x86_64` PE) | Auto-discovered clean-room synthetic PE32+ test binaries (`test_*/CMakeLists.txt`) |
 
 ---
 
-## Current limitations
+## Milestones
 
-BetterXen is an engineering research project, not a working commercial-game emulator.
+| Milestone | Scope | Status |
+| --- | --- | --- |
+| **M0 — Repo, ABI & Cross-Build** | 6-track layout, frozen `abi/`, ARM64 `bx-cli`, 16 cross-compiled PE32+ shims, live CrossOver + Rosetta 2 smoke tests (`test_veh_clwb`, `test_shim_exports`) | **Verified locally on Apple M5** |
+| **M1 — Boot to `D3D12XboxCreateDevice`** | Full startup shim coverage (`xmem` physical/scatter pages, `XCRDAPI` async file reads, `d3d12_xs` auto-logging COM proxy, offline `xgameruntime`, audio queue stubs) | **Open (Wave 1 backlog ready)** |
+| **M2 — First Frame & Shader Gate** | `PresentX` → `IDXGISwapChain3::Present` via D3DMetal 3.0; inspect runtime shaders to select DXIL fast path vs. `ACCC`/`FSPX` RDNA 2 transpilation | Planned |
+| **M3 — Shaders, Streaming & Textures** | DirectStorage decompression, RDNA 2 `xg_xs` texture deswizzling, full shader pipeline | Planned |
+| **M4 — 3D Rendering, DXR/BVH & Input** | BVH4 rehydration → live D3DMetal 3.0 DXR rebuild, PC FidelityFX/MetalFX upscaling shim, full `GameInput` | Planned |
+| **M5 — Audio, Saves & Stability** | Software audio/DSP decoding (`AcpHal`/`xapu`/`chad`), `PersistentLocalStorage`, multi-hour soak stability | Planned |
+| **M6 — Cache, 16 GB Tuning & Polish** | Persistent PSO/shader disk cache, Lockhart 16 GB unified memory optimization, Metal System Trace tuning | Planned |
 
-The following remain unsupported or incomplete:
-
-| Subsystem | Outstanding work |
-| --- | --- |
-| Guest CPU | Broad x86-64 instruction coverage, multithreading and performant dynamic recompilation |
-| Executable loader | General relocations, TLS, DLL initialization and authentic Xbox startup |
-| Xbox runtime | Console-specific services, system APIs, filesystem and application lifecycle |
-| RDNA2 shaders | General control flow, broader instructions, Wave64, cross-lane operations and mesh stages |
-| Graphics | Broader translated texture sampling (one instruction and sampler mode exist) and broader resource binding |
-| Textures | Authentic Xbox memory layouts and broader translated sampling |
-| Performance | Production-scale workloads, CPU/GPU profiling and optimized execution |
-| Game compatibility | No demonstrated execution of commercial Xbox titles |
-
-BetterXen's current shader fixtures target a bounded subset of desktop gfx1030 behavior. This is not equivalent to complete Xbox Series GPU compatibility.
-
-Progress is measured by reproducible tests rather than estimated game compatibility percentages.
+See [docs/architecture/parallel-tracks.md](docs/architecture/parallel-tracks.md) and [docs/roadmap.md](docs/roadmap.md) for full details.
 
 ---
 
-## Building BetterXen
+## Quick Start
 
 ### Requirements
 
-- Apple Silicon Mac running native ARM64 macOS.
-- Rust toolchain with `aarch64-apple-darwin` support.
-- Xcode and Metal development tools.
-- Python 3.11 or newer.
-- LLVM with AMDGPU support for applicable shader-fixture assembly and verification.
+- **Apple Silicon Mac** running native ARM64 macOS with **Rosetta 2** and **CrossOver 26.3+** (external install).
+- **Rust toolchain** (`aarch64-apple-darwin`, Rust 1.85+ / 1.100.0).
+- **`mingw-w64` & `cmake`** (`brew install mingw-w64 cmake`) for cross-compiling x86-64 Windows PE32+ shims on macOS.
+- **Python 3.11+** for export verification and repository hygiene checks.
 
-The recorded Apple M5 environment uses Rust 1.100.0 and Xcode 27.2.
-
-### Clone
+### Build & Verify
 
 ```sh
 git clone https://github.com/MacosPorters/betterxen.git
 cd betterxen
-```
 
-### Build
-
-```sh
-scripts/bootstrap.sh
-cargo build --locked -p betterxen
-```
-
-### Run core tests
-
-```sh
+# 1. Build & test the native ARM64 Rust workspace (launcher + shader-transpiler)
 cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build -p bx-cli
+
+# 2. Check host Apple Silicon, Rosetta 2, CrossOver, D3DMetal, and mingw-w64 readiness
+target/debug/bx-cli doctor
+
+# 3. Cross-compile all 16 x86-64 PE32+ shim DLLs + conformance binaries
+#    (automatically verifies every abi/defs/*.def export and zero MinGW runtime DLL deps)
+scripts/build-shims.sh
+
+# 4. Run live synthetic PE32+ conformance tests inside CrossOver + Rosetta 2
+target/debug/bx-cli run --prefix /tmp/bx-test --shims build-shims/bin --log /tmp/bx-test.jsonl --exe build-shims/bin/test_veh_clwb.exe
+target/debug/bx-cli run --prefix /tmp/bx-test --shims build-shims/bin --log /tmp/bx-test.jsonl --exe build-shims/bin/test_shim_exports.exe
+target/debug/bx-cli trace /tmp/bx-test.jsonl
+
+# 5. Check Markdown links & repository hygiene
+python3 scripts/audit/docs_hygiene.py
 ```
 
-The format, lint and test trio is the standard check set. The native Metal
-passes use Metal API and shader validation; `scripts/audit/status.py --check`
-verifies the generated status tables.
+### `bx-cli` Commands
 
-### Run native Metal tests
-
-These require a Metal-capable Apple Silicon Mac.
-
-```sh
-scripts/test-gpu.sh
-```
-
-The native test suite enables Metal API and shader validation and tests the supported compute, rendering and texture paths. The full semantic-review batch defaults to a 300-second timeout; set `XENORA_SEMANTIC_TIMEOUT` to raise or lower it for a slower or faster host. On macOS, the script uses a Python 3 fallback when GNU `timeout` is unavailable.
-
-### Verify guest execution
-
-```sh
-cargo test --locked \
-  --manifest-path experiments/x1/Cargo.toml \
-  --target aarch64-apple-darwin \
-  --features metal
-```
-
-Run the original guest resource integration tests:
-
-```sh
-tests/compat_fixtures/verify-resources.sh
-```
-
-Additional checks:
-
-```sh
-tests/compat_fixtures/verify.sh
-tests/compat_fixtures/verify-compute.sh
-scripts/assemble-fixture.sh --check
-scripts/demo.sh
-```
-
-Some verification paths require additional tools. Refer to the relevant test scripts and documentation before interpreting a missing dependency as a test failure.
-
-### Test evidence
-
-Testing distinguishes between:
-
-- **CPU correctness:** Independent expected values and bounded execution.
-- **Shader compilation:** Decoding, lowering and valid generated Metal source.
-- **Native GPU execution:** Actual GPU work and checked readback.
-- **Guest integration:** Original test executables invoking GPU services and checking results.
-- **Unsupported behavior:** Explicit rejections and documented missing functionality.
-
-Compiling a shader is not equivalent to proving its GPU output is correct.
-
-### Contributing
-
-Contributions are welcome, and several people and coding agents work in this repository at once. To avoid duplicated work:
-
-1. Read every comment on an issue and check for open pull requests that link it.
-2. Claim the issue with a plain reply (for example "I'm taking this. Plan: ...") before you edit anything. The earliest live claim wins, and a claim is stale only after about seven days without a pull request.
-3. Stay inside the files the issue lists, and put `Closes #<n>` in the pull request description.
-4. Sign off every commit (DCO) and use only public documentation and original code. Anyone who has seen leaked or confidential Xbox material must not contribute.
-5. Update `CHANGELOG.md` for meaningful changes. Changes to `main` need maintainer review through [CODEOWNERS](.github/CODEOWNERS).
-
-See [CONTRIBUTING.md](CONTRIBUTING.md), [docs/legal.md](docs/legal.md) and the [documentation index](docs/README.md) for the full rules.
-
-### Where the work is heading
-
-See the [roadmap](docs/roadmap.md) for the current phase and the [changelog](CHANGELOG.md) for unreleased additions. The paused native implementation's open research items are listed under [current limitations](#current-limitations).
+| Command | Purpose |
+| --- | --- |
+| `bx-cli doctor` | Inspects Apple Silicon host, RAM (recommends `lockhart` on 16 GB Macs or `anaconda` on 32 GB+), Rosetta 2, CrossOver, D3DMetal, and `mingw-w64` |
+| `bx-cli probe <pe32+>` | Static PE32+ import scanner that classifies every imported DLL into Tracks A–E or Wine built-ins |
+| `bx-cli shader <blob>` | Classifies a `DXBC` shader container (`DXIL` vs. legacy `SHDR`/`SHEX` vs. `ACCC`/`FSPX`) |
+| `bx-cli run --exe <path> ...` | Launches a PE32+ binary under CrossOver/Wine with `env_clear()` host isolation (`--inherit-env` opt-in), `ROSETTA_ADVERTISE_AVX=1`, `WINEDLLOVERRIDES`, `BX_PROFILE`, and JSONL trace capture |
+| `bx-cli trace <log.jsonl>` | Aggregates `bx_runtime_veh.dll` logs (unimplemented API counts, COM vtable misses, `clwb` VEH traps, ADX tripwires) |
 
 ---
 
-**The goal is to build a trustworthy native Apple Silicon compatibility framework, one verifiable subsystem at a time.**
+## Contributing with Humans & Coding Agents
+
+BetterXen is built for **parallel work across 5–8+ contributors and coding agents** (`AGENTS.md` — symlinked as `CLAUDE.md` — holds the full ruleset):
+
+1. **Pick a track & claim an issue** from [docs/issues/wave-1-backlog.md](docs/issues/wave-1-backlog.md) (or GitHub Issues using `.github/ISSUE_TEMPLATE/track-handoff.yml`). Reply `Claiming — branch: track-<a..f>/<issue>-<slug>` before coding.
+2. **Isolate your branch or worktree:** `git worktree add ../wt-<issue> -b track-<a..f>/<issue>-<slug> origin/main`.
+3. **Stay inside your issue's exclusive file scope:** Never edit another track's directory inside a feature PR. Need a new cross-DLL helper? Open a small `[ABI]` PR touching only `abi/` first.
+4. **Add a conflict-free conformance test:** Drop `tests/conformance/test_<name>/CMakeLists.txt` + `main.cpp` — CMake auto-discovers `test_*` directories with zero edits to shared files.
+5. **Run the verification commands above**, update [CHANGELOG.md](CHANGELOG.md) under `[Unreleased]`, sign off commits (DCO `Signed-off-by`), and open a PR with `Closes #<issue>`.
+
+See [AGENTS.md](AGENTS.md), [CONTRIBUTING.md](CONTRIBUTING.md), [docs/architecture/parallel-tracks.md](docs/architecture/parallel-tracks.md), and [docs/README.md](docs/README.md).
+
+---
+
+## Current Verified Scope & Limitations
+
+- **Verified (local Apple M5, macOS 27.2.1, CrossOver 26.3, Rosetta 2):**
+  - Native ARM64 `bx-cli`, `bx-probe`, `bx-telemetry`, and `dxbc-accc` unit tests.
+  - All 16 x86-64 PE32+ shim DLLs cross-compile with zero warnings, pass strict PE Export Directory verification (102 exact names, ordinals, forwarders, 0 extra exports), and carry zero dynamic MinGW runtime dependencies.
+  - `test_veh_clwb.exe` executes AVX2+FMA, traps and skips `clwb` via `bx_runtime_veh.dll`, and exercises starter `XMemAlloc`/`XMemTransferMemory` under CrossOver/Wine.
+  - `test_shim_exports.exe` loads all 16 shim DLLs and resolves 25 runtime exports via `LoadLibraryA` / `GetProcAddress` inside CrossOver/Wine.
+- **Not yet implemented (M1–M6):**
+  - `d3d12_xs.dll` COM device/command-list/PSO proxy and `PresentX` swapchain presentation.
+  - `xmem.dll` physical/scatter page mapping and `XCRDAPI.dll` async DirectStorage queues.
+  - `xg_xs.dll` RDNA 2 texture tiling/deswizzling and DXR/BVH4 rehydration interception.
+  - Console `ACCC`/`FSPX` RDNA 2 → DXIL/MSL shader transpilation (gated on M2).
+  - Real software audio/DSP decoding behind `AcpHal`/`xapu`/`chad` and full `GameInput` polling.
+  - Commercial Xbox game execution.
+
+---
+
+## Historical Native-First Research
+
+The earlier paused native-first implementation (independent x86-64 interpreter/ARM64 DBT, bounded `gfx1030` RDNA 2 → MSL translator, native Metal backend, and Swift app) was retired from `main` per [ADR 0006](docs/adr/0006-retire-in-tree-native-workspace.md) and remains preserved permanently in Git history at tag `native-first-final`.
 
 ---
 
 ## License
 
-BetterXen is licensed under the [GNU General Public License v3 or later](LICENSE).
+BetterXen is licensed under the [GNU General Public License v3 or later](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [docs/legal.md](docs/legal.md) for attribution and legal scope.
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party attribution and [docs/legal.md](docs/legal.md) for the project's research and legal boundaries.
-
-BetterXen is an independent open-source project and is not affiliated with Microsoft, Xbox, any game publisher or Apple.
-
----
+BetterXen is an independent open-source project and is not affiliated with Microsoft, Xbox, Apple, CodeWeavers, or any game publisher.

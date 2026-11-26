@@ -1,65 +1,52 @@
 # Contributing to BetterXen
 
-BetterXen is hybrid-first Apple Silicon compatibility research built around an externally installed CrossOver, with a preserved but paused independent native implementation. Contributions should improve verified behavior rather than expand untested claims.
+BetterXen is a modular, CrossOver-based Xbox Series (`Scarlett`) compatibility layer for Apple Silicon macOS. Contributions are organized into **6 parallel tracks** so 5–8+ human contributors and coding agents can work simultaneously without merge conflicts.
 
-## Which work is active
+## Active Work & Track Ownership
 
-The only active development track is the CrossOver-based hybrid architecture in [docs/roadmap.md](docs/roadmap.md). Planning is progressive: only the current milestone (Phase 1) has open issues; ideas for later phases are parked in the roadmap. Native research is paused, its backlog is closed and indexed in [docs/research/native-issue-archive.md](docs/research/native-issue-archive.md), and the few native issues still open only have assigned contributors with open pull requests. Do not start native work; if hybrid development needs a native component, file a focused hybrid issue. Pick an open issue in the current milestone and check its dependencies first. The engineering rules in `AGENTS.md` permit CrossOver, Wine-based infrastructure, Rosetta 2 and D3DMetal (subject to licensing) and allow evaluating DXMT, DXVK, VKD3D-Proton and MoltenVK. CrossOver is proprietary: do not bundle or redistribute any of it, and record the exact versions you test. Before adopting or copying any upstream code, verify its license and provenance and add it to the [upstream registry](docs/research/upstream-registry.md); projects built around leaked or unauthorized game builds are not a source of code. Use the issue templates (hybrid task, bug, research, performance, validation, documentation) and fill in the licensing and provenance section.
+The single authoritative plan is [docs/roadmap.md](docs/roadmap.md) (Milestones M0–M6), supported by [docs/architecture/parallel-tracks.md](docs/architecture/parallel-tracks.md) and the ready-to-claim Wave 1 issues in [docs/issues/wave-1-backlog.md](docs/issues/wave-1-backlog.md). The earlier native-first workspace was retired from `main` per [ADR 0006](docs/adr/0006-retire-in-tree-native-workspace.md) and remains preserved permanently at Git tag `native-first-final`.
 
-## Getting started
+1. Pick an open unclaimed issue on your track (A–F) using `.github/ISSUE_TEMPLATE/track-handoff.yml`.
+2. Check all comments and open PRs, then claim in plain text (`Claiming — branch: track-<a..f>/<issue>-<slug>`). A claim with no commits or PR after 7 days is stale and may be taken over with a reply saying so.
+3. Work in a dedicated branch or `git worktree` and stay strictly inside the issue's **exclusive file scope**.
+4. If your track needs a new cross-DLL helper or export, open a small `[ABI]` PR touching only `abi/` first. Once merged, both tracks implement in parallel.
+5. Add new synthetic PE32+ conformance binaries under `tests/conformance/test_<name>/CMakeLists.txt` + `main.cpp` (auto-discovered by CMake — no shared-file edits needed).
 
-- Read `README.md` and, when present, `AGENTS.md`, `docs/interfaces.md`, `docs/status.toml` and the relevant architecture decisions.
-- Discuss substantial changes in an issue before implementing them; small fixes do not require prior approval.
-- Claim an issue before working on it by replying on it in plain words, after checking its comments for an existing claim. Never claim over someone else. A claim with no pull request after about one week may be taken over with a reply saying so. Coding agents follow the same rules; see "Claiming work before you start" in `AGENTS.md`.
-- Use a native ARM64 macOS environment with Rust and the appropriate Xcode/Metal tools. LLVM AMDGPU tools are needed for ISA fixture generation; extra tooling depends on the subsystem.
-- Keep changes focused and preserve existing public interfaces unless a change is justified and documented.
+## Development & Verification
 
-## Development and verification
+Requirements on Apple Silicon macOS: Rust 1.85+ (`aarch64-apple-darwin`), `mingw-w64` & `cmake` (`brew install mingw-w64 cmake`), Python 3.11+, Rosetta 2, and CrossOver 26.3+ (externally installed, never bundled).
 
-When the Cargo workspace exists, run from its root:
+Run these checks before opening a PR:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo build --locked -p bx-cli && lipo -archs target/debug/bx-cli
+scripts/build-shims.sh
+target/debug/bx-cli run --prefix /tmp/bx-test --shims build-shims/bin --log /tmp/bx-test.jsonl --exe build-shims/bin/test_veh_clwb.exe
+target/debug/bx-cli run --prefix /tmp/bx-test --shims build-shims/bin --log /tmp/bx-test.jsonl --exe build-shims/bin/test_shim_exports.exe
+python3 scripts/audit/docs_hygiene.py
 ```
 
-Follow repository documentation for actual GPU tests, fuzzing, mutation testing and benchmarks. Report commands, versions, pass/fail/skip counts and hardware used. A successful shader compile is not successful GPU execution. Do not report unavailable tools or skipped tests as passes.
+Report exact commands, host hardware/macOS/CrossOver versions, and pass/fail/skip counts. Never report a skipped test or unavailable tool as a pass.
 
-For an instruction or compiler change, cite the applicable ISA section, state the exact architecture, document operand and execution-mask semantics, and add tests for encodings, edge cases, unsupported cases and independent expected results. Where applicable, verify the resulting MSL through actual Metal execution. Do not convert unsupported instructions into silent no-ops.
+## Clean-Room, Licensing & Provenance Policy
 
-For a performance change, provide reproducible before-and-after results using equivalent inputs, hardware and settings. For a new dependency, explain why it is needed, verify its license and native ARM64 compatibility, and record its provenance.
+- Use publicly accessible specifications, publicly licensed software, and independently authored synthetic workloads only. Never submit leaked executables or SDKs, confidential Xbox documentation, firmware, keys, proprietary game binaries, or unauthorized shader dumps.
+- Under BetterXen's clean-room policy, anyone who has accessed leaked or confidential Xbox materials must not contribute. Do not post details of restricted material in issues or PRs.
+- Before incorporating third-party code, verify **per-file** license compatibility with `GPL-3.0-or-later`, record provenance in [docs/research/upstream-registry.md](docs/research/upstream-registry.md) and [docs/research/component-reuse-matrix.md](docs/research/component-reuse-matrix.md), preserve copyright notices, and update [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Public visibility or a GPL license does not clear code derived from leaked material.
+- Never bundle or redistribute proprietary components (CrossOver, D3DMetal, Rosetta 2).
+- Never claim Xbox hardware verification (BetterXen has no Xbox hardware access) or independent certification of your own work; classify evidence per [docs/claims.toml](docs/claims.toml).
 
-## Research and clean-room policy
+## Pull Requests & DCO Sign-Off
 
-Use publicly accessible specifications and authorized materials only. Do not submit leaked SDKs, confidential documentation, firmware, keys, proprietary game binaries or unauthorized shader dumps. Under BetterXen's clean-room policy, anyone who has accessed leaked or confidential Xbox materials must not contribute. Do not post details of restricted material in issues or PRs.
-
-Distinguish desktop RDNA behavior from Xbox-specific behavior. Cite primary sources with exact applicable architectures and record uncertainties using the project's evidence classification when available. Tests on Apple GPUs do not establish verification on Xbox hardware.
-
-BetterXen implements its own Rust guest runtime, decoder, typed IR, shader
-compiler and native Metal backend from public technical specifications
-and independently derived tests. Contributions must not copy, port or
-adapt code, decoder tables, internal metadata or implementation
-architecture from other emulators. External results can inform test
-selection. Author the resulting code and fixtures independently.
-
-Before incorporating third-party code, verify per-file license compatibility with GPL-3.0-or-later, record the exact upstream revision and original paths, preserve copyright notices and document changes. Update applicable attribution records. Public visibility alone is not proof of authorization or license compatibility.
-
-## Pull requests
-
-- Branch from the current main branch, keep commits focused, and link relevant issues.
-- Describe what changes and why, link the issue you claimed with `Closes #<number>`, state which checks you actually ran, and disclose material AI assistance. Separate unverified work from supported behavior.
-- Include a clear explanation, tests and any documentation/status updates. Separate unverified work from supported behavior.
-- Disclose material AI assistance and personally review generated changes. AI output is not an authoritative source, test oracle or substitute for independent review.
-- Never include secrets, personal paths, credentials or private data in patches or logs.
-- Do not claim approval from an independent reviewer unless one has actually reviewed the change.
-
-Sign off each commit under the [Developer Certificate of Origin](https://developercertificate.org/):
+- Branch from `main`, keep changes focused inside your track scope, link the issue with `Closes #<number>`, update [CHANGELOG.md](CHANGELOG.md) under `[Unreleased]`, and update [docs/README.md](docs/README.md) when adding or reorganizing docs.
+- Disclose material AI assistance and personally review generated changes. Never include secrets, personal paths, or credentials in patches or logs.
+- Sign off every commit under the [Developer Certificate of Origin](https://developercertificate.org/):
 
 ```sh
 git commit -s -m "Describe the change"
 ```
 
-Use your configured Git identity and a privacy-preserving email address if desired. Sign-off is your certification of the contribution; do not sign off work on another person's behalf. Contributions are subject to the repository license and any applicable, compatible third-party notices.
-
-For security-sensitive findings, see [SECURITY.md](SECURITY.md). Community expectations are in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+See [AGENTS.md](AGENTS.md), [docs/legal.md](docs/legal.md), [SECURITY.md](SECURITY.md), and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).

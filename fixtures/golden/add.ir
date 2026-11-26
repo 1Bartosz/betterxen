@@ -1,4 +1,0 @@
-0000: t0 = load.u32 input[index]
-000c: t1 = const.u32 0x12345678
-0014: t2 = add.u32 t0, t1
-001c: store.u32 output[index], t2
