@@ -19,8 +19,32 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Shims loaded with `LOAD_LIBRARY_SEARCH_SYSTEM32`.
-pub const SYSTEM32_SHIMS: &[&str] = &["xgameruntime.dll"];
+/// Shims loaded with `LOAD_LIBRARY_SEARCH_SYSTEM32` (or shadowed by Wine builtin stubs in
+/// `system32`, which Windows searches before `WINEPATH`).
+pub const SYSTEM32_SHIMS: &[&str] = &["xgameruntime.dll", "GameInput.dll"];
+
+/// Returns true when `bytes` is a Wine `winebuild` fake-DLL placeholder stub in `system32`
+/// (`"MZ"` header, `"Wine builtin DLL\0"` at DOS offset `0x40`, and `"PE\0\0"` at `e_lfanew`).
+///
+/// Wine populates `drive_c/windows/system32/` with fake PE stubs for built-in modules such as
+/// `gameinput.dll`. Unlike user- or installer-provided native DLLs (#474), these placeholders are
+/// created by Wine itself and would otherwise shadow BetterXen shims on `LOAD_LIBRARY_SEARCH_SYSTEM32`
+/// loads (`fixme:ginput:GameInputCreate ... stub!`).
+pub fn is_wine_builtin_dll(bytes: &[u8]) -> bool {
+    const WINE_SIG_OFFSET: usize = 0x40;
+    const WINE_SIG: &[u8] = b"Wine builtin DLL\0";
+    if bytes.len() < WINE_SIG_OFFSET + WINE_SIG.len() + 4 {
+        return false;
+    }
+    if &bytes[0..2] != b"MZ" {
+        return false;
+    }
+    if &bytes[WINE_SIG_OFFSET..WINE_SIG_OFFSET + WINE_SIG.len()] != WINE_SIG {
+        return false;
+    }
+    let pe_off = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
+    pe_off >= WINE_SIG_OFFSET + WINE_SIG.len() && bytes.get(pe_off..pe_off + 4) == Some(b"PE\0\0")
+}
 
 /// `roots` plus, transitively, every import that is itself a file in the shim folder
 /// (`is_shim`). Names are compared case-insensitively, as the Windows loader does, and returned
@@ -220,6 +244,8 @@ pub enum Staged {
     Copied(PathBuf),
     /// An earlier copy staged by this tool, refreshed because the shim changed.
     Replaced(PathBuf),
+    /// A Wine `"Wine builtin DLL"` placeholder stub in `system32`, backed up once and replaced.
+    ReplacedWineStub(PathBuf),
     Unchanged(PathBuf),
     /// A [`SYSTEM32_SHIMS`] file the shim folder does not have.
     Absent(PathBuf),
@@ -230,6 +256,9 @@ impl Staged {
         match self {
             Staged::Copied(p) => format!("staged {}", p.display()),
             Staged::Replaced(p) => format!("refreshed own earlier copy {}", p.display()),
+            Staged::ReplacedWineStub(p) => {
+                format!("replaced Wine builtin stub {} (backup saved)", p.display())
+            }
             Staged::Unchanged(p) => format!("already current {}", p.display()),
             Staged::Absent(p) => format!("not staged, {} not found", p.display()),
         }
@@ -365,6 +394,8 @@ where
                     ));
                 } else if existing.as_deref().map(sha256_hex).as_ref() == owned.get(name) {
                     Staged::Replaced(dst.clone())
+                } else if existing.as_deref().is_some_and(is_wine_builtin_dll) {
+                    Staged::ReplacedWineStub(dst.clone())
                 } else {
                     return Err(foreign(
                         &dst,
@@ -415,6 +446,41 @@ where
                         format!("cannot install {}: {e}", dst.display())
                     }
                 }),
+                // Wine fake-DLL placeholder stub: verify it is still a regular Wine builtin stub,
+                // preserve a one-time backup `.<name>.wine-builtin.bak`, then atomically replace.
+                Staged::ReplacedWineStub(_) => match fs::symlink_metadata(&dst) {
+                    Ok(meta) if meta.is_file() => match fs::read(&dst) {
+                        Ok(now) if is_wine_builtin_dll(&now) => {
+                            let bak = system32.join(format!(".{name}.wine-builtin.bak"));
+                            if fs::symlink_metadata(&bak).is_err() {
+                                let bak_tmp = system32.join(format!(
+                                    ".{name}.wine-builtin.bak.{}.bx-staging",
+                                    std::process::id()
+                                ));
+                                fs::write(&bak_tmp, &now).map_err(|e| {
+                                    let _ = fs::remove_file(&bak_tmp);
+                                    format!("cannot write backup {}: {e}", bak_tmp.display())
+                                })?;
+                                let bak_res = install_new(&bak_tmp, &bak, &now);
+                                let _ = fs::remove_file(&bak_tmp);
+                                match bak_res {
+                                    Ok(()) => {}
+                                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                                    Err(e) => {
+                                        return Err(format!(
+                                            "cannot save Wine stub backup {}: {e}",
+                                            bak.display()
+                                        ));
+                                    }
+                                }
+                            }
+                            fs::rename(&tmp, &dst)
+                                .map_err(|e| format!("cannot replace {}: {e}", dst.display()))
+                        }
+                        _ => Err(foreign(&dst, name, "changed while staging")),
+                    },
+                    _ => Err(foreign(&dst, name, "changed while staging")),
+                },
                 // Still our own earlier copy? Then the rename replaces it in one step.
                 _ => match fs::read(&dst) {
                     Ok(now) if owned.get(name) == Some(&sha256_hex(&now)) => fs::rename(&tmp, &dst)
@@ -511,11 +577,12 @@ mod tests {
         let (_t, shims, prefix) = setup("deps");
         let sys = system32_dir(&prefix);
         let staged = stage(&shims, &sys).unwrap();
-        assert_eq!(staged.len(), 2, "{staged:?}");
+        assert_eq!(staged.len(), 3, "{staged:?}");
         assert_eq!(fs::read(sys.join("bx_runtime_veh.dll")).unwrap(), b"veh v1");
+        assert_eq!(fs::read(sys.join("gameinput.dll")).unwrap(), b"shim v1");
         assert!(
             !sys.join("unrelated.dll").exists(),
-            "only imported shims are staged"
+            "only SYSTEM32_SHIMS and imported shims are staged"
         );
     }
 
@@ -867,16 +934,86 @@ mod tests {
     #[test]
     fn missing_shim_is_reported_and_nothing_is_staged() {
         let (t, shims, prefix) = setup("missing");
-        fs::remove_file(shims.join("xgameruntime.dll")).unwrap();
+        for name in SYSTEM32_SHIMS {
+            fs::remove_file(shims.join(name)).unwrap();
+        }
         assert!(!has_system32_shims(&shims));
         let sys = system32_dir(&prefix);
-        let expected = vec![Staged::Absent(shims.join("xgameruntime.dll"))];
+        let expected: Vec<Staged> = SYSTEM32_SHIMS
+            .iter()
+            .map(|name| Staged::Absent(shims.join(name)))
+            .collect();
         assert_eq!(stage(&shims, &sys).unwrap(), expected);
         assert_eq!(fs::read_dir(&sys).unwrap().count(), 0);
         // With nothing to stage, a prefix without system32 is not an error either.
         let fresh = system32_dir(&t.0.join("fresh"));
         assert_eq!(stage(&shims, &fresh).unwrap(), expected);
         assert!(!fresh.exists());
+    }
+
+    fn make_fake_wine_builtin_pe() -> Vec<u8> {
+        let mut pe = vec![0u8; 0x100];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&(0x80u32).to_le_bytes());
+        pe[0x40..0x51].copy_from_slice(b"Wine builtin DLL\0");
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe
+    }
+
+    #[test]
+    fn replaces_a_wine_builtin_stub_after_saving_a_backup() {
+        let (_t, shims, prefix) = setup("wine-stub");
+        let sys = system32_dir(&prefix);
+        let wine_stub = make_fake_wine_builtin_pe();
+        assert!(is_wine_builtin_dll(&wine_stub));
+        fs::write(sys.join("gameinput.dll"), &wine_stub).unwrap();
+
+        let first = stage(&shims, &sys).unwrap();
+        assert!(first.contains(&Staged::ReplacedWineStub(sys.join("gameinput.dll"))));
+        assert_eq!(fs::read(sys.join("gameinput.dll")).unwrap(), b"shim v1");
+        assert_eq!(
+            fs::read(sys.join(".gameinput.dll.wine-builtin.bak")).unwrap(),
+            wine_stub
+        );
+        let owned = read_manifest(&sys).unwrap();
+        assert_eq!(owned.get("gameinput.dll"), Some(&sha256_hex(b"shim v1")));
+
+        // Subsequent rebuilds refresh our owned copy while keeping the original Wine backup intact.
+        fs::write(shims.join("GameInput.dll"), b"shim v2").unwrap();
+        let second = stage(&shims, &sys).unwrap();
+        assert!(second.contains(&Staged::Replaced(sys.join("gameinput.dll"))));
+        assert_eq!(fs::read(sys.join("gameinput.dll")).unwrap(), b"shim v2");
+        assert_eq!(
+            fs::read(sys.join(".gameinput.dll.wine-builtin.bak")).unwrap(),
+            wine_stub
+        );
+    }
+
+    #[test]
+    fn non_wine_pe_and_symlinks_to_wine_stubs_are_still_refused() {
+        let (t, shims, prefix) = setup("non-wine-pe");
+        let sys = system32_dir(&prefix);
+        // A regular native PE (standard DOS stub, no "Wine builtin DLL" marker) is foreign.
+        let mut native_pe = make_fake_wine_builtin_pe();
+        native_pe[0x40..0x51].copy_from_slice(b"This program can!");
+        assert!(!is_wine_builtin_dll(&native_pe));
+        fs::write(sys.join("gameinput.dll"), &native_pe).unwrap();
+        assert!(stage(&shims, &sys).is_err());
+        assert_eq!(fs::read(sys.join("gameinput.dll")).unwrap(), native_pe);
+
+        // A symlink pointing to a real Wine builtin stub is ALSO refused (never follow links).
+        fs::remove_file(sys.join("gameinput.dll")).unwrap();
+        let wine_target = t.0.join("wine_gameinput.dll");
+        fs::write(&wine_target, make_fake_wine_builtin_pe()).unwrap();
+        std::os::unix::fs::symlink(&wine_target, sys.join("gameinput.dll")).unwrap();
+        let err = stage(&shims, &sys).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(
+            fs::symlink_metadata(sys.join("gameinput.dll"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
