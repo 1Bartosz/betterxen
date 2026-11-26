@@ -10,6 +10,7 @@ Guest execution uses original, purpose-built test programs. Commercial Xbox game
 remains unsupported.
 
 ### Added
+- Added structured unhandled exception logging with module-relative addresses and x64 registers, and expanded the CLWB conformance test to require six traps across ModRM, SIB, REX and RIP-relative operands (#409).
 - Enforced the configured title memory cap for default heap allocations and virtual commits in `xmem.dll`. Added working-set accounting and a synthetic fixture for alignment, commit overlap, decommit, release, and memory transfer (#411).
 - Added a BetterXen-only DirectStorage conformance interface for asynchronous uncompressed file and memory transfers, status arrays, and completion events in `XCRDAPI.dll` (#413).
 - Implemented offline `xgameruntime.dll` task queues and async completion, local user handles, synthetic game-license queries, console identity, and bottle-local storage (#418). Added a synthetic conformance executable for Lockhart and Anaconda launches. Only the marked conformance title receives an active synthetic SKU. The build also produces an unmarked control with the same executable name. Queue shutdown delivers accepted callbacks, and bottle-local storage is keyed by executable path.
