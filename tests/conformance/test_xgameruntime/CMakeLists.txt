@@ -1,0 +1,2 @@
+add_executable(test_xgameruntime main.cpp)
+target_link_libraries(test_xgameruntime PRIVATE xgameruntime kernel32)
