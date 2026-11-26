@@ -16,6 +16,7 @@
  *   --inject bad-window         the main swapchain gets a destroyed window    -> create  (12)
  *   --inject skip-draw          the shader draw is left out of one frame      -> pixels  (15)
  *   --inject wrong-expectation  the CPU expects a blue value that is off by 1 -> pixels  (15)
+ * run_controls.sh runs all three and checks the failing stage and log records of each.
  */
 #ifndef WIDL_EXPLICIT_AGGREGATE_RETURNS
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
@@ -278,6 +279,45 @@ bool log_has(const char* event, const char* needle) {
     return found;
 }
 
+/* Records of `event` containing `needle` written by this run. Zero if there is no log. */
+UINT log_count(const char* event, const char* needle) {
+    char path[MAX_PATH];
+    if (!log_path(path)) return 0;
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    UINT count = 0;
+    LARGE_INTEGER size = {};
+    if (GetFileSizeEx(f, &size) && size.QuadPart > g_log_start && size.QuadPart < (64ll << 20)) {
+        auto* buf = static_cast<char*>(HeapAlloc(GetProcessHeap(), 0, static_cast<SIZE_T>(size.QuadPart) + 1));
+        DWORD got = 0;
+        if (buf && ReadFile(f, buf, static_cast<DWORD>(size.QuadPart), &got, nullptr)) {
+            buf[got] = '\0';
+            char event_key[96];
+            std::snprintf(event_key, sizeof(event_key), "\"event\":\"%s\"", event);
+            for (char* line = buf + g_log_start; line && *line;) {
+                char* end = std::strchr(line, '\n');
+                if (end) *end = '\0';
+                count += std::strstr(line, event_key) && std::strstr(line, needle);
+                line = end ? end + 1 : nullptr;
+            }
+        }
+        if (buf) HeapFree(GetProcessHeap(), 0, buf);
+    }
+    CloseHandle(f);
+    return count;
+}
+
+UINT host_present_count(IBxPresentSwapChain* chain) {
+    IDXGISwapChain1* h = nullptr;
+    UINT count = 0;
+    const bool ok = SUCCEEDED(chain->GetHostSwapChain(__uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&h))) &&
+                    SUCCEEDED(h->GetLastPresentCount(&count));
+    check(ok, "reading the host present count");
+    release(h);
+    return count;
+}
+
 /* ---- Lifetime: the bridge against a swapchain made with host DXGI alone ---------------------- */
 
 /* Attached to a swapchain as private data; it stays referenced for as long as that data lives. */
@@ -329,6 +369,7 @@ bool open_host(HostDxgi& host) {
 struct Retention {
     ULONG holder_refs = 0; /* swapchain references seen while its one owner (app or bridge) holds it */
     LONG retained = 0;     /* witnesses still referenced after every create/release cycle */
+    ULONG released[4] = {}; /* host control: what each final swapchain Release returned */
 };
 
 constexpr int kProbeCycles = 4;
@@ -345,7 +386,7 @@ Retention probe_host(const HostDxgi& host, Witness (&witness)[kProbeCycles]) {
               "control: witness %d must be referenced by the swapchain (refs=%ld)", i, witness[i].refs);
         check(SUCCEEDED(swap->Present(0, 0)), "control: host Present %d", i);
         pump(50);
-        swap->Release();
+        result.released[i] = swap->Release();
         DestroyWindow(window);
         pump(50);
     }
@@ -354,7 +395,7 @@ Retention probe_host(const HostDxgi& host, Witness (&witness)[kProbeCycles]) {
     return result;
 }
 
-Retention probe_bridge(IBxPresentQueue* bridge, Witness (&witness)[kProbeCycles]) {
+Retention probe_bridge(IBxPresentQueue* bridge, Witness (&witness)[kProbeCycles], const Retention& control) {
     Retention result;
     for (int i = 0; i < kProbeCycles; ++i) {
         HWND window = make_window();
@@ -371,13 +412,32 @@ Retention probe_bridge(IBxPresentQueue* bridge, Witness (&witness)[kProbeCycles]
         hr = chain->Present(0, 0);
         check(SUCCEEDED(hr), "bridge Present %d hr=0x%08lx", i, ul(hr));
         pump(50);
+        char path[MAX_PATH], needle[64];
+        std::snprintf(needle, sizeof(needle), "presented=1 swapchain_release_returned=%lu\"", control.released[i]);
+        const UINT before = log_count("present_chain_destroyed", needle);
         check(chain->Release() == 0, "bridge swapchain %d still referenced after its final Release", i);
+        /* An extra bridge reference would raise this above what the host-only control saw. */
+        if (log_path(path)) {
+            check(log_count("present_chain_destroyed", needle) == before + 1,
+                  "bridge swapchain %d: host Release did not return the control's %lu", i, control.released[i]);
+        }
         DestroyWindow(window);
         pump(50);
     }
     pump(300);
     for (const Witness& w : witness) result.retained += w.refs > 1;
     return result;
+}
+
+struct PresentCall {
+    IBxPresentSwapChain* chain;
+    HRESULT result;
+};
+
+DWORD WINAPI present_thread(void* arg) {
+    auto* call = static_cast<PresentCall*>(arg);
+    call->result = call->chain->Present(0, 0);
+    return 0;
 }
 
 } // namespace
@@ -481,6 +541,12 @@ int main(int argc, char** argv) {
         }
         release(compute_bridge);
         release(compute);
+        char path[MAX_PATH];
+        if (log_path(path)) {
+            const UINT args = log_count("present_create_rejected", "invalid window or description");
+            check(args == 7, "bridge logged %u argument rejections, expected 7", args);
+            check(log_count("present_create_rejected", "not a DIRECT queue") == 1, "compute queue rejection not logged");
+        }
     }
 
     /* --- Swapchain ------------------------------------------------------------------------------ */
@@ -615,6 +681,17 @@ int main(int argc, char** argv) {
     hr = host_chain->GetLastPresentCount(&presents_before);
     check(SUCCEEDED(hr), "GetLastPresentCount hr=0x%08lx", ul(hr));
 
+    IDXGISwapChain3* host3 = nullptr;
+    hr = host_chain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&host3));
+    REQUIRE(SUCCEEDED(hr) && host3, "host IDXGISwapChain3 hr=0x%08lx", ul(hr));
+    for (UINT i = 0; i < kBuffers; ++i) {
+        ID3D12Resource* theirs = nullptr;
+        hr = host_chain->GetBuffer(i, __uuidof(ID3D12Resource), reinterpret_cast<void**>(&theirs));
+        std::printf("  buffer %u: bridge=%p host=%p\n", i, static_cast<void*>(back_buffers[i]), static_cast<void*>(theirs));
+        check(SUCCEEDED(hr) && theirs == back_buffers[i], "bridge buffer %u is not the host swapchain's buffer %u", i, i);
+        release(theirs);
+    }
+
     UINT64 slot_value[kBuffers] = {};
     UINT indices_seen = 0;
     UINT frames_presented = 0;
@@ -665,8 +742,13 @@ int main(int argc, char** argv) {
         queue->ExecuteCommandLists(1, lists);
         slot_value[slot] = f + 1;
         REQUIRE(SUCCEEDED(queue->Signal(fence, f + 1)), "frame %u: Signal", f);
+        check(host3->GetCurrentBackBufferIndex() == slot, "frame %u: bridge index %u, host index %u", f, slot,
+              host3->GetCurrentBackBufferIndex());
+        const UINT count_before = host_present_count(chain);
         hr = chain->Present(f % 2, 0); /* alternate immediate and vsync'd presents */
         REQUIRE(SUCCEEDED(hr), "frame %u: Present hr=0x%08lx", f, ul(hr));
+        const UINT advanced = host_present_count(chain) - count_before;
+        check(advanced == 1, "frame %u: host present count advanced by %u", f, advanced);
         ++frames_presented;
         pump(1);
     }
@@ -678,6 +760,7 @@ int main(int argc, char** argv) {
     hr = host_chain->GetLastPresentCount(&presents_after);
     check(SUCCEEDED(hr) && presents_after - presents_before == kFrames,
           "host swapchain counted %u presents, expected %u (hr=0x%08lx)", presents_after - presents_before, kFrames, ul(hr));
+    release(host3);
     release(host_chain);
     check(indices_seen == (1u << kBuffers) - 1, "back buffer indices used: mask 0x%x", indices_seen);
     std::printf("frames_presented=%u host_present_count=%u\n", frames_presented, presents_after - presents_before);
@@ -713,10 +796,16 @@ int main(int argc, char** argv) {
             check(hr == DXGI_ERROR_INVALID_CALL, "present after the window is destroyed: hr=0x%08lx", ul(hr));
             check(orphan->Release() == 0, "orphaned swapchain still referenced");
         }
+        char path[MAX_PATH];
+        if (log_path(path)) {
+            check(log_count("present_rejected", "window_alive=1") == 3 && log_count("present_rejected", "window_alive=0") == 1,
+                  "expected 3 argument and 1 destroyed-window present rejections in the log");
+        }
     }
 
     /* --- Pixels ---------------------------------------------------------------------------------- */
     g_stage = kPixels;
+    REQUIRE(footprint.Footprint.RowPitch >= kWidth * 4, "row pitch %u is too small", footprint.Footprint.RowPitch);
     UINT64 pixels_checked = 0;
     UINT64 pixels_wrong = 0;
     for (UINT f = 0; f < kFrames; ++f) {
@@ -774,12 +863,32 @@ int main(int argc, char** argv) {
             hr = paced->Present(0, 0);
             check(hr == S_OK, "blocked queue, present %u (unused buffer next): hr=0x%08lx", i + 1, ul(hr));
         }
-        const ULONGLONG start = GetTickCount64();
+        UINT count = host_present_count(paced);
+        ULONGLONG start = GetTickCount64();
         hr = paced->Present(0, 0);
-        const ULONGLONG waited = GetTickCount64() - start;
-        check(hr == kTimedOut && waited >= BX_PRESENT_WAIT_MS - 100 && waited < BX_PRESENT_WAIT_MS + 3000,
+        ULONGLONG waited = GetTickCount64() - start;
+        /* No tight upper bound: this time includes the host's own Present. */
+        check(hr == BX_PRESENT_E_NEXT_BUFFER_BUSY && waited >= BX_PRESENT_WAIT_MS - 100,
               "present onto a busy buffer: hr=0x%08lx after %llu ms", ul(hr), static_cast<unsigned long long>(waited));
         std::printf("observed: present_pacing_wait_ms=%llu\n", static_cast<unsigned long long>(waited));
+        check(host_present_count(paced) == count + 1, "a busy-next-buffer result must mean the frame was presented");
+        /*
+         * A retry while still blocked presents nothing. It runs on another thread and holds the
+         * swapchain for the whole wait, so WaitForIdle here must honour its own, shorter timeout.
+         */
+        PresentCall retry = {paced, E_FAIL};
+        HANDLE thread = CreateThread(nullptr, 0, present_thread, &retry, 0, nullptr);
+        REQUIRE(thread != nullptr, "CreateThread");
+        Sleep(500);
+        start = GetTickCount64();
+        hr = paced->WaitForIdle(300);
+        waited = GetTickCount64() - start;
+        check(hr == kTimedOut && waited < 2000, "WaitForIdle behind a Present: hr=0x%08lx after %llu ms", ul(hr),
+              static_cast<unsigned long long>(waited));
+        REQUIRE(WaitForSingleObject(thread, 30000) == WAIT_OBJECT_0, "retry Present did not return");
+        CloseHandle(thread);
+        check(retry.result == kTimedOut && host_present_count(paced) == count + 1, "retry while blocked: hr=0x%08lx",
+              ul(retry.result));
         REQUIRE(SUCCEEDED(gate->Signal(1)), "release the gate");
         check(paced->WaitForIdle(5000) == S_OK, "queue did not drain after the gate opened");
         hr = paced->Present(0, 0);
@@ -787,6 +896,23 @@ int main(int argc, char** argv) {
         check(paced->Release() == 0, "pacing swapchain still referenced");
         release(gate);
         DestroyWindow(paced_window);
+    }
+    {
+        /* Final Release with the queue blocked: the leak branch must still return the proxy reference. */
+        HWND w = make_window();
+        IBxPresentSwapChain* stuck = nullptr;
+        ID3D12Fence* gate = nullptr;
+        const ULONG refs = ref_count(queue);
+        REQUIRE(SUCCEEDED(bridge->CreateSwapChain(w, &kDesc, &stuck)), "leak-path swapchain");
+        hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&gate));
+        REQUIRE(SUCCEEDED(hr) && gate && SUCCEEDED(queue->Wait(gate, 1)), "gate fence hr=0x%08lx", ul(hr));
+        check(stuck->Release() == 0, "blocked swapchain Release");
+        check(ref_count(queue) == refs, "the leak branch kept a queue proxy reference (%lu, wanted %lu)", ref_count(queue), refs);
+        char path[MAX_PATH];
+        if (log_path(path)) check(log_count("present_chain_leaked", "not released") == 1, "no present_chain_leaked record");
+        REQUIRE(SUCCEEDED(gate->Signal(1)), "release the gate");
+        release(gate);
+        /* The window is left open: the leaked swapchain still refers to it. */
     }
 
     /* --- Teardown and repetition ------------------------------------------------------------------ */
@@ -838,10 +964,10 @@ int main(int argc, char** argv) {
         static Witness host_witness[kProbeCycles]; /* static: a retained swapchain may outlive this scope */
         static Witness bridge_witness[kProbeCycles];
         const Retention direct = probe_host(host, host_witness);
-        const Retention bridged = probe_bridge(bridge, bridge_witness);
+        const Retention bridged = probe_bridge(bridge, bridge_witness, direct);
         check(bridged.holder_refs == direct.holder_refs, "swapchain references while held: bridge %lu, host control %lu",
               bridged.holder_refs, direct.holder_refs);
-        check(bridged.retained <= direct.retained, "swapchains retained after release: bridge %ld, host control %ld",
+        check(bridged.retained == direct.retained, "swapchains retained after release: bridge %ld, host control %ld",
               bridged.retained, direct.retained);
         std::printf("observed: swapchain_refs_while_held host=%lu bridge=%lu; retained_after_release host=%ld/%d bridge=%ld/%d\n",
                     direct.holder_refs, bridged.holder_refs, direct.retained, kProbeCycles, bridged.retained, kProbeCycles);

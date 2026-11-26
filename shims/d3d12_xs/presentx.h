@@ -12,7 +12,7 @@
  * Use: QueryInterface the command queue returned by a D3D12XboxCreateDevice device for
  * IID_IBxPresentQueue, then create a swapchain on a Win32 window. No new DLL export is involved.
  *
- * The contract below the bridge is the public DXGI flip model: the caller records its own
+ * This is a subset of the public DXGI flip model, not all of it: the caller records its own
  * resource transitions and every back buffer must be in D3D12_RESOURCE_STATE_PRESENT when it is
  * presented. D3D12 offers no way to query a resource's state, so the bridge cannot check this.
  * ResizeBuffers and fullscreen are not implemented.
@@ -30,8 +30,13 @@ inline const GUID IID_IBxPresentQueue = {0x34127279, 0x2d93, 0x4642, {0x88, 0xa6
 /* {DEC9F73E-DE84-4F87-9167-26203B3A1152} */
 inline const GUID IID_IBxPresentSwapChain = {0xdec9f73e, 0xde84, 0x4f87, {0x91, 0x67, 0x26, 0x20, 0x3b, 0x3a, 0x11, 0x52}};
 
-/* Longest wait Present() performs for the next back buffer, and the destructor for the GPU. */
+/* Longest single GPU wait Present() performs, and the destructor's wait for the GPU. */
 inline constexpr DWORD BX_PRESENT_WAIT_MS = 5000;
+/*
+ * Present() result: the frame WAS handed to the host, but the next back buffer is still busy.
+ * Do not present that frame again. Call WaitForIdle until it returns S_OK before reusing a buffer.
+ */
+inline constexpr HRESULT BX_PRESENT_E_NEXT_BUFFER_BUSY = static_cast<HRESULT>(0x80040201u);
 
 struct BxPresentDesc {
     UINT width;          /* 1..16384; 0 ("use the window size") is not accepted */
@@ -42,9 +47,10 @@ struct BxPresentDesc {
 
 /*
  * One swapchain. Holds a reference on the command queue it was created from.
- * The final Release waits (bounded) for the queue to go idle. If it cannot establish that the
- * GPU has finished, it logs and deliberately leaks the host objects rather than freeing memory
- * that may still be in use. Time spent inside the host's own Release is not bounded: on the
+ * The final Release waits (bounded) for the queue to go idle. If that fails and the device
+ * reports it has not been removed, it logs and deliberately leaks what pending GPU work may
+ * still touch (swapchain, fence, event, host queue) and releases its queue proxy reference.
+ * After device removal everything is released. Time spent inside the host's own Release is not bounded: on the
  * wined3d/vkd3d path (not D3DMetal) an intermittent stall in it was observed.
  */
 struct IBxPresentSwapChain : public IUnknown {
@@ -52,23 +58,31 @@ struct IBxPresentSwapChain : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetBuffer(UINT index, REFIID riid, void** ppv) = 0;
     virtual UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() = 0;
     /*
-     * IDXGISwapChain::Present, then a fence signal on the queue, then a wait until the GPU has
-     * finished the previous use of the back buffer that is now current. Returns the DXGI result
-     * (including success codes such as DXGI_STATUS_OCCLUDED), the first failure, or
-     * HRESULT_FROM_WIN32(ERROR_TIMEOUT) when that wait exceeds BX_PRESENT_WAIT_MS. The bound
-     * covers BetterXen's own wait, not time spent inside the host's Present.
+     * Waits (bounded) until the current back buffer is idle, calls IDXGISwapChain::Present,
+     * signals a fence on the queue, then waits until the next back buffer is idle. Results:
+     *   - a DXGI success code, including DXGI_STATUS_OCCLUDED: presented, next buffer idle;
+     *   - HRESULT_FROM_WIN32(ERROR_TIMEOUT): NOT presented (the current buffer is still busy);
+     *   - BX_PRESENT_E_NEXT_BUFFER_BUSY: presented, see its definition;
+     *   - another failure: the host's Present failure, or a fence or device failure. A fence
+     *     or device failure can follow a successful host Present.
+     * The bounds cover BetterXen's own waits, not time spent inside the host's Present.
      *
      * The bridge itself returns DXGI_ERROR_INVALID_CALL, without calling the host, for a
-     * sync_interval above 4, for any flag (none is supported), and once the window is destroyed.
-     * D3DMetal 3.0 was observed to answer S_OK to all of these.
+     * sync_interval above 4, for any flag (none is supported, including DXGI_PRESENT_TEST),
+     * once the window is destroyed, and when Present or WaitForIdle is re-entered on a thread
+     * already inside one of them. D3DMetal 3.0 was observed to answer S_OK to the first three.
      */
     virtual HRESULT STDMETHODCALLTYPE Present(UINT sync_interval, UINT flags) = 0;
     /*
      * Waits until everything submitted to the queue before this call has finished.
      * INFINITE is rejected with E_INVALIDARG; a timeout returns HRESULT_FROM_WIN32(ERROR_TIMEOUT).
+     * timeout_ms includes any time spent waiting for a Present on another thread.
      */
     virtual HRESULT STDMETHODCALLTYPE WaitForIdle(DWORD timeout_ms) = 0;
-    /* The host DXGI swapchain, for diagnostics and tests. The caller owns the reference. */
+    /*
+     * The host DXGI swapchain, for diagnostics and tests. The caller owns the reference and must
+     * not call Present or ResizeBuffers on it: the bridge's buffer tracking would not follow.
+     */
     virtual HRESULT STDMETHODCALLTYPE GetHostSwapChain(REFIID riid, void** ppv) = 0;
 };
 

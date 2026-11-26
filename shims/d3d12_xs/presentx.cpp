@@ -21,15 +21,20 @@ void log_hr(bx_log_level_t level, const char* event, const char* what, HRESULT h
     bx_log_emit(level, "d3d12_xs", event, detail);
 }
 
-class SrwGuard {
+/* Releases an already acquired lock and records its owner, so re-entry can be refused. */
+class SrwOwner {
 public:
-    explicit SrwGuard(SRWLOCK& lock) : lock_(lock) { AcquireSRWLockExclusive(&lock_); }
-    ~SrwGuard() { ReleaseSRWLockExclusive(&lock_); }
-    SrwGuard(const SrwGuard&) = delete;
-    SrwGuard& operator=(const SrwGuard&) = delete;
+    SrwOwner(SRWLOCK& lock, std::atomic<DWORD>& owner) : lock_(lock), owner_(owner) { owner_ = GetCurrentThreadId(); }
+    ~SrwOwner() {
+        owner_ = 0;
+        ReleaseSRWLockExclusive(&lock_);
+    }
+    SrwOwner(const SrwOwner&) = delete;
+    SrwOwner& operator=(const SrwOwner&) = delete;
 
 private:
     SRWLOCK& lock_;
+    std::atomic<DWORD>& owner_;
 };
 
 class BxPresentSwapChain final : public IBxPresentSwapChain {
@@ -67,6 +72,7 @@ private:
     IDXGISwapChain3* swap_ = nullptr;
     ID3D12Fence* fence_ = nullptr;
     HANDLE event_ = nullptr;
+    std::atomic<DWORD> owner_{0}; /* thread holding lock_ */
     UINT64 last_signaled_ = 0;
     UINT64 presented_ = 0;
     UINT64 buffer_value_[DXGI_MAX_SWAP_CHAIN_BUFFERS] = {};
@@ -238,8 +244,14 @@ void BxPresentSwapChain::destroy() {
         HRESULT idle = idle_locked(BX_PRESENT_WAIT_MS);
         if (FAILED(idle) && SUCCEEDED(removed_reason())) {
             /* The device is alive and the GPU may still be using the back buffers. */
-            log_hr(BX_LOG_ERROR, "present_chain_leaked", "queue not idle; host objects deliberately not released", idle);
+            log_hr(BX_LOG_ERROR, "present_chain_leaked", "queue not idle; GPU-visible objects deliberately not released", idle);
+            /*
+             * swap_, fence_, event_ and host_queue_ stay: pending work may touch them. The proxy
+             * is only BetterXen's wrapper; host_queue_ keeps the host queue alive without it.
+             */
+            ID3D12CommandQueue* proxy = queue_proxy_;
             delete this;
+            proxy->Release();
             return;
         }
     }
@@ -317,8 +329,20 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
         bx_log_emit(BX_LOG_WARN, "d3d12_xs", "present_rejected", detail);
         return DXGI_ERROR_INVALID_CALL;
     }
-    SrwGuard guard(lock_);
+    if (owner_ == GetCurrentThreadId()) {
+        bx_log_emit(BX_LOG_WARN, "d3d12_xs", "present_rejected", "re-entered on the same thread");
+        return DXGI_ERROR_INVALID_CALL;
+    }
+    AcquireSRWLockExclusive(&lock_);
+    SrwOwner guard(lock_, owner_);
     const UINT presented_index = swap_->GetCurrentBackBufferIndex();
+    if (presented_index < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
+        /* Busy only after an earlier BX_PRESENT_E_NEXT_BUFFER_BUSY. Nothing is presented then. */
+        const HRESULT ready = wait_locked(buffer_value_[presented_index], BX_PRESENT_WAIT_MS);
+        if (FAILED(ready)) {
+            return ready;
+        }
+    }
     HRESULT hr = swap_->Present(sync_interval, flags);
     if (FAILED(hr)) {
         char detail[128];
@@ -341,7 +365,7 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
     if (next < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
         sync_hr = wait_locked(buffer_value_[next], BX_PRESENT_WAIT_MS);
         if (FAILED(sync_hr)) {
-            return sync_hr;
+            return sync_hr == kWaitTimedOut ? BX_PRESENT_E_NEXT_BUFFER_BUSY : sync_hr;
         }
     }
     return hr;
@@ -351,8 +375,20 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::WaitForIdle(DWORD timeout_ms) {
     if (timeout_ms == INFINITE) {
         return E_INVALIDARG;
     }
-    SrwGuard guard(lock_);
-    return idle_locked(timeout_ms);
+    if (owner_ == GetCurrentThreadId()) {
+        return DXGI_ERROR_INVALID_CALL;
+    }
+    const ULONGLONG start = GetTickCount64();
+    while (!TryAcquireSRWLockExclusive(&lock_)) {
+        if (GetTickCount64() - start >= timeout_ms) {
+            bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "present_wait_timeout", "swapchain busy in another call");
+            return kWaitTimedOut;
+        }
+        Sleep(1);
+    }
+    SrwOwner guard(lock_, owner_);
+    const ULONGLONG spent = GetTickCount64() - start;
+    return idle_locked(spent < timeout_ms ? static_cast<DWORD>(timeout_ms - spent) : 0);
 }
 
 HRESULT STDMETHODCALLTYPE BxPresentSwapChain::GetHostSwapChain(REFIID riid, void** ppv) {
@@ -440,6 +476,9 @@ private:
 } // namespace
 
 HRESULT bx_present_query_queue(ID3D12CommandQueue* queue_proxy, void** ppv) {
+    if (!ppv) {
+        return E_POINTER;
+    }
     auto* bridge = new (std::nothrow) BxPresentQueue(queue_proxy);
     if (!bridge) {
         *ppv = nullptr;
