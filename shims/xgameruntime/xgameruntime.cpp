@@ -668,7 +668,7 @@ HRESULT WINAPI UninitializeApiImpl() {
     return S_OK;
 }
 
-HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) {
+void WINAPI XErrorReport(HRESULT hr, const char* message) {
     char detail[480];
     const auto prefix = std::snprintf(detail, sizeof(detail), "hr=0x%08lX msg=",
                                       static_cast<unsigned long>(static_cast<uint32_t>(hr)));
@@ -676,7 +676,6 @@ HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) {
     if (used >= sizeof(detail)) used = sizeof(detail) - 1;
     append_escaped(detail, sizeof(detail), &used, message);
     bx_log_emit(BX_LOG_ERROR, "xgameruntime", "XErrorReport", detail);
-    return S_OK;
 }
 
 struct TaskQueueDispatch {
@@ -753,6 +752,7 @@ HRESULT WINAPI QueryApiImpl(const GUID* clsid, const GUID* iid, void** out) {
         bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", "invalid_args");
         return E_POINTER;
     }
+    *out = nullptr;
     if (!clsid || !iid) {
         bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", "invalid_args");
         return E_INVALIDARG;
@@ -771,9 +771,10 @@ HRESULT WINAPI QueryApiImpl(const GUID* clsid, const GUID* iid, void** out) {
         return S_OK;
     }
 
-    char clsid_text[48], iid_text[48], detail[192];
+    char clsid_text[48], iid_text[48], detail[192], symbol[160];
     format_guid(clsid_text, sizeof(clsid_text), clsid);
     format_guid(iid_text, sizeof(iid_text), iid);
+    std::snprintf(symbol, sizeof(symbol), "QueryApiImpl(%s/%s)", clsid_text, iid_text);
     if (family) {
         std::snprintf(detail, sizeof(detail), "iid_mismatch family=%s clsid=%s iid=%s", family->name, clsid_text,
                       iid_text);
@@ -781,6 +782,7 @@ HRESULT WINAPI QueryApiImpl(const GUID* clsid, const GUID* iid, void** out) {
         std::snprintf(detail, sizeof(detail), "unsupported clsid=%s iid=%s", clsid_text, iid_text);
     }
     bx_log_emit(BX_LOG_WARN, "xgameruntime", "QueryApiImpl", detail);
+    BX_STUB_LOG("xgameruntime.dll", symbol);
     return E_NOINTERFACE;
 }
 

@@ -295,7 +295,7 @@ int main() {
     using InitEx2Fn = HRESULT(WINAPI*)(uint32_t, uint32_t, char, const void*);
     using UninitFn = HRESULT(WINAPI*)();
     using QueryFn = HRESULT(WINAPI*)(const GUID*, const GUID*, void**);
-    using ErrorFn = HRESULT(WINAPI*)(HRESULT, const char*);
+    using ErrorFn = void(WINAPI*)(HRESULT, const char*);
     InitFn init_api{};
     InitExFn init_ex{};
     InitEx2Fn init_ex2{};
@@ -337,9 +337,12 @@ int main() {
 
     CHECK(query_api(&xsystem, &xsystem_iid, nullptr) == E_POINTER);
     CHECK(api == sentinel);
-    CHECK(query_api(nullptr, &xsystem_iid, &api) == E_INVALIDARG);
-    CHECK(query_api(&xsystem, nullptr, &api) == E_INVALIDARG);
-    CHECK(query_api(&xsystem, &xsystem_iid, &api) == not_initialized);
+    api = sentinel;
+    CHECK(query_api(nullptr, &xsystem_iid, &api) == E_INVALIDARG && !api);
+    api = sentinel;
+    CHECK(query_api(&xsystem, nullptr, &api) == E_INVALIDARG && !api);
+    api = sentinel;
+    CHECK(query_api(&xsystem, &xsystem_iid, &api) == not_initialized && !api);
     CHECK(init_api(0, 1) == E_INVALIDARG);
     CHECK(init_ex(1, 0, 2) == E_INVALIDARG);
     const ApiInitOptions broken{1u, 1u, {0, 0, 0}, nullptr};
@@ -366,16 +369,30 @@ int main() {
     XGameRuntimeUninitialize();
     CHECK(XStoreCreateContext(nullptr, &probe) == not_initialized);
 
+    const ApiInitOptions default_opts{1u, 0u, {0, 0, 0}, nullptr};
+    CHECK(init_ex2(1, 1, 6, &default_opts) == S_OK);
+    CHECK(XStoreCreateContext(nullptr, &probe) == S_OK && probe);
+    XStoreCloseContextHandle(probe);
+    CHECK(uninit_api() == S_OK);
+    CHECK(XStoreCreateContext(nullptr, &probe) == not_initialized);
+
     CHECK(init_api(1, 1) == S_OK);
-    api = nullptr;
-    CHECK(query_api(&xsystem, &xsystem_iid, &api) == S_OK && api);
+    const uint32_t families[][2] = {
+        {0xB7581001, 0xB7581002}, {0xB7581101, 0xB7581102}, {0xB7581201, 0xB7581202},
+        {0xB7581301, 0xB7581302}, {0xB7581401, 0xB7581402}, {0xB7581501, 0xB7581502},
+    };
     struct SystemHead {
         uint32_t(WINAPI* get_device_type)();
     };
-    CHECK(static_cast<SystemHead*>(api)->get_device_type() == XSystemGetDeviceType());
-    api = sentinel;
-    CHECK(query_api(&xsystem, &wrong_iid, &api) == E_NOINTERFACE && api == sentinel);
-
+    for (const auto& ids : families) {
+        const GUID clsid = family_guid(ids[0]);
+        const GUID iid = family_guid(ids[1]);
+        void* table = nullptr;
+        CHECK(query_api(&clsid, &iid, &table) == S_OK && table);
+        if (ids[0] == 0xB7581401) {
+            CHECK(static_cast<SystemHead*>(table)->get_device_type() == XSystemGetDeviceType());
+        }
+    }
     struct LogSpan {
         bool from_file = false;
         char path[512]{};
@@ -426,16 +443,26 @@ int main() {
         bool has(const char* needle) const { return std::strstr(text, needle) != nullptr; }
     } span;
     CHECK(span.start());
+    api = sentinel;
+    const auto mismatched = query_api(&xsystem, &wrong_iid, &api);
+    CHECK(mismatched == E_NOINTERFACE && !api);
+    api = sentinel;
     const auto unsupported = query_api(&bogus, &bogus, &api);
-    const auto reported = error_report(E_FAIL, "synthetic-gdk-error");
-    const auto reported_null = error_report(E_FAIL, nullptr);
+    error_report(E_FAIL, "synthetic-gdk-error");
+    error_report(E_FAIL, nullptr);
+    error_report(E_FAIL, "err \"quoted\" \\path\nline2");
     span.finish();
-    CHECK(unsupported == E_NOINTERFACE && api == sentinel);
-    CHECK(reported == S_OK && reported_null == S_OK);
+    CHECK(unsupported == E_NOINTERFACE && !api);
     CHECK(span.has("\"sub\":\"xgameruntime\",\"event\":\"QueryApiImpl\"") && span.has("unsupported clsid=DEADBEEF"));
+    CHECK(span.has("\"event\":\"unimpl_api\"") &&
+          span.has("xgameruntime.dll!QueryApiImpl(B7581401-5853-4000-8000-000000000001/"
+                   "B75814FF-5853-4000-8000-000000000001)") &&
+          span.has("xgameruntime.dll!QueryApiImpl(DEADBEEF-0000-0000-1100-000000000000/"
+                   "DEADBEEF-0000-0000-1100-000000000000)"));
     CHECK(span.has("\"sub\":\"xgameruntime\",\"event\":\"XErrorReport\"") &&
           span.has("hr=0x80004005 msg=synthetic-gdk-error"));
     CHECK(span.has("hr=0x80004005 msg=(null)"));
+    CHECK(span.has("msg=err \\\"quoted\\\" \\\\path line2"));
     XGameRuntimeUninitialize();
     CHECK(XStoreCreateContext(nullptr, &probe) == not_initialized);
 
