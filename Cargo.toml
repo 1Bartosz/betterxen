@@ -3,6 +3,7 @@ members = [
     "launcher/crates/bx-cli",
     "launcher/crates/bx-probe",
     "launcher/crates/bx-telemetry",
+    "shader-transpiler/crates/d3dmetal-harness",
     "shader-transpiler/crates/dxbc-accc",
 ]
 exclude = ["legacy-native"]
