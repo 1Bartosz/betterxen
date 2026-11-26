@@ -7,6 +7,8 @@
  * Field meanings follow the public D3D12 resource and footprint documents
  * (D3D12_RESOURCE_DIMENSION, D3D12_SUBRESOURCE_FOOTPRINT, and
  * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT / D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT).
+ * Block-compressed footprint width and height are texels rounded up to the
+ * 4x4 block, the same rounding D3D12 uses for a copyable footprint.
  * Format numbers are the public DXGI_FORMAT values. This is not the Xbox
  * GDK XG interface and it is not an Xbox hardware result.
  */
@@ -75,8 +77,8 @@ typedef struct bx_xg_resource_desc {
 
 typedef struct bx_xg_subresource_footprint {
     uint32_t format;
-    uint32_t width;  /* texels */
-    uint32_t height; /* texels */
+    uint32_t width;  /* texels, rounded up to the format block width */
+    uint32_t height; /* texels, rounded up to the format block height */
     uint32_t depth;
     uint32_t row_pitch; /* bytes, multiple of BX_XG_LINEAR_PITCH_ALIGNMENT */
 } bx_xg_subresource_footprint;
@@ -94,6 +96,13 @@ static const GUID BX_IID_IXGTextureAddressComputer = {
 static const GUID BX_IID_IUnknown = {
     0x00000000u, 0x0000u, 0x0000u, {0xC0u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x46u}};
 
+/*
+ * GetResourceLayout places every subresource at its absolute offset from
+ * base_offset, including subresources before first_subresource. total_bytes
+ * runs from base_offset through the aligned end of the last requested
+ * subresource, so a partial range still reports a total that covers the
+ * earlier subresources.
+ */
 typedef struct bx_xg_texture_computer bx_xg_texture_computer;
 
 typedef struct bx_xg_texture_computer_vtbl {

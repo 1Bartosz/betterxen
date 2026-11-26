@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include "bx_log.h"
@@ -12,6 +13,7 @@
  * Linear 2D layouts follow the public D3D12 copy footprint rules:
  *   mip size     = max(1, base >> mip)
  *   block count  = ceil(texels / block), at least 1
+ *   footprint    = block count times the block size (D3D12 rounds texels up)
  *   row bytes    = block_columns * bytes_per_block
  *   row pitch    = align_up(row_bytes, 256)
  *   subresource  = row_pitch * block_rows
@@ -58,8 +60,10 @@ struct TextureComputer {
 
 struct Placement {
     uint64_t offset;
-    uint32_t width;
+    uint32_t width; /* logical texels, used for element bounds */
     uint32_t height;
+    uint32_t footprint_width; /* texels rounded up to the block */
+    uint32_t footprint_height;
     uint32_t depth;
     uint32_t row_pitch;
     uint32_t row_count;
@@ -211,7 +215,12 @@ static bool layout_is_tiled(uint32_t layout) {
 }
 
 static HRESULT validate_desc(const bx_xg_resource_desc* desc, Resolved* out) {
-    if (desc->dimension == BX_XG_DIMENSION_TEXTURE1D || desc->dimension == BX_XG_DIMENSION_TEXTURE3D) {
+    if (desc->dimension == BX_XG_DIMENSION_TEXTURE1D) {
+        BX_STUB_LOG("xg_xs.dll", "XGCreateTextureComputer TEXTURE1D");
+        return E_NOTIMPL;
+    }
+    if (desc->dimension == BX_XG_DIMENSION_TEXTURE3D) {
+        BX_STUB_LOG("xg_xs.dll", "XGCreateTextureComputer TEXTURE3D");
         return E_NOTIMPL;
     }
     if (desc->dimension != BX_XG_DIMENSION_TEXTURE2D) {
@@ -234,6 +243,7 @@ static HRESULT validate_desc(const bx_xg_resource_desc* desc, Resolved* out) {
         return E_INVALIDARG;
     }
     if (desc->sample_desc.count != 1u) {
+        BX_STUB_LOG("xg_xs.dll", "XGCreateTextureComputer MSAA");
         return E_NOTIMPL;
     }
     if (desc->layout != BX_XG_LAYOUT_LINEAR && !layout_is_tiled(desc->layout)) {
@@ -307,7 +317,16 @@ static HRESULT reject_if_tiled(const TextureComputer* obj, uint32_t slot, const 
     query.texel_y = 0u;
     const HRESULT hr = rdna2_sw64kb_prepare(&query);
     if (hr == E_NOTIMPL) {
-        BX_VTABLE_STUB_LOG("IXGTextureAddressComputer", slot, method);
+        const Rdna2TileMode* mode = nullptr;
+        for (const Rdna2TileMode& candidate : kRdna2TileModes) {
+            if (candidate.mode == obj->resolved.layout) {
+                mode = &candidate;
+                break;
+            }
+        }
+        char label[80];
+        std::snprintf(label, sizeof(label), "%s %s", method, mode && mode->name ? mode->name : "SW_64KB");
+        BX_VTABLE_STUB_LOG("IXGTextureAddressComputer", slot, label);
     }
     return hr;
 }
@@ -325,9 +344,14 @@ static HRESULT measure_mip(const Resolved* resolved, uint32_t mip, Placement* pl
     if (!align_up_u64(row_bytes, kPitchAlignment, &row_pitch) || row_pitch > UINT32_MAX) {
         return E_INVALIDARG;
     }
+    if (blocks_w > UINT32_MAX / resolved->block_w || blocks_h > UINT32_MAX / resolved->block_h) {
+        return E_INVALIDARG;
+    }
     place->offset = 0;
     place->width = width;
     place->height = height;
+    place->footprint_width = blocks_w * resolved->block_w;
+    place->footprint_height = blocks_h * resolved->block_h;
     place->depth = 1u;
     place->row_pitch = static_cast<uint32_t>(row_pitch);
     place->row_count = blocks_h;
@@ -421,8 +445,8 @@ static void sink_layout(void* ctx, uint32_t slot, const Placement* place) {
     auto* out = static_cast<LayoutOut*>(ctx);
     out->layouts[slot].offset = place->offset;
     out->layouts[slot].footprint.format = place->format;
-    out->layouts[slot].footprint.width = place->width;
-    out->layouts[slot].footprint.height = place->height;
+    out->layouts[slot].footprint.width = place->footprint_width;
+    out->layouts[slot].footprint.height = place->footprint_height;
     out->layouts[slot].footprint.depth = place->depth;
     out->layouts[slot].footprint.row_pitch = place->row_pitch;
     out->row_counts[slot] = place->row_count;

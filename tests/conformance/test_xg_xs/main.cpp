@@ -237,8 +237,27 @@ static void test_hand_layouts() {
         return;
     }
     check_hr("bc1 partial layout", computer->lpVtbl->GetResourceLayout(computer, 0, 1, 0, layouts, rows, row_bytes, &total), S_OK);
-    /* ceil(5/4)=2 columns, ceil(3/4)=1 row, 16 byte row, payload 256, total 512. */
-    check(rows[0] == 1u && row_bytes[0] == 16u && layouts[0].footprint.width == 5u && total == 512u, "bc1 5x3");
+    /* 5x3 texels round to an 8x4 footprint: 2 block columns, 1 block row, 16 byte row, total 512. */
+    check(rows[0] == 1u && row_bytes[0] == 16u && layouts[0].footprint.width == 8u &&
+              layouts[0].footprint.height == 4u && total == 512u,
+          "bc1 5x3");
+    check_hr("bc1 5x3 texel", computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, 4, 2, 0, &offset), S_OK);
+    check(offset == 8u, "bc1 5x3 texel (4,2) stays inside the logical 5x3");
+    offset = 0x99u;
+    check_hr("bc1 past logical width",
+             computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, 5, 0, 0, &offset),
+             E_INVALIDARG);
+    check(offset == 0x99u, "padding texels outside 5x3 are not addressable");
+    release_computer(computer);
+
+    desc = desc_2d(DXGI_FORMAT_BC7_UNORM, 6, 5, 1, 1, BX_XG_LAYOUT_LINEAR);
+    computer = create_ok(&desc, "create bc7 6x5");
+    if (!computer) {
+        return;
+    }
+    check_hr("bc7 6x5 layout", computer->lpVtbl->GetResourceLayout(computer, 0, 1, 0, layouts, rows, row_bytes, &total), S_OK);
+    check(layouts[0].footprint.width == 8u && layouts[0].footprint.height == 8u && rows[0] == 2u && row_bytes[0] == 32u,
+          "bc7 6x5 rounds to 8x8");
     release_computer(computer);
 
     desc = desc_2d(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 2, 1, BX_XG_LAYOUT_LINEAR);
@@ -480,6 +499,12 @@ static void test_swizzle_placeholder() {
                  computer->lpVtbl->CopyIntoSubresource(computer, dest, sizeof(dest), 0, src, sizeof(src), 0, 0),
                  E_NOTIMPL);
         check(bytes_are(dest, sizeof(dest), 0x3C), "tiled copy writes nothing");
+        std::memset(dest, 0x3C, sizeof(dest));
+        check_hr("tiled copy from",
+                 computer->lpVtbl->CopyFromSubresource(computer, dest, sizeof(dest), 0, 0, src, sizeof(src), 0),
+                 E_NOTIMPL);
+        check(bytes_are(dest, sizeof(dest), 0x3C), "tiled copy from writes nothing");
+        check(bytes_are(src, sizeof(src), 0x5A), "tiled copy from leaves the source");
         release_computer(computer);
     }
     check(XGSuggestSwizzleMode(BX_XG_DIMENSION_TEXTURE2D, DXGI_FORMAT_BC7_UNORM, 32, 32, 1, 0, 1, 0) == BX_XG_LAYOUT_LINEAR,
