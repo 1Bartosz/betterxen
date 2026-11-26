@@ -1,5 +1,6 @@
 //! Track A (M1-A1): Native ARM64 macOS CLI for BetterXen hybrid execution.
 
+mod stage;
 mod supervise;
 
 use std::collections::BTreeMap;
@@ -435,6 +436,30 @@ fn bottle_options(backend: Option<&str>) -> Vec<String> {
     options
 }
 
+/// The CrossOver Wine environment for a bare `--prefix` (bottles get theirs from `bin/wine`).
+fn apply_prefix_env(command: &mut Command, cx_root: &Path, prefix: &Path, wineloader: &Path) {
+    command
+        .env("WINEPREFIX", prefix)
+        .env("WINESERVER", cx_root.join("bin/wineserver"))
+        .env("WINELOADER", wineloader)
+        .env(
+            "WINEDLLPATH",
+            format!(
+                "{}:{}",
+                cx_root.join("lib/wine").display(),
+                cx_root.join("lib64/wine").display()
+            ),
+        )
+        .env(
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            format!(
+                "{}:{}:/usr/lib",
+                cx_root.join("lib64").display(),
+                cx_root.join("lib").display()
+            ),
+        );
+}
+
 fn cmd_run(args: &[String]) -> ExitCode {
     let run = match parse_run_args(args) {
         Ok(run) => run,
@@ -482,6 +507,51 @@ fn cmd_run(args: &[String]) -> ExitCode {
         None => resolved_prefix.clone(),
     };
 
+    // #457: shims loaded with LOAD_LIBRARY_SEARCH_SYSTEM32 never see WINEPATH, so they are
+    // copied into the environment's system32 first. A bare prefix is initialized for that.
+    let system32 = stage::system32_dir(&environment_dir);
+    if bottle.is_none() && !system32.is_dir() {
+        let _ = fs::create_dir_all(&resolved_prefix);
+        let mut boot = Command::new(&wineloader);
+        boot.args(["wineboot", "--init"]);
+        apply_host_env(&mut boot, inherit_env);
+        apply_prefix_env(&mut boot, cx_root, &resolved_prefix, &wineloader);
+        boot.env("WINEDEBUG", "-all");
+        match boot.status() {
+            Ok(st) if st.success() => {}
+            Ok(st) => {
+                eprintln!(
+                    "error: wineboot --init failed for {}: {st}",
+                    resolved_prefix.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!(
+                    "error: cannot run wineboot for {}: {e}",
+                    resolved_prefix.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    match stage::stage_system32(&abs_shims, &system32) {
+        Ok(staged) => {
+            for item in &staged {
+                eprintln!("bx-cli: {}", item.describe());
+            }
+        }
+        Err(e) => {
+            let hint = if bottle.is_some() {
+                " (start the bottle once so CrossOver creates it)"
+            } else {
+                ""
+            };
+            eprintln!("error: cannot stage system32 shims: {e}{hint}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let mut cmd = if let Some(ref bname) = bottle {
         let mut c = Command::new(&wine_wrapper);
         c.args(["--bottle", bname])
@@ -498,25 +568,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     apply_host_env(&mut cmd, inherit_env);
 
     if bottle.is_none() {
-        cmd.env("WINEPREFIX", &resolved_prefix)
-            .env("WINESERVER", cx_root.join("bin/wineserver"))
-            .env("WINELOADER", &wineloader)
-            .env(
-                "WINEDLLPATH",
-                format!(
-                    "{}:{}",
-                    cx_root.join("lib/wine").display(),
-                    cx_root.join("lib64/wine").display()
-                ),
-            )
-            .env(
-                "DYLD_FALLBACK_LIBRARY_PATH",
-                format!(
-                    "{}:{}:/usr/lib",
-                    cx_root.join("lib64").display(),
-                    cx_root.join("lib").display()
-                ),
-            );
+        apply_prefix_env(&mut cmd, cx_root, &resolved_prefix, &wineloader);
     }
 
     cmd.env("ROSETTA_ADVERTISE_AVX", "1")
