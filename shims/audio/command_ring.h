@@ -45,6 +45,7 @@ struct Connection {
     uintptr_t id;
     Connection* next;
     CommandRing queue;
+    uint32_t max_streams = 0;
     bool active = false;
 };
 
@@ -58,7 +59,7 @@ uintptr_t next_id = 2;
 uintptr_t next_id = 1;
 #endif
 
-HRESULT connect(void** out) {
+HRESULT connect(void** out, uint32_t max_streams = 0) {
     if (!out) return E_POINTER;
     *out = nullptr;
     std::lock_guard guard(connections_lock);
@@ -66,6 +67,7 @@ HRESULT connect(void** out) {
     auto* c = new (std::nothrow) Connection;
     if (!c) return E_OUTOFMEMORY;
     c->id = next_id;
+    c->max_streams = max_streams;
     next_id += 2;
     c->next = connections;
     connections = c;

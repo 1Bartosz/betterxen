@@ -34,8 +34,9 @@ struct Allocation {
 };
 Allocation* allocations;
 std::mutex heap_lock;
-uint64_t capacity = UINT32_MAX;
-uint64_t used;
+uint64_t capacity = 0;
+uint64_t used = 0;
+bool heap_created = false;
 }
 
 extern "C" {
@@ -59,7 +60,10 @@ HRESULT WINAPI AcpHalReleaseShapeContexts(void) {
 HRESULT WINAPI ApuCreateHeap(uint32_t cached, uint32_t non_cached) {
     std::lock_guard guard(heap_lock);
     if (allocations) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    // Invariant: allocations == nullptr implies used == 0; reset explicitly.
+    used = 0;
     capacity = uint64_t(cached) + non_cached;
+    heap_created = true;
     return S_OK;
 }
 
@@ -71,7 +75,7 @@ HRESULT WINAPI ApuAlloc(void** va, uint32_t* apu, uint32_t size, uint32_t alignm
     if (alignment < 64) alignment = 64;
     if (!size) size = 64;
     std::lock_guard guard(heap_lock);
-    if (size > capacity - used) return E_OUTOFMEMORY;
+    if (!heap_created || size > capacity - used) return E_OUTOFMEMORY;
     uint64_t base = alignment;
     Allocation** link = &allocations;
     while (*link && base + size > (*link)->base) {

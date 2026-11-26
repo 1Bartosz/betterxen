@@ -2,7 +2,14 @@
 #include "command_ring.h"
 
 extern "C" {
-HRESULT WINAPI XDspConnectWithMaximumStreamLimit(uint32_t, void** out) { return connect(out); }
+// Validate and record the caller's stream limit; the synthetic command ring
+// holds a fixed 32-packet backlog independent of stream count.
+HRESULT WINAPI XDspConnectWithMaximumStreamLimit(uint32_t max_streams, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!max_streams) return E_INVALIDARG;
+    return connect(out, max_streams);
+}
 HRESULT WINAPI XDspDisconnect(void* handle) { return disconnect(handle); }
 
 HRESULT WINAPI XDspActivate(void* handle) {

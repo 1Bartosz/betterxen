@@ -33,9 +33,18 @@ int main() {
     auto* hal = static_cast<IUnknown*>(object);
     CHECK(hal->QueryInterface(IID_IUnknown, &object) == S_OK && object == hal);
     CHECK(hal->Release() == 1);
-    CHECK(ApuCreateHeap(64, 64) == S_OK);
     void *va = nullptr, *second = nullptr;
     uint32_t base = 0, other = 0;
+    CHECK(ApuAlloc(&va, &base, 64, 64) == E_OUTOFMEMORY && !va && !base);
+    CHECK(ApuCreateHeap(64, 64) == S_OK);
+    CHECK(ApuAlloc(&va, nullptr, 64, 64) == S_OK && va);
+    CHECK(ApuFree(va) == S_OK);
+    va = nullptr;
+    CHECK(ApuAlloc(nullptr, &base, 64, 64) == S_OK && base);
+    va = ApuMapApuAddress(base);
+    CHECK(va && ApuFree(va) == S_OK);
+    va = nullptr;
+    base = 0;
     CHECK(ApuAlloc(&va, &base, 64, 256) == S_OK && va && base);
     CHECK(reinterpret_cast<uintptr_t>(va) % 256 == 0 && base % 256 == 0);
     CHECK(ApuAlloc(&second, &other, 64, 64) == S_OK && other != base);
@@ -98,7 +107,8 @@ int main() {
     CHECK(XApuDisconnect(apu) == S_OK && XApuDisconnect(peer) == S_OK);
     CHECK(XApuEnqueueCommand(apu, &result, sizeof(result)) == E_HANDLE);
 
-    CHECK(XDspConnectWithMaximumStreamLimit(2, &dsp) == S_OK);
+    CHECK(XDspConnectWithMaximumStreamLimit(0, &dsp) == E_INVALIDARG && !dsp);
+    CHECK(XDspConnectWithMaximumStreamLimit(2, &dsp) == S_OK && dsp);
     for (unsigned cycle = 0; cycle < 2; ++cycle) {
         unsigned queued = 0;
         HRESULT hr = S_OK;
@@ -123,9 +133,22 @@ int main() {
     CHECK(create(&object) == S_OK && object == input && input->Release() == 1);
     CHECK(input->QueryInterface(IID_IUnknown, &object) == S_OK && object == input);
     CHECK(input->Release() == 1);
-    auto** table = *reinterpret_cast<void***>(input);
+    constexpr GUID kGameInputV0 = {0x11be2a7e, 0x4254, 0x445a,
+                                   {0x9c, 0x09, 0xff, 0xc4, 0x0f, 0x00, 0x69, 0x18}};
+    constexpr GUID kUnknownIid = {0x00000001, 0x0002, 0x0003,
+                                  {0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b}};
+    void* unknown = reinterpret_cast<void*>(uintptr_t{1});
+    CHECK(input->QueryInterface(kUnknownIid, &unknown) == E_NOINTERFACE && !unknown);
+    void* v0_obj = nullptr;
+    CHECK(input->QueryInterface(kGameInputV0, &v0_obj) == S_OK && v0_obj == input);
+    auto* v0 = static_cast<IUnknown*>(v0_obj);
+    auto** table = *reinterpret_cast<void***>(v0);
+    using Timestamp = uint64_t (WINAPI*)(IUnknown*);
+    CHECK(reinterpret_cast<Timestamp>(table[3])(v0) > 0);
     using Reading = HRESULT (WINAPI*)(IUnknown*, uint32_t, void*, void**);
-    CHECK(reinterpret_cast<Reading>(table[4])(input, 0, nullptr, &object) == E_NOTIMPL && !object);
+    void* reading = reinterpret_cast<void*>(uintptr_t{1});
+    CHECK(reinterpret_cast<Reading>(table[4])(v0, 0, nullptr, &reading) == E_NOTIMPL && !reading);
+    CHECK(v0->Release() == 1);
     CHECK(input->Release() == 0);
     FreeLibrary(dll);
     std::puts("PASS: audio mappings, APU and DSP queues, GameInput ordinal 1");
