@@ -129,15 +129,6 @@ public:
 
     explicit CompletionTask(AsyncBlock* block) : block(block), callback(block->callback) {}
 
-    ~CompletionTask() override {
-        if (!sequence || thread) return;
-        // The final handle to an undrained manual completion port was closed.
-        std::lock_guard lock(state_mutex);
-        auto state = read_state(block);
-        state.callback_pending = false;
-        write_state(block, state);
-    }
-
     void run(const QueueRef&) override {
         {
             std::lock_guard lock(state_mutex);
@@ -173,26 +164,35 @@ public:
 
     ~AsyncTask() override {
         if (!queued) return;
-        // No caller can dispatch this work after the final manual port handle closes.
+        // Submission lost the race with queue close. No callback was accepted.
         std::lock_guard lock(state_mutex);
         auto state = read_state(block);
-        state.status = E_ABORT;
+        state.status = E_HANDLE;
         state.callback_pending = false;
         write_state(block, state);
     }
 
     void run(const QueueRef& queue) override {
-        const bool entitled = operation == Operation::game_license && fixture_entitlement();
+        finish(queue, false);
+    }
+
+    void cancel(const QueueRef& queue) override {
+        finish(queue, true);
+    }
+
+private:
+    void finish(const QueueRef& queue, bool canceled) {
+        const bool entitled = !canceled && operation == Operation::game_license && fixture_entitlement();
         {
             std::lock_guard lock(state_mutex);
             auto state = read_state(block);
-            state.status = state.cancel_requested ? E_ABORT : S_OK;
+            state.status = (canceled || state.cancel_requested) ? E_ABORT : S_OK;
             state.entitled = entitled;
             if (completion) completion->sequence = state.sequence;
             queued = false;
             write_state(block, state);
         }
-        if (completion) submit(queue, Port::completion, std::move(completion));
+        if (completion) submit(queue, Port::completion, std::move(completion), true);
     }
 };
 
@@ -224,8 +224,7 @@ HRESULT begin(AsyncBlock* block, Operation operation, void* store = nullptr) {
                             false, block->callback != nullptr, false, false});
         work->queued = true;
     }
-    submit(queue, Port::work, std::move(work));
-    return S_OK;
+    return submit(queue, Port::work, std::move(work)) ? S_OK : E_HANDLE;
 }
 
 HRESULT check_result(AsyncBlock* block, Operation expected, AsyncState& state) {
@@ -294,14 +293,21 @@ HRESULT storage_path(wchar_t (&path)[MAX_PATH]) {
     const wchar_t* name = nullptr;
     const auto hr = executable_name(module, name);
     if (FAILED(hr)) return hr;
-    constexpr auto prefix_length = std::size(storage_root) - 1;
-    if (prefix_length + 1 + std::wcslen(name) >= MAX_PATH) {
-        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+    // Hash the full Windows path so identically named workloads in separate
+    // directories get distinct storage within the same bottle.
+    wchar_t normalized[MAX_PATH];
+    if (!LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, module, -1,
+                       normalized, MAX_PATH, nullptr, nullptr, 0)) {
+        return HRESULT_FROM_WIN32(GetLastError());
     }
-    std::wmemcpy(path, storage_root, prefix_length);
-    path[prefix_length] = L'\\';
-    std::wcscpy(path + prefix_length + 1, name);
-    return S_OK;
+    uint64_t path_id = 14695981039346656037ULL;
+    for (auto* ch = normalized; *ch; ++ch) {
+        path_id ^= static_cast<uint16_t>(*ch);
+        path_id *= 1099511628211ULL;
+    }
+    const auto length = std::swprintf(path, MAX_PATH, L"%ls\\%016llx", storage_root,
+                                      static_cast<unsigned long long>(path_id));
+    return length < 0 ? HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE) : S_OK;
 }
 
 HRESULT create_storage(const wchar_t* path) {

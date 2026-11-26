@@ -39,14 +39,14 @@ public:
             return S_OK;
         }
 
-        bool push(std::unique_ptr<Task> task) {
-            if (mode == DispatchMode::immediate) {
+        bool push(std::unique_ptr<Task> task, bool is_completion) {
+            std::unique_lock lock(mutex);
+            if (closed && !is_completion) return false;
+            if (mode == DispatchMode::immediate || (closed && mode == DispatchMode::manual)) {
+                lock.unlock();
                 task->run(owner->shared_from_this());
                 return true;
             }
-
-            std::lock_guard lock(mutex);
-            if (closed) return false;
             auto* tail = task.get();
             (last ? last->next : first) = std::move(task);
             last = tail;
@@ -75,20 +75,22 @@ public:
             return task;
         }
 
-        void close_manual() {
-            if (mode != DispatchMode::manual) return;
+        void close(const QueueRef& queue) {
             std::unique_lock lock(mutex);
             closed = true;
             ready.notify_all();
+            if (mode != DispatchMode::manual) return;
+
             while (first) {
                 auto task = pop();
                 lock.unlock();
-                task.reset();
+                task->cancel(queue);
                 lock.lock();
             }
         }
 
         bool dispatch(uint32_t timeout) {
+            if (mode == DispatchMode::immediate) return false;
             std::unique_lock lock(mutex);
             const auto has_task = [this] { return closed || (first && !serial_running); };
             if (timeout == INFINITE) {
@@ -165,6 +167,7 @@ struct CallbackTask final : Task {
 
     CallbackTask(Callback callback, void* context) : callback(callback), context(context) {}
     void run(const QueueRef&) override { callback(context, false); }
+    void cancel(const QueueRef&) override { callback(context, true); }
 };
 
 } // namespace
@@ -183,8 +186,8 @@ QueueRef acquire_queue(void* handle) {
     return it == handles.end() ? QueueRef{} : it->second;
 }
 
-bool submit(const QueueRef& queue, Port port, std::unique_ptr<Task> task) {
-    return queue->lanes[static_cast<uint32_t>(port)].push(std::move(task));
+bool submit(const QueueRef& queue, Port port, std::unique_ptr<Task> task, bool is_completion) {
+    return queue->lanes[static_cast<uint32_t>(port)].push(std::move(task), is_completion);
 }
 
 } // namespace bx::gdk
@@ -212,19 +215,19 @@ HRESULT WINAPI XTaskQueueCreate(DispatchMode work, DispatchMode completion, void
 
 void WINAPI XTaskQueueCloseHandle(void* handle) {
     QueueRef queue;
-    bool close_manual = false;
+    bool close_queue = false;
     {
         std::lock_guard lock(queues_mutex);
         const auto it = handles.find(reinterpret_cast<uintptr_t>(handle));
         if (it == handles.end()) return;
         queue = std::move(it->second);
-        close_manual = queue != process_queue;
+        close_queue = queue != process_queue;
         handles.erase(it);
     }
-    // Custom queues have one public handle in the frozen ABI. Once closed, nobody
-    // can drain a manual port. Pool callbacks still own and finish their work.
-    if (close_manual) {
-        for (auto& lane : queue->lanes) lane.close_manual();
+    // The frozen ABI exposes no termination or duplicate-handle API. Drain manual
+    // completion callbacks on close and let accepted pool work finish normally.
+    if (close_queue) {
+        for (auto& lane : queue->lanes) lane.close(queue);
     }
 }
 

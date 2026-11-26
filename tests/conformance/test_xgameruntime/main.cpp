@@ -89,6 +89,11 @@ void CALLBACK record_thread(void* context, bool canceled) {
     *static_cast<DWORD*>(context) = GetCurrentThreadId();
 }
 
+void CALLBACK record_canceled(void* context, bool canceled) {
+    CHECK(canceled);
+    ++*static_cast<unsigned*>(context);
+}
+
 struct SerialCallbacks {
     std::atomic<unsigned> count{0};
     HANDLE done;
@@ -126,11 +131,14 @@ void check_storage() {
     SpaceInfo space{};
     CHECK(XPersistentLocalStorageGetSpaceInfo(&space) == S_OK);
     CHECK(space.total > 0 && space.available <= space.free && space.free <= space.total);
+    std::printf("storage path: %s\n", path);
 }
 
 } // namespace
 
+#ifndef BX_TEST_UNENTITLED
 extern "C" __declspec(dllexport) void BetterXenSyntheticStoreFixture() {}
+#endif
 
 int main() {
     char profile[16]{};
@@ -139,10 +147,11 @@ int main() {
     CHECK(anaconda || std::strcmp(profile, "lockhart") == 0);
     CHECK(XSystemGetDeviceType() == (anaconda ? 7u : 6u));
 
-    char module[MAX_PATH]{};
-    CHECK(GetModuleFileNameA(nullptr, module, MAX_PATH) > 0);
-    const char* name = std::strrchr(module, '\\');
-    const bool entitled = std::strcmp(name ? name + 1 : module, "test_xgameruntime.exe") == 0;
+#ifdef BX_TEST_UNENTITLED
+    constexpr bool entitled = false;
+#else
+    constexpr bool entitled = true;
+#endif
 
     Async uninitialized{};
     CHECK(FAILED(XUserAddAsync(1, &uninitialized)));
@@ -213,14 +222,28 @@ int main() {
     CHECK(XUserAddResult(&async, &user) == E_ABORT && !user);
     CHECK(!XTaskQueueDispatch(queue, completion, 0));
     CHECK(XUserAddAsync(0, &async) == S_OK);
+    unsigned dropped = 0;
+    CHECK(XTaskQueueSubmitCallback(queue, work, &dropped, record_canceled) == S_OK);
+    CHECK(XTaskQueueSubmitCallback(queue, completion, &dropped, record_canceled) == S_OK);
     XTaskQueueCloseHandle(queue);
-    CHECK(XAsyncGetStatus(&async, true) == E_ABORT && result.count == 3);
+    CHECK(dropped == 2 && result.count == 4 && result.status == E_ABORT);
+    CHECK(XAsyncGetStatus(&async, true) == E_ABORT);
     CHECK(!XTaskQueueDispatch(queue, completion, 0));
+    CHECK(XUserAddAsync(0, &async) == E_HANDLE && result.count == 4);
+
+    CHECK(XTaskQueueCreate(manual, manual, &queue) == S_OK);
+    async = {queue, &result, completed, {}};
+    CHECK(XUserAddAsync(0, &async) == S_OK);
+    CHECK(XTaskQueueDispatch(queue, work, 0) && result.count == 4);
+    XTaskQueueCloseHandle(queue);
+    CHECK(result.count == 5 && result.status == S_OK);
+    CHECK(XUserAddResult(&async, &user) == S_OK);
+    XUserCloseHandle(user);
 
     CHECK(XTaskQueueCreate(pool, manual, &queue) == S_OK);
     async = {queue, &result, completed, {}};
     CHECK(XUserAddAsync(0, &async) == S_OK);
-    CHECK(XTaskQueueDispatch(queue, completion, timeout_ms) && result.count == 4);
+    CHECK(XTaskQueueDispatch(queue, completion, timeout_ms) && result.count == 6);
     CHECK(XUserAddResult(&async, &user) == S_OK);
     XUserCloseHandle(user);
     XTaskQueueCloseHandle(queue);
@@ -228,7 +251,7 @@ int main() {
     async = {nullptr, &result, completed, {}};
     CHECK(XUserAddAsync(0, &async) == S_OK);
     CHECK(XAsyncGetStatus(&async, true) == S_OK);
-    CHECK(result.count == 5 && result.thread != main_thread);
+    CHECK(result.count == 7 && result.thread != main_thread);
     CHECK(XUserAddResult(&async, &user) == S_OK);
     XUserCloseHandle(user);
 
@@ -236,6 +259,7 @@ int main() {
     task_thread = 0;
     CHECK(XTaskQueueSubmitCallback(queue, completion, &task_thread, record_thread) == S_OK);
     CHECK(task_thread == main_thread);
+    CHECK(!XTaskQueueDispatch(queue, completion, INFINITE));
     SerialCallbacks serial{0, CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     CHECK(serial.done);
     for (unsigned i = 0; i < 8; ++i) {
