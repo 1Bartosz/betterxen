@@ -9,6 +9,9 @@ exact revision and known limitations.
 Guest execution uses original, purpose-built test programs. Commercial Xbox game execution
 remains unsupported.
 
+### Fixed
+- `test_integration_boot.exe` now creates a real texture address computer, checks a two-mip layout against hand-computed values and requires its release to free it, instead of reporting that stage as pending after a null-descriptor probe (#446).
+
 ### Added
 - Added file-mapping-backed 64 KiB and 2 MiB physical pages, contiguous and scatter aliases (including intra-span duplicate-tag aliasing), exact-span unmap validation, physical region queries (`bx_xmem_query_region`), and shared working-set accounting / combined title memory budget enforcement across heap, virtual, and physical allocations in `xmem.dll`. Synthetic `XMemAllocatePhysicalPages` / `XMemFreePhysicalPages` signatures follow Win32 AWE (`memoryapi.h`) pending a public console flag encoding (#412).
 - Added Win32 bridge conformance coverage for a hidden window, message dispatch, concurrent PSM registrations, and per-event JSONL log verification. Offline PSM registration tokens are tracked without C++ exceptions using disjoint family tags so cross-family unregisters log `foreign_token` and retired or invalid tokens log `unknown_token` (#410).
