@@ -9,7 +9,7 @@ BetterXen is organized so **5 to 8+ contributors** can develop the CrossOver-bas
 | `abi/` | Shared (frozen) | C headers + `.def` | Cross-DLL contracts (`bx_log.h`, `bx_config.h`, `bx_xmem_internal.h`, `bx_shader_bridge.h`) and canonical DLL export lists |
 | `launcher/` | Track A | Rust (`aarch64-apple-darwin`) | Native ARM64 macOS CLI (`bx-cli`), PE32+ static probe (`bx-probe`), JSONL trace aggregator (`bx-telemetry`) |
 | `shims/runtime_veh/` | Track A | C++20 (`mingw-w64`) | `bx_runtime_veh.dll`: `clwb` VEH handler, `adcx`/`adox` tripwire, Lockhart/Anaconda config, JSONL trace logger |
-| `shims/win32_bridge/` | Track A | C++20 (`mingw-w64`) | PSM AppNotify stubs + `ext-ms-win-rtcore-ntuser-*` → `user32.dll` forwarders |
+| `shims/win32_bridge/` | Track A | C++20 (`mingw-w64`) | PSM AppNotify stubs + `ext-ms-win-rtcore-ntuser-*` → `user32.dll` forwarders; not loaded for static imports under CrossOver ([ADR 0007](../adr/0007-api-set-shims-under-crossover.md)) |
 | `shims/xmem/` | Track B | C++20 (`mingw-w64`) | `xmem.dll`: physical/virtual/scatter memory allocator, `__XMemAllocationHooks__`, 16 GB Lockhart cap |
 | `shims/xcrdapi/` | Track B | C++20 (`mingw-w64`) | `XCRDAPI.dll`: DirectStorage async I/O factory, queues, and decompression |
 | `shims/d3d12_xs/` | Track C1 | C++20 (`mingw-w64`) | `d3d12_xs.dll`: Xbox D3D12 COM proxy over Wine `d3d12.dll` (D3DMetal 3.0), `PresentX`, placed resources |
