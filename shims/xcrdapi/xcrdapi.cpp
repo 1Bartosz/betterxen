@@ -144,22 +144,79 @@ struct Entry {
     UINT64 value = 0;
 };
 
-HRESULT read_request(HANDLE file, const Request& request) {
-    if (!request.size) return S_OK;
+template<class T>
+struct ComRelease {
+    T* pointer = nullptr;
+    ~ComRelease() { if (pointer) pointer->Release(); }
+    void** out() { return reinterpret_cast<void**>(&pointer); }
+};
+
+struct WinEvent {
+    HANDLE handle = nullptr;
+    ~WinEvent() { if (handle) CloseHandle(handle); }
+};
+
+// Queue::EnqueueRequest is vtable slot 3: IUnknown occupies 0..2.
+constexpr UINT kEnqueueRequestSlot = 3;
+
+void log_compression(UINT compression) {
+    const char* method = "compression";
+    if (compression == compression_lz) method = "compression_lz";
+    else if (compression == compression_bcpack) method = "compression_bcpack";
+    else if (compression == compression_gdeflate) method = "compression_gdeflate";
+    BX_VTABLE_STUB_LOG("Queue", kEnqueueRequestSlot, method);
+}
+
+bool cpu_visible_heap(const D3D12_HEAP_PROPERTIES& heap) {
+    if (heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK) return true;
+    if (heap.Type != D3D12_HEAP_TYPE_CUSTOM) return false;
+    return heap.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE
+        || heap.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+}
+
+D3D12_RESOURCE_DESC buffer_desc(UINT64 width) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = width;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    return desc;
+}
+
+void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
+                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+    if (!list || !resource || before == after) return;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    list->ResourceBarrier(1, &barrier);
+}
+
+HRESULT read_bytes(HANDLE file, UINT64 offset, void* destination, const void* source, DWORD size) {
+    if (!size) return S_OK;
+    if (!destination) return E_INVALIDARG;
     if (!file) {
-        std::memmove(request.destination, request.source, request.size);
+        if (!source) return E_INVALIDARG;
+        std::memmove(destination, source, size);
         return S_OK;
     }
 
     OVERLAPPED operation{};
-    operation.Offset = static_cast<DWORD>(request.file_offset);
-    operation.OffsetHigh = static_cast<DWORD>(request.file_offset >> 32);
+    operation.Offset = static_cast<DWORD>(offset);
+    operation.OffsetHigh = static_cast<DWORD>(offset >> 32);
     operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!operation.hEvent) return win32_error();
 
     DWORD bytes = 0;
     HRESULT result = S_OK;
-    if (!ReadFile(file, request.destination, request.size, &bytes, &operation)) {
+    if (!ReadFile(file, destination, size, &bytes, &operation)) {
         const DWORD error = GetLastError();
         if (error != ERROR_IO_PENDING) {
             result = HRESULT_FROM_WIN32(error);
@@ -168,8 +225,119 @@ HRESULT read_request(HANDLE file, const Request& request) {
         }
     }
     CloseHandle(operation.hEvent);
-    if (SUCCEEDED(result) && bytes != request.size) return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+    if (SUCCEEDED(result) && bytes != size) return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
     return result;
+}
+
+HRESULT write_mapped(HANDLE file, const Request& request) {
+    D3D12_RANGE no_read{0, 0};
+    void* mapped = nullptr;
+    const HRESULT map_hr = request.resource->Map(0, &no_read, &mapped);
+    if (FAILED(map_hr)) return map_hr;
+    if (!mapped) {
+        request.resource->Unmap(0, nullptr);
+        return E_FAIL;
+    }
+    auto* destination = static_cast<unsigned char*>(mapped) + static_cast<SIZE_T>(request.resource_offset);
+    const HRESULT read_hr = read_bytes(file, request.file_offset, destination, request.source, request.size);
+    D3D12_RANGE written{
+        static_cast<SIZE_T>(request.resource_offset),
+        static_cast<SIZE_T>(request.resource_offset + request.size)};
+    request.resource->Unmap(0, &written);
+    return read_hr;
+}
+
+// Default-heap buffers are not mapped. Stage the bytes in an upload resource and
+// copy them on the device that owns `dest`, which must be in D3D12_RESOURCE_STATE_COMMON.
+HRESULT copy_staged(HANDLE file, const Request& request) {
+    ComRelease<ID3D12Device> device;
+    HRESULT hr = request.resource->GetDevice(__uuidof(ID3D12Device), device.out());
+    if (FAILED(hr) || !device.pointer) return FAILED(hr) ? hr : E_FAIL;
+
+    D3D12_HEAP_PROPERTIES upload_heap{};
+    upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    const D3D12_RESOURCE_DESC upload_desc = buffer_desc(request.size);
+    ComRelease<ID3D12Resource> upload;
+    hr = device.pointer->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
+                                                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                 __uuidof(ID3D12Resource), upload.out());
+    if (FAILED(hr) || !upload.pointer) return FAILED(hr) ? hr : E_FAIL;
+
+    D3D12_RANGE no_read{0, 0};
+    void* mapped = nullptr;
+    hr = upload.pointer->Map(0, &no_read, &mapped);
+    if (FAILED(hr) || !mapped) {
+        if (SUCCEEDED(hr)) upload.pointer->Unmap(0, nullptr);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    hr = read_bytes(file, request.file_offset, mapped, request.source, request.size);
+    upload.pointer->Unmap(0, nullptr);
+    if (FAILED(hr)) return hr;
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ComRelease<ID3D12CommandQueue> queue;
+    hr = device.pointer->CreateCommandQueue(&queue_desc, __uuidof(ID3D12CommandQueue), queue.out());
+    if (FAILED(hr) || !queue.pointer) return FAILED(hr) ? hr : E_FAIL;
+
+    ComRelease<ID3D12CommandAllocator> allocator;
+    hr = device.pointer->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                __uuidof(ID3D12CommandAllocator), allocator.out());
+    if (FAILED(hr) || !allocator.pointer) return FAILED(hr) ? hr : E_FAIL;
+
+    ComRelease<ID3D12GraphicsCommandList> list;
+    hr = device.pointer->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.pointer, nullptr,
+                                           __uuidof(ID3D12GraphicsCommandList), list.out());
+    if (FAILED(hr) || !list.pointer) return FAILED(hr) ? hr : E_FAIL;
+
+    transition(list.pointer, request.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    list.pointer->CopyBufferRegion(request.resource, request.resource_offset, upload.pointer, 0, request.size);
+    transition(list.pointer, request.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    hr = list.pointer->Close();
+    if (FAILED(hr)) return hr;
+
+    ID3D12CommandList* lists[] = {list.pointer};
+    queue.pointer->ExecuteCommandLists(1, lists);
+
+    ComRelease<ID3D12Fence> fence;
+    hr = device.pointer->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), fence.out());
+    if (FAILED(hr) || !fence.pointer) return FAILED(hr) ? hr : E_FAIL;
+    hr = queue.pointer->Signal(fence.pointer, 1);
+    if (FAILED(hr)) return hr;
+
+    WinEvent done;
+    done.handle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!done.handle) return win32_error();
+    hr = fence.pointer->SetEventOnCompletion(1, done.handle);
+    if (FAILED(hr)) return hr;
+    const DWORD waited = WaitForSingleObject(done.handle, 10000);
+    if (waited == WAIT_OBJECT_0) return S_OK;
+    if (waited == WAIT_TIMEOUT) return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+    return win32_error();
+}
+
+HRESULT fulfill(HANDLE file, const Request& request) {
+    if (request.compression) {
+        log_compression(request.compression);
+        return E_NOTIMPL;
+    }
+    if (!request.size) return S_OK;
+    if (!request.resource) return read_bytes(file, request.file_offset, request.destination, request.source, request.size);
+
+    const D3D12_RESOURCE_DESC desc = request.resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return E_INVALIDARG;
+    if (request.resource_offset > desc.Width
+        || static_cast<UINT64>(request.size) > desc.Width - request.resource_offset) {
+        return E_INVALIDARG;
+    }
+
+    D3D12_HEAP_PROPERTIES heap{};
+    const HRESULT heap_hr = request.resource->GetHeapProperties(&heap, nullptr);
+    if (SUCCEEDED(heap_hr)) {
+        return cpu_visible_heap(heap) ? write_mapped(file, request) : copy_staged(file, request);
+    }
+    const HRESULT mapped = write_mapped(file, request);
+    return SUCCEEDED(mapped) ? mapped : copy_staged(file, request);
 }
 
 // Each queue is drained serially, in FIFO order, by a single threadpool work item.
@@ -184,18 +352,30 @@ public:
 
     HRESULT STDMETHODCALLTYPE EnqueueRequest(const Request* request) override {
         constexpr UINT64 max_file_offset = std::numeric_limits<LONGLONG>::max();
-        if (!request || (request->file && request->source)
-            || (request->size && (!request->destination || (!request->source && !request->file)))
-            || (request->file && (request->file_offset > max_file_offset - request->size))) {
+        if (!request
+            || (request->file && request->source)
+            || (request->destination && request->resource)
+            || (request->size && !request->destination && !request->resource)
+            || (request->size && !request->source && !request->file)
+            || (request->file && request->file_offset > max_file_offset - request->size)
+            || (request->resource && request->size
+                && request->resource_offset > std::numeric_limits<UINT64>::max() - request->size)) {
             return E_INVALIDARG;
         }
         Entry entry{Kind::request, *request};
+        if (request->resource) request->resource->AddRef();
         if (request->file && !request->compression) {
             const HRESULT result = request->file->GetHandle(&entry.handle);
-            if (FAILED(result)) return result;
+            if (FAILED(result)) {
+                if (request->resource) request->resource->Release();
+                return result;
+            }
         }
         const HRESULT result = enqueue(entry);
-        if (FAILED(result) && entry.handle) CloseHandle(entry.handle);
+        if (FAILED(result)) {
+            if (entry.handle) CloseHandle(entry.handle);
+            if (request->resource) request->resource->Release();
+        }
         return result;
     }
 
@@ -321,13 +501,9 @@ private:
             HRESULT result = S_OK;
             switch (entry.kind) {
                 case Kind::request:
-                    if (entry.request.compression) {
-                        BX_STUB_LOG("XCRDAPI.dll", "compression");
-                        result = E_NOTIMPL;
-                    } else {
-                        result = read_request(entry.handle, entry.request);
-                    }
+                    result = fulfill(entry.handle, entry.request);
                     if (entry.handle) CloseHandle(entry.handle);
+                    if (entry.request.resource) entry.request.resource->Release();
                     break;
                 case Kind::status:
                     entry.status->complete(entry.index, status_error_);

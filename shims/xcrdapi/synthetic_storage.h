@@ -2,6 +2,11 @@
 #define BETTERXEN_SYNTHETIC_STORAGE_H
 
 #include <windows.h>
+// Host d3d12.dll returns large structs through a hidden pointer. The toolchain
+// header only matches that ABI when this macro is set.
+#ifndef WIDL_EXPLICIT_AGGREGATE_RETURNS
+#define WIDL_EXPLICIT_AGGREGATE_RETURNS
+#endif
 #include <d3d12.h>
 #include <unknwn.h>
 
@@ -26,9 +31,14 @@ struct Status : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetResult(UINT index) = 0;
 };
 
-// Requests keep source and destination buffers borrowed until completion.
+// BetterXen-defined request. Borrowed CPU pointers stay valid until completion.
 // File requests retain a duplicate of the file handle when enqueued.
-// Exactly one of `file` or `source` may be non-null; setting both returns E_INVALIDARG.
+// Exactly one of `file` or `source` may be non-null.
+// A non-zero `size` needs exactly one of `destination` (CPU memory) or `resource`
+// (an ID3D12Resource buffer written at `resource_offset`). CPU-visible heaps are
+// mapped. A default heap is copied on the device GetDevice returns and must be
+// in D3D12_RESOURCE_STATE_COMMON across that copy.
+// `compression` values are BetterXen-defined selectors, not an Xbox enum.
 struct Request {
     File* file;
     UINT64 file_offset;
@@ -36,7 +46,14 @@ struct Request {
     void* destination;
     DWORD size;
     UINT compression;
+    ID3D12Resource* resource = nullptr;
+    UINT64 resource_offset = 0;
 };
+
+inline constexpr UINT compression_none = 0;
+inline constexpr UINT compression_lz = 1;
+inline constexpr UINT compression_bcpack = 2;
+inline constexpr UINT compression_gdeflate = 3;
 
 struct ErrorRecord {
     HRESULT first_error;
