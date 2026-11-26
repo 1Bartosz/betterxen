@@ -114,6 +114,7 @@ int g_pending = 0;
 int g_fail = 0;
 const char* volatile g_current_stage = "process_start";
 volatile LONG g_error_exceptions = 0;
+LPTOP_LEVEL_EXCEPTION_FILTER g_prev_unhandled_filter = nullptr;
 
 const char* status_name(Status s) {
     switch (s) {
@@ -168,6 +169,9 @@ LONG WINAPI unhandled_fault(PEXCEPTION_POINTERS ep) {
                 g_seq, g_current_stage, code, addr);
     std::printf("FAIL: test_integration_boot (unhandled fault in stage %s)\n", g_current_stage);
     std::fflush(stdout);
+    if (g_prev_unhandled_filter) {
+        g_prev_unhandled_filter(ep);
+    }
     ExitProcess(3);
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -398,11 +402,11 @@ void stage_clwb(const bx_runtime_config_t* cfg) {
     if (!data_intact) {
         checkpoint("clwb_veh", Status::Fail, "buffer contents changed across clwb");
     } else if (delta == kForms) {
-        checkpoint("clwb_veh", Status::Pass, "%llu/%llu clwb forms trapped and skipped by bx_runtime_veh (veh_enabled=%u)",
+        checkpoint("clwb_veh", Status::Pass, "%llu/%llu (3 of 6) clwb forms trapped and skipped by bx_runtime_veh (veh_enabled=%u)",
                    static_cast<unsigned long long>(delta), static_cast<unsigned long long>(kForms), veh_enabled);
     } else if (delta == 0) {
         checkpoint("clwb_veh", Status::Pass,
-                   "%llu clwb forms executed without raising an illegal-instruction trap (trap delta 0, veh_enabled=%u)",
+                   "%llu (3 of 6) clwb forms executed without raising an illegal-instruction trap (trap delta 0, veh_enabled=%u)",
                    static_cast<unsigned long long>(kForms), veh_enabled);
     } else {
         checkpoint("clwb_veh", Status::Fail, "trap delta %llu is neither 0 nor %llu",
@@ -729,7 +733,7 @@ bool strict_requested(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-    SetUnhandledExceptionFilter(unhandled_fault);
+    g_prev_unhandled_filter = SetUnhandledExceptionFilter(unhandled_fault);
     PVOID fault_handle = AddVectoredExceptionHandler(0, fault_counter);
     const bool strict = strict_requested(argc, argv);
 
@@ -842,6 +846,7 @@ int main(int argc, char** argv) {
         checkpoint("shutdown", Status::Fail, "dsp_closed=%d apu_closed=%d error_exceptions=%ld", dsp_closed, apu_closed, faults);
     }
     if (fault_handle) RemoveVectoredExceptionHandler(fault_handle);
+    SetUnhandledExceptionFilter(g_prev_unhandled_filter);
 
     /* --- Summary ---------------------------------------------------------- */
     const bool ok = g_fail == 0 && !(strict && g_pending > 0);
