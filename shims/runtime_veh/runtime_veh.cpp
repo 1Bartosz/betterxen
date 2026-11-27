@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <intrin.h>
 
 #include "bx_config.h"
 #include "bx_log.h"
@@ -17,6 +18,14 @@ LPTOP_LEVEL_EXCEPTION_FILTER g_previous_filter = nullptr;
 std::atomic_flag g_crash_logged{};
 std::atomic<bool> g_crash_in_flight{false};
 std::atomic<uint64_t> g_clwb_traps{0};
+
+// Other AMD-only instructions Rosetta 2 (and Intel CPUs) raise #UD on. Their
+// counts reach the JSONL trace only: the frozen .def has no export for them.
+enum AmdKind { kClzero, kMonitorx, kMwaitx, kRdpru, kExtrq, kInsertq, kAmdKinds };
+constexpr const char* kAmdEvents[kAmdKinds] = {
+    "clzero_trapped", "monitorx_trapped", "mwaitx_trapped",
+    "rdpru_trapped", "extrq_trapped", "insertq_trapped"};
+std::atomic<uint64_t> g_amd_traps[kAmdKinds]{};
 bx_runtime_config_t g_config = {
     BX_ABI_VERSION,
     BX_PROFILE_LOCKHART,
@@ -135,6 +144,167 @@ bool is_adx_opcode(const uint8_t* ip, size_t size) {
     return size - idx >= 4 && ip[idx] == 0x0F && ip[idx + 1] == 0x38 && ip[idx + 2] == 0xF6;
 }
 
+// Logs the first trap of a kind and then every power of two, as for clwb.
+void log_sampled_trap(const char* event, uint64_t count, uint64_t rip, size_t len) {
+    if (count == 1 || (count & (count - 1)) == 0) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "rip=0x%016llx len=%zu total_traps=%llu",
+                      static_cast<unsigned long long>(rip), len,
+                      static_cast<unsigned long long>(count));
+        bx_log_emit(BX_LOG_INFO, "runtime_veh", event, msg);
+    }
+}
+
+// The instruction encodings and architectural effects below are derived from
+// AMD APM vol. 3 (24594, rev. 3.36), Instruction Prefixes and CLZERO, MONITORX,
+// MWAITX, RDPRU, and vol. 4 (26568, rev. 3.25), EXTRQ and INSERTQ.
+struct AmdInstruction {
+    AmdKind kind = kAmdKinds;
+    size_t length = 0;
+    bool address32 = false;
+    size_t destination = 0;
+    size_t source = 0;
+    bool immediate = false;
+    uint16_t field = 0;
+};
+
+AmdInstruction decode_amd_instruction(const uint8_t* bytes, size_t size) {
+    if (size < 3) {
+        return {};
+    }
+
+    const bool address32 = bytes[0] == 0x67;
+    const bool extract = bytes[0] == 0x66;
+    const bool insert = bytes[0] == 0xF2;
+    size_t offset = (address32 || extract || insert) ? 1 : 0;
+    uint8_t rex = 0;
+    if ((bytes[offset] & 0xF0) == 0x40) {
+        rex = bytes[offset++];
+    }
+    if (size - offset < 3 || bytes[offset] != 0x0F) {
+        return {};
+    }
+
+    const uint8_t opcode = bytes[offset + 1];
+    const uint8_t operand = bytes[offset + 2];
+    const size_t length = offset + 3;
+    if (!extract && !insert && opcode == 0x01) {
+        switch (operand) {
+        case 0xFC: return {kClzero, length, address32};
+        case 0xFA: return {kMonitorx, length, address32};
+        case 0xFB: return address32 ? AmdInstruction{} : AmdInstruction{kMwaitx, length};
+        case 0xFD: return address32 ? AmdInstruction{} : AmdInstruction{kRdpru, length};
+        default: return {};
+        }
+    }
+
+    if ((!extract && !insert) || (opcode != 0x78 && opcode != 0x79) ||
+        (operand & 0xC0) != 0xC0) {
+        return {};
+    }
+    const bool immediate = opcode == 0x78;
+    const unsigned reg = (operand & 0x38) >> 3;
+    if (immediate && (size - length < 2 || (extract && reg != 0))) {
+        return {};
+    }
+
+    const size_t rm = (operand & 7) + ((rex & 1) ? 8 : 0);
+    AmdInstruction result{extract ? kExtrq : kInsertq, length};
+    result.destination = extract && immediate ? rm : reg + ((rex & 4) ? 8 : 0);
+    result.source = rm;
+    result.immediate = immediate;
+    if (immediate) {
+        result.length += 2;
+        result.field = static_cast<uint16_t>(bytes[length + 1] * 256u + bytes[length]);
+    }
+    return result;
+}
+
+void apply_sse4a(const AmdInstruction& instruction, CONTEXT& context) {
+    M128A* registers = context.FltSave.XmmRegisters;
+    M128A& destination = registers[instruction.destination];
+    const M128A source = registers[instruction.source];
+    const bool extract = instruction.kind == kExtrq;
+
+    // EXTRQ takes register controls from bits 13:0 and INSERTQ from 77:64.
+    uint64_t field = instruction.field;
+    if (!instruction.immediate) {
+        field = extract ? source.Low : static_cast<uint64_t>(source.High);
+    }
+    const unsigned index = (field & 0x3F00) >> 8;
+    const unsigned width = field & 0x3F;
+    const uint64_t low_mask = width ? UINT64_MAX >> (64 - width) : UINT64_MAX;
+    if (extract) {
+        destination.Low = (destination.Low >> index) & low_mask;
+    } else {
+        const uint64_t positioned_mask = low_mask << index;
+        destination.Low = (destination.Low & ~positioned_mask) |
+                          ((source.Low << index) & positioned_mask);
+    }
+    // The APM leaves the upper quadword and out-of-range fields undefined.
+}
+
+bool zero_guest_cache_line(uint64_t address, EXCEPTION_RECORD& exception) {
+    // The supported guest has 64-byte cache lines. An aligned line fits
+    // in one Windows page, including when the address is at the end of it.
+    constexpr uintptr_t line_size = 64;
+    const uintptr_t start = address & ~(line_size - 1);
+    constexpr DWORD write_protections = PAGE_READWRITE | PAGE_WRITECOPY |
+                                       PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    MEMORY_BASIC_INFORMATION page{};
+    if (VirtualQuery(reinterpret_cast<const void*>(start), &page, sizeof(page)) &&
+        page.State == MEM_COMMIT && (page.Protect & write_protections) &&
+        !(page.Protect & PAGE_GUARD)) {
+        std::memset(reinterpret_cast<void*>(start), 0, line_size);
+        return true;
+    }
+
+    // Pass the write fault on at the original guest RIP. Guard pages use
+    // the same fallback, without Windows' one-shot guard-page semantics.
+    exception.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+    exception.NumberParameters = 2;
+    exception.ExceptionInformation[0] = 1; // Write access.
+    exception.ExceptionInformation[1] = start;
+    return false;
+}
+
+bool apply_amd_instruction(const AmdInstruction& instruction, CONTEXT& context,
+                           EXCEPTION_RECORD& exception) {
+    switch (instruction.kind) {
+    case kClzero:
+        return zero_guest_cache_line(instruction.address32 ? static_cast<uint32_t>(context.Rax)
+                                                           : context.Rax, exception);
+    case kMonitorx:
+        // There is no host monitor state. MWAITX may complete immediately.
+        return true;
+    case kMwaitx:
+        // Approximate an early wakeup with one scheduler yield.
+        SwitchToThread();
+        return true;
+    case kRdpru: {
+        const uint32_t selector = static_cast<uint32_t>(context.Rcx);
+        const uint64_t counter = selector < 2 ? __rdtsc() : 0;
+        context.Rax = static_cast<uint32_t>(counter);
+        context.Rdx = static_cast<uint32_t>(counter >> 32);
+
+        // The APM specifies zero for these five flags and marks CF modified.
+        // BetterXen chooses a clear CF until its native behavior is verified.
+        constexpr DWORD arithmetic_flags = (1u << 11) | (1u << 7) | (1u << 6) |
+                                           (1u << 4) | (1u << 2) | (1u << 0);
+        context.EFlags &= ~arithmetic_flags;
+        return true;
+    }
+    case kExtrq:
+    case kInsertq:
+        apply_sse4a(instruction, context);
+        return true;
+    case kAmdKinds:
+        return false;
+    }
+    return false;
+}
+
 LONG WINAPI log_unhandled_exception(PEXCEPTION_POINTERS ep) {
     // Wine can invoke the top-level filter again for the same terminal fault.
     if (ep && ep->ExceptionRecord && ep->ContextRecord &&
@@ -198,18 +368,23 @@ LONG CALLBACK bx_veh_handler(PEXCEPTION_POINTERS ep) {
         size_t len = decode_clwb_length(ip, size);
         if (len > 0) {
             uint64_t count = g_clwb_traps.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (count == 1 || (count & (count - 1)) == 0) {
-                char msg[160];
-                std::snprintf(msg, sizeof(msg),
-                              "rip=0x%016llx len=%zu total_traps=%llu",
-                              static_cast<unsigned long long>(ep->ContextRecord->Rip),
-                              len,
-                              static_cast<unsigned long long>(count));
-                bx_log_emit(BX_LOG_INFO, "runtime_veh", "clwb_trapped", msg);
-            }
+            log_sampled_trap("clwb_trapped", count, ep->ContextRecord->Rip, len);
             ep->ContextRecord->Rip += len;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+    }
+
+    const AmdInstruction instruction = decode_amd_instruction(ip, size);
+    if (instruction.length != 0) {
+        if (!apply_amd_instruction(instruction, *ep->ContextRecord, *ep->ExceptionRecord)) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        const uint64_t count =
+            g_amd_traps[instruction.kind].fetch_add(1, std::memory_order_relaxed) + 1;
+        log_sampled_trap(kAmdEvents[instruction.kind], count, ep->ContextRecord->Rip,
+                         instruction.length);
+        ep->ContextRecord->Rip += instruction.length;
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 
     if (g_config.enable_adx_tripwire && is_adx_opcode(ip, size)) {
