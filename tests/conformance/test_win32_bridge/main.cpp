@@ -138,6 +138,8 @@ struct PsmLogCounts {
     size_t constrained_unregistered = 0;
     size_t constrained_foreign = 0;
     size_t constrained_unknown = 0;
+    size_t state_callback_unfired = 0;
+    size_t constrained_callback_unfired = 0;
 };
 
 int64_t query_file_size(const char* path) {
@@ -204,6 +206,14 @@ bool count_psm_log_events(const char* path, int64_t start_offset, PsmLogCounts& 
             continue;
         }
         if (line.find("\"event\":\"RegisterAppStateChangeNotification\"") != std::string::npos &&
+            line.find("callback_unfired") != std::string::npos) {
+            ++out.state_callback_unfired;
+            ++out.state_registered;
+        } else if (line.find("\"event\":\"RegisterAppConstrainedChangeNotification\"") != std::string::npos &&
+                   line.find("callback_unfired") != std::string::npos) {
+            ++out.constrained_callback_unfired;
+            ++out.constrained_registered;
+        } else if (line.find("\"event\":\"RegisterAppStateChangeNotification\"") != std::string::npos &&
             line.find("\"detail\":\"registered_offline\"") != std::string::npos) {
             ++out.state_registered;
         } else if (line.find("\"event\":\"RegisterAppConstrainedChangeNotification\"") != std::string::npos &&
@@ -345,7 +355,29 @@ bool test_psm() {
                         counts.constrained_foreign, counts.constrained_unknown);
                 }
 
-                ok = success.load() && unique_ok && !g_callback_called.load() && counts_ok;
+                /* The callbacks are accepted and stored but never invoked, so the
+                 * JSONL detail must say so: ERROR_SUCCESS is bookkeeping only. */
+                const bool fired_never = !g_callback_called.load();
+                if (!fired_never) {
+                    std::fprintf(stderr, "FAIL: a PSM callback fired; the shim has no event source\n");
+                }
+                if (counts.state_callback_unfired != counts.state_registered) {
+                    std::fprintf(stderr,
+                                 "FAIL: %zu of %zu state registrations omit 'callback_unfired'\n",
+                                 counts.state_registered - counts.state_callback_unfired,
+                                 counts.state_registered);
+                }
+                if (counts.constrained_callback_unfired != counts.constrained_registered) {
+                    std::fprintf(stderr,
+                                 "FAIL: %zu of %zu constrained registrations omit 'callback_unfired'\n",
+                                 counts.constrained_registered - counts.constrained_callback_unfired,
+                                 counts.constrained_registered);
+                }
+                const bool limitation_logged = counts.state_callback_unfired == counts.state_registered &&
+                                               counts.constrained_callback_unfired ==
+                                                   counts.constrained_registered;
+
+                ok = success.load() && unique_ok && fired_never && counts_ok && limitation_logged;
             }
         }
     }
