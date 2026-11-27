@@ -302,7 +302,7 @@ fn format_shader_gate_section(summary: &TraceSummary) -> String {
         // pipelines are created-but-not-run. Additive: the per-record list above is unchanged.
         let _ = writeln!(
             out,
-            "\nD3DMetal gaps by pipeline/stage ({}):",
+            "\nD3DMetal gaps by kind/stage ({}):",
             summary.shader_gap_groups.len()
         );
         for group in &summary.shader_gap_groups {
@@ -1724,7 +1724,7 @@ sub setup_bottle_wineprefix {
         );
         // The additive grouped view.
         assert!(
-            rendered.contains("D3DMetal gaps by pipeline/stage (3):"),
+            rendered.contains("D3DMetal gaps by kind/stage (3):"),
             "{rendered}"
         );
         assert!(
