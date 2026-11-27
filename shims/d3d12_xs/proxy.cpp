@@ -1,4 +1,5 @@
 #include "proxy.h"
+#include "vmem.h"
 
 #include <cstdio>
 #include <cstring>
@@ -206,6 +207,8 @@ ULONG STDMETHODCALLTYPE BxDeviceProxy::AddRef() {
 ULONG STDMETHODCALLTYPE BxDeviceProxy::Release() {
     ULONG left = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (left == 0) {
+        /* Before this object is freed. The cached backing heap does not own this proxy. */
+        bx_vmem_clear_backing_device(this);
         bx_release_hosts();
         delete this;
     }

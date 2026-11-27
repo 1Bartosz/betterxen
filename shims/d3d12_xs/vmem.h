@@ -42,12 +42,15 @@
  * Any other CreateHeap is the host CreateHeap. The desc is not modified.
  * The live-heap xmem budget charge (taken on create, dropped on the wrapper's
  * final Release) is the budget difference, and the returned object is the wrapper.
- * GetDevice on the wrapper returns the BxDeviceProxy that created the heap and
- * does not AddRef it. The process-wide backing cache holds that heap, so a strong
- * reference would keep the device and its charge alive after the caller released
- * the device. The cache records the host ID3D12Device that built the heap.
- * CreateHeap for a different host device releases the heap and its buffer,
- * credits the charge, and builds a new backing heap.
+ * GetDevice on every wrapper returns the BxDeviceProxy. An ordinary heap AddRefs
+ * that proxy until the wrapper's final Release, matching BxChildProxy, so the
+ * caller can release the device and keep the heap. The process-wide backing heap
+ * does not AddRef. The cache would keep the device and its charge alive. That
+ * pointer is weak: it is cleared when the proxy is destroyed, and it is set to
+ * the proxy that next receives the cached heap. The cache records the host
+ * ID3D12Device that built the heap. CreateHeap for a different host device
+ * releases the heap and its buffer, credits the charge, and builds a new one.
+ * CreateHeap for the same host device returns the cached heap.
  *
  * The layout must match tests/conformance/test_d3d12_placed/main.cpp.
  */
@@ -78,5 +81,15 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config);
 
 /* Patches the device proxy vtable so CreateHeap and CreatePlacedResource run the code in vmem.cpp. */
 void bx_vmem_install_device_hooks(void* device);
+
+/* Called from BxDeviceProxy::Release when the proxy's last reference drops.
+   If the cached backing heap's weak device pointer is this proxy, it becomes null
+   so a later GetDevice returns E_FAIL instead of using freed memory. */
+void bx_vmem_clear_backing_device(void* device_proxy);
+
+/* AddRefs the host ID3D12Device that created the cached backing heap, or returns null.
+   The test sets BX_D3D12_REUSE_BACKING_HOST=1 so a second proxy wraps this same host
+   while the cache still holds it. */
+void* bx_vmem_addref_backing_host();
 
 #endif /* BETTERXEN_D3D12_XS_VMEM_H */

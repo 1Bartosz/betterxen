@@ -52,12 +52,24 @@ HRESULT WINAPI D3D12XboxCreateDevice(PVOID params, REFIID riid, void** ppv) {
     }
 
     ID3D12Device* host = nullptr;
-    HRESULT hr = create(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&host));
-    if (FAILED(hr) || !host) {
-        char detail[96];
-        std::snprintf(detail, sizeof(detail), "D3D12CreateDevice hr=0x%08lx", static_cast<unsigned long>(hr));
-        bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "host_device_failed", detail);
-        return FAILED(hr) ? hr : E_FAIL;
+    char reuse[8] = {};
+    /* Test hook. While the backing cache holds a host heap, that heap keeps the host
+       device alive, and a real runtime then returns the same ID3D12Device. Set the
+       variable so the next proxy wraps that device even if this host does not. */
+    const bool reuse_backing = GetEnvironmentVariableA("BX_D3D12_REUSE_BACKING_HOST", reuse, sizeof(reuse)) > 0 &&
+                               reuse[0] == '1' && reuse[1] == '\0';
+    if (reuse_backing) {
+        host = static_cast<ID3D12Device*>(bx_vmem_addref_backing_host());
+    }
+    HRESULT hr = S_OK;
+    if (!host) {
+        hr = create(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&host));
+        if (FAILED(hr) || !host) {
+            char detail[96];
+            std::snprintf(detail, sizeof(detail), "D3D12CreateDevice hr=0x%08lx", static_cast<unsigned long>(hr));
+            bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "host_device_failed", detail);
+            return FAILED(hr) ? hr : E_FAIL;
+        }
     }
 
     BxDeviceProxy* proxy = BxDeviceProxy::create(host);
@@ -77,10 +89,10 @@ HRESULT WINAPI D3D12XboxCreateDevice(PVOID params, REFIID riid, void** ppv) {
     for (int i = 0; i < 10; ++i) {
         if (levels[i]) highest = i + 1;
     }
-    char detail[192];
+    char detail[256];
     std::snprintf(detail, sizeof(detail),
-                  "host device wrapped; highest_host_interface=ID3D12Device%d feature_level=11_0 params=%s (not interpreted) trace_d3d=%u",
-                  highest, params ? "non-null" : "null", g_bx_trace_d3d);
+                  "host_device=%p highest_host_interface=ID3D12Device%d feature_level=11_0 params=%s (not interpreted) trace_d3d=%u",
+                  static_cast<void*>(proxy->h_ID3D12Device), highest, params ? "non-null" : "null", g_bx_trace_d3d);
     bx_log_emit(BX_LOG_INFO, "d3d12_xs", "D3D12XboxCreateDevice", detail);
 
     hr = proxy->QueryInterface(riid, ppv);

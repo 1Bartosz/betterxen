@@ -20,9 +20,14 @@
  * returns the host HRESULT. The wrapper and the live-heap xmem budget charge
  * are the only differences: charge on create, credit on the wrapper's final
  * Release, E_OUTOFMEMORY only when that budget is exceeded.
- * GetDevice on the wrapper returns the BxDeviceProxy that created the heap.
- * The wrapper does not AddRef that proxy. The cached backing heap is keyed by
- * the host ID3D12Device that created it and is released when that device changes.
+ * GetDevice on every wrapper returns the BxDeviceProxy. An ordinary heap AddRefs
+ * that proxy and Releases it after the wrapper is destroyed, matching
+ * BxChildProxy, so the caller may release the device and keep the heap.
+ * The cached backing heap does not AddRef: this record would keep the device
+ * and its budget charge alive. That pointer is weak. It is cleared when the
+ * proxy is destroyed and set to the proxy that next receives the cached heap.
+ * The cache is keyed by the host ID3D12Device and is released when that device
+ * changes.
  * A null out pointer is forwarded unchanged to the host.
  * vkd3d on CrossOver 26.2 faults on that pointer with or without this shim.
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createheap
@@ -137,20 +142,33 @@ void release_charge(uint64_t bytes) {
  * returns this object. bx_unwrap sees IID_BxProxyHost and receives the host heap.
  * GetProtectedResourceSession forwards to the host ID3D12Heap1.
  * GetDevice returns the BxDeviceProxy, matching BxChildProxy::GetDevice.
- * `device_` is not an owning reference. AddRef would keep the proxy alive for as
- * long as g_record.backing holds this heap, so the caller's last Release would
- * not destroy the device and the budget charge would stick across device
- * recreation. The pointer stays valid while that proxy is alive. ensure_backing
- * releases a cached heap when the host device changes and does not call GetDevice
- * on the heap it is dropping.
+ * Ordinary heaps (`owns_device_`) AddRef the proxy in the constructor and
+ * Release it after `delete this`, the same order as BxChildProxy::Release.
+ * The process-wide backing heap does not. g_record holds that heap for the
+ * life of the region, so a strong reference would pin the device and the
+ * budget charge after the caller dropped the proxy. `device_` on that heap is
+ * weak: bx_vmem_clear_backing_device nulls it when the proxy is destroyed, and
+ * return_backing points it at the proxy currently receiving the cache. Those
+ * two writes happen under g_section. A host ID3D12Heap keeps its host device
+ * alive, and a later D3D12CreateDevice can return that same pointer; retargeting
+ * `device_` is what makes GetDevice return the new proxy instead of the freed one.
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12heap1
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12devicechild-getdevice
  */
 class BxChargedHeap final : public ID3D12Heap1 {
 public:
-    static BxChargedHeap* create(ID3D12Heap* host, ID3D12Heap1* host1, uint64_t bytes, BxDeviceProxy* device) {
-        return new (std::nothrow) BxChargedHeap(host, host1, bytes, device);
+    static BxChargedHeap* create(ID3D12Heap* host, ID3D12Heap1* host1, uint64_t bytes, BxDeviceProxy* device,
+                                 bool own_device) {
+        return new (std::nothrow) BxChargedHeap(host, host1, bytes, device, own_device);
     }
+
+    /* Weak backing heap only. Called under g_section. */
+    void set_device(BxDeviceProxy* device) {
+        if (!owns_device_) {
+            device_ = device;
+        }
+    }
+    BxDeviceProxy* device() const { return device_; }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) {
@@ -192,7 +210,13 @@ public:
             if (host_) {
                 host_->Release();
             }
+            /* Same order as BxChildProxy::Release: destroy the wrapper, then Release the device. */
+            BxDeviceProxy* owned = owns_device_ ? device_ : nullptr;
+            device_ = nullptr;
             delete this;
+            if (owned) {
+                owned->Release();
+            }
         }
         return left;
     }
@@ -232,13 +256,16 @@ public:
     }
 
 private:
-    BxChargedHeap(ID3D12Heap* host, ID3D12Heap1* host1, uint64_t bytes, BxDeviceProxy* device)
-        : host_(host), host1_(host1), bytes_(bytes), device_(device) {
+    BxChargedHeap(ID3D12Heap* host, ID3D12Heap1* host1, uint64_t bytes, BxDeviceProxy* device, bool own_device)
+        : host_(host), host1_(host1), bytes_(bytes), device_(device), owns_device_(own_device) {
         if (host_) {
             host_->AddRef();
         }
         if (host1_) {
             host1_->AddRef();
+        }
+        if (owns_device_ && device_) {
+            device_->AddRef();
         }
     }
     ~BxChargedHeap() = default;
@@ -246,7 +273,8 @@ private:
     ID3D12Heap* host_;
     ID3D12Heap1* host1_;
     uint64_t bytes_;
-    BxDeviceProxy* device_; /* non-owning; see the class comment */
+    BxDeviceProxy* device_;
+    bool owns_device_; /* ordinary heap: strong, like BxChildProxy. Backing cache: weak. */
     LONG refs_ = 1;
 };
 
@@ -311,7 +339,7 @@ bool backing_request(const D3D12_HEAP_DESC* desc) {
     return region_still_mapped(snap);
 }
 
-HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFIID riid, void** out);
+HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFIID riid, void** out, bool own_device);
 
 /* True when the cached backing heap was created for `host`.
    Otherwise moves a foreign cache out of g_record so the caller can release it
@@ -344,11 +372,14 @@ void release_backing_pair(BxChargedHeap* heap, ID3D12Resource* buffer) {
     }
 }
 
-HRESULT return_backing(REFIID riid, void** out) {
+HRESULT return_backing(BxDeviceProxy* self, REFIID riid, void** out) {
     Guard guard(g_section);
     if (!g_record.backing) {
         return E_FAIL;
     }
+    /* The host device can outlive proxy A and be wrapped again by proxy B.
+       Point GetDevice at the proxy that is receiving this heap. */
+    g_record.backing->set_device(self);
     g_record.backing->AddRef();
     const HRESULT hr = g_record.backing->QueryInterface(riid, out);
     g_record.backing->Release();
@@ -359,7 +390,7 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
     BxChargedHeap* stale_heap = nullptr;
     ID3D12Resource* stale_buffer = nullptr;
     if (detach_foreign_backing(self->h_ID3D12Device, &stale_heap, &stale_buffer)) {
-        return return_backing(riid, out);
+        return return_backing(self, riid, out);
     }
     release_backing_pair(stale_heap, stale_buffer);
     stale_heap = nullptr;
@@ -373,7 +404,7 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
     desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
     desc.Flags = D3D12_HEAP_FLAG_NONE;
     void* created = nullptr;
-    HRESULT hr = host_private_heap(self, &desc, __uuidof(ID3D12Heap), &created);
+    HRESULT hr = host_private_heap(self, &desc, __uuidof(ID3D12Heap), &created, false);
     if (FAILED(hr) || !created) {
         return FAILED(hr) ? hr : E_FAIL;
     }
@@ -410,7 +441,7 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
             resource->Unmap(0, nullptr);
             resource->Release();
             wrap->Release();
-            return return_backing(riid, out);
+            return return_backing(self, riid, out);
         }
         stale_heap = g_record.backing;
         stale_buffer = g_record.backing_buffer;
@@ -421,10 +452,10 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
         g_record.cpu_pointer = reinterpret_cast<uint64_t>(mapped);
     }
     release_backing_pair(stale_heap, stale_buffer);
-    return return_backing(riid, out);
+    return return_backing(self, riid, out);
 }
 
-HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFIID riid, void** out) {
+HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFIID riid, void** out, bool own_device) {
     /* desc is forwarded unmodified. The charge follows the wrapper, including ID3D12Heap1. */
     if (!try_charge(desc->SizeInBytes)) {
         bx_log_emit(BX_LOG_WARN, "d3d12_xs", "heap_budget",
@@ -450,7 +481,7 @@ HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFI
     if (host->QueryInterface(__uuidof(ID3D12Heap1), &probed) == S_OK && probed) {
         host1 = static_cast<ID3D12Heap1*>(probed);
     }
-    BxChargedHeap* wrap = BxChargedHeap::create(host, host1, desc->SizeInBytes, self);
+    BxChargedHeap* wrap = BxChargedHeap::create(host, host1, desc->SizeInBytes, self, own_device);
     if (host1) {
         host1->Release();
     }
@@ -528,7 +559,7 @@ HRESULT STDMETHODCALLTYPE create_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC
     if (backing_request(desc)) {
         return ensure_backing(self, desc->SizeInBytes, riid, out);
     }
-    return host_private_heap(self, desc, riid, out);
+    return host_private_heap(self, desc, riid, out, true);
 }
 
 HRESULT validate_backing_placement(ID3D12Device* device, ID3D12Heap* heap, UINT64 offset, const D3D12_RESOURCE_DESC* desc,
@@ -728,6 +759,23 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
                   static_cast<unsigned long long>(charged));
     bx_log_emit(BX_LOG_INFO, "d3d12_xs", "D3D12ConfigureVirtualMemoryX", detail);
     return S_OK;
+}
+
+void bx_vmem_clear_backing_device(void* device_proxy) {
+    Guard guard(g_section);
+    auto* proxy = static_cast<BxDeviceProxy*>(device_proxy);
+    if (g_record.backing && g_record.backing->device() == proxy) {
+        g_record.backing->set_device(nullptr);
+    }
+}
+
+void* bx_vmem_addref_backing_host() {
+    Guard guard(g_section);
+    if (!g_record.backing_host) {
+        return nullptr;
+    }
+    g_record.backing_host->AddRef();
+    return g_record.backing_host;
 }
 
 void bx_vmem_install_device_hooks(void* device) {
