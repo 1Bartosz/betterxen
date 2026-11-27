@@ -66,6 +66,7 @@
  */
 constexpr uint32_t BX_D3D12_VMEM_MAGIC = 0x4D565842u;
 constexpr uint32_t BX_D3D12_VMEM_FLAG_BACKING_HEAP = 0x1u;
+constexpr uint32_t BX_D3D12_XBOX_VMEM_MAX_SEGMENTS = 64u;
 
 struct BxD3d12VirtualMemoryConfig {
     uint32_t magic;
@@ -86,6 +87,26 @@ static_assert(offsetof(BxD3d12VirtualMemoryConfig, base_va) == 16, "base_va offs
 static_assert(offsetof(BxD3d12VirtualMemoryConfig, size_bytes) == 24, "size_bytes offset");
 static_assert(offsetof(BxD3d12VirtualMemoryConfig, reserved) == 32, "reserved offset");
 static_assert(offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer) == 40, "cpu_pointer offset");
+
+/*
+ * Evidenced 32-byte Xbox virtual-memory configuration block.
+ *
+ * Unlike BXVM, this block has no magic or struct_size header: offset +0x00 is 0,
+ * offset +0x04 carries a positive virtual-segment count (observed 3 for 16 GiB
+ * and 4 for 24 GiB reservations), and offsets +0x08..+0x1f are 0. Because the
+ * export takes PVOID with no size parameter, the decoder verifies via
+ * VirtualQuery that all 32 bytes are committed and readable before copying past
+ * the initial 8-byte probe, and never writes to caller memory.
+ */
+struct BxXboxVirtualMemoryConfig {
+    uint32_t reserved0;
+    uint32_t virtual_segment_count;
+    uint32_t reserved[6];
+};
+static_assert(sizeof(BxXboxVirtualMemoryConfig) == 32, "Xbox config block is 32 bytes");
+static_assert(offsetof(BxXboxVirtualMemoryConfig, reserved0) == 0, "reserved0 offset");
+static_assert(offsetof(BxXboxVirtualMemoryConfig, virtual_segment_count) == 4, "virtual_segment_count offset");
+static_assert(offsetof(BxXboxVirtualMemoryConfig, reserved) == 8, "reserved offset");
 
 extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config);
 
