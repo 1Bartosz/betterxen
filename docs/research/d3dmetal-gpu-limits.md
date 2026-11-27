@@ -109,7 +109,6 @@ independently reproduced, not CrossOver 26.3, and not an Xbox hardware result.
 | Check | Outcome |
 | --- | --- |
 | `device.shader_model` | 6.6 |
-
 | `wave.reported` | `WaveOps=1`, lane count min 32, max 32 |
 | `wave.control` | ran at width 32, lanes a permutation within each wave (required: pass) |
 | `wave.wavesize64` | created but not run (output still sentinel) |
