@@ -27,6 +27,10 @@ HRESULT WINAPI XDspDisconnect(void*);
 
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
 
+namespace {
+void WINAPI dummy_device_callback(uint64_t, void*, void*, uint64_t, uint32_t, uint32_t) {}
+} // namespace
+
 int main() {
     void* object = nullptr;
     CHECK(AcpHalCreate(&object) == S_OK && object);
@@ -148,8 +152,42 @@ int main() {
     using Reading = HRESULT (WINAPI*)(IUnknown*, uint32_t, void*, void**);
     void* reading = reinterpret_cast<void*>(uintptr_t{1});
     CHECK(reinterpret_cast<Reading>(table[4])(v0, 0, nullptr, &reading) == E_NOTIMPL && !reading);
+
+    using RegisterDeviceCb = HRESULT (WINAPI*)(
+        IUnknown*, void*, uint32_t, uint32_t, uint32_t, void*, void*, uint64_t*);
+    using StopCb = void (WINAPI*)(IUnknown*, uint64_t);
+    using UnregisterCb = bool (WINAPI*)(IUnknown*, uint64_t, uint64_t);
+    using SetFocusPolicyFn = void (WINAPI*)(IUnknown*, uint32_t);
+    auto reg_dev = reinterpret_cast<RegisterDeviceCb>(table[9]);
+    auto stop_cb = reinterpret_cast<StopCb>(table[12]);
+    auto unreg_cb = reinterpret_cast<UnregisterCb>(table[13]);
+    auto set_focus = reinterpret_cast<SetFocusPolicyFn>(table[21]);
+    void* cb_fn = reinterpret_cast<void*>(&dummy_device_callback);
+
+    uint64_t tok1 = 99, tok2 = 0;
+    CHECK(reg_dev(v0, nullptr, 1, 1, 0, nullptr, nullptr, &tok1) == E_INVALIDARG && tok1 == 0);
+    tok1 = 99;
+    CHECK(reg_dev(v0, nullptr, 0, 1, 0, nullptr, cb_fn, &tok1) == E_INVALIDARG && tok1 == 0);
+    tok1 = 99;
+    CHECK(reg_dev(v0, nullptr, 1, 0, 0, nullptr, cb_fn, &tok1) == E_INVALIDARG && tok1 == 0);
+    tok1 = 99;
+    CHECK(reg_dev(v0, nullptr, 1, 1, 3, nullptr, cb_fn, &tok1) == E_INVALIDARG && tok1 == 0);
+
+    CHECK(reg_dev(v0, nullptr, 0x10000, 0x1, 2, &tok1, cb_fn, &tok1) == S_OK && tok1 != 0);
+    CHECK(reg_dev(v0, nullptr, 0x10000, 0x1, 1, nullptr, cb_fn, &tok2) == S_OK && tok2 > tok1);
+    CHECK(reg_dev(v0, nullptr, 0x10000, 0x1, 0, nullptr, cb_fn, nullptr) == S_OK);
+
+    CHECK(!unreg_cb(v0, 0, 5000));
+    CHECK(!unreg_cb(v0, 0xdeadbeefULL, 5000));
+    stop_cb(v0, tok1);
+    CHECK(unreg_cb(v0, tok1, 5000));
+    CHECK(!unreg_cb(v0, tok1, 5000));
+    CHECK(unreg_cb(v0, tok2, 0));
+    CHECK(!unreg_cb(v0, tok2, 0));
+    set_focus(v0, 0x2);
+
     CHECK(v0->Release() == 1);
     CHECK(input->Release() == 0);
     FreeLibrary(dll);
-    std::puts("PASS: audio mappings, APU and DSP queues, GameInput ordinal 1");
+    std::puts("PASS: audio mappings, APU and DSP queues, GameInput ordinal 1 and device callbacks");
 }

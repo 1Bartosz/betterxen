@@ -1,4 +1,5 @@
 #include "proxy.h"
+#include "vmem.h"
 
 #include <cstdio>
 #include <cstring>
@@ -6,6 +7,8 @@
 #include <type_traits>
 
 #include "presentx.h"
+
+#include "shader_gate.h"
 
 /* {6B1D5C0E-2F4A-4E0B-9A57-3C0E5D7B1A42}: private to this DLL, never handed to a host object. */
 const GUID IID_BxProxyHost = {0x6b1d5c0e, 0x2f4a, 0x4e0b, {0x9a, 0x57, 0x3c, 0x0e, 0x5d, 0x7b, 0x1a, 0x42}};
@@ -135,9 +138,11 @@ bool log_shader(const char* pso_kind, const char* stage, const D3D12_SHADER_BYTE
                 well_formed = false;
                 break;
             }
+            /* ACCC counts too: the shader format gate (#466) decides what happens to it. */
             if (std::memcmp(bytes + off, "DXIL", 4) == 0 ||
                 std::memcmp(bytes + off, "SHEX", 4) == 0 ||
-                std::memcmp(bytes + off, "SHDR", 4) == 0) {
+                std::memcmp(bytes + off, "SHDR", 4) == 0 ||
+                std::memcmp(bytes + off, "ACCC", 4) == 0) {
                 has_shader_chunk = true;
             }
             if (i < 16) {
@@ -202,13 +207,43 @@ ULONG STDMETHODCALLTYPE BxDeviceProxy::AddRef() {
     return refs_.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-ULONG STDMETHODCALLTYPE BxDeviceProxy::Release() {
-    ULONG left = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
-    if (left == 0) {
-        bx_release_hosts();
-        delete this;
+bool BxDeviceProxy::bx_try_acquire_if_nonzero() {
+    ULONG cur = refs_.load(std::memory_order_acquire);
+    while (cur != 0) {
+        if (refs_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
     }
-    return left;
+    return false;
+}
+
+bool BxDeviceProxy::bx_try_release_last() {
+    ULONG expected = 1;
+    return refs_.compare_exchange_strong(expected, 0, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+ULONG STDMETHODCALLTYPE BxDeviceProxy::Release() {
+    /* The 1->0 transition and a weak GetDevice acquire share g_section.
+       GetDevice adds a reference only when the count is non-zero, so a proxy
+       at zero is never brought back. Exactly one Release performs final cleanup. */
+    ULONG cur = refs_.load(std::memory_order_acquire);
+    for (;;) {
+        if (cur == 0) {
+            return 0;
+        }
+        if (cur > 1) {
+            if (refs_.compare_exchange_weak(cur, cur - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return cur - 1;
+            }
+            continue;
+        }
+        if (bx_vmem_final_release(this)) {
+            bx_release_hosts();
+            delete this;
+            return 0;
+        }
+        cur = refs_.load(std::memory_order_acquire);
+    }
 }
 
 HRESULT BxDeviceProxy::wrap_child(IUnknown* host_child, const char* what, REFIID riid, void** ppv) {
@@ -348,7 +383,25 @@ HRESULT STDMETHODCALLTYPE BxDeviceProxy::CreateGraphicsPipelineState(const D3D12
         log_created("graphics pipeline state", E_INVALIDARG);
         return E_INVALIDARG;
     }
-    HRESULT hr = h_ID3D12Device->CreateGraphicsPipelineState(desc, riid, ppv);
+    if (!desc) {
+        HRESULT hr = h_ID3D12Device->CreateGraphicsPipelineState(desc, riid, ppv);
+        log_created("graphics pipeline state", hr);
+        return hr;
+    }
+    /* M2 shader format gate (#466): every stage is classified; an ACCC-only stage fails the PSO. */
+    BxShaderGate gate;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC admitted = *desc;
+    HRESULT gated = gate.admit("graphics", "VS", desc->VS, admitted.VS);
+    if (SUCCEEDED(gated)) gated = gate.admit("graphics", "PS", desc->PS, admitted.PS);
+    if (SUCCEEDED(gated)) gated = gate.admit("graphics", "DS", desc->DS, admitted.DS);
+    if (SUCCEEDED(gated)) gated = gate.admit("graphics", "HS", desc->HS, admitted.HS);
+    if (SUCCEEDED(gated)) gated = gate.admit("graphics", "GS", desc->GS, admitted.GS);
+    if (FAILED(gated)) {
+        if (ppv) *ppv = nullptr;
+        log_created("graphics pipeline state", gated);
+        return gated;
+    }
+    HRESULT hr = h_ID3D12Device->CreateGraphicsPipelineState(&admitted, riid, ppv);
     log_created("graphics pipeline state", hr);
     return hr;
 }
@@ -360,7 +413,21 @@ HRESULT STDMETHODCALLTYPE BxDeviceProxy::CreateComputePipelineState(const D3D12_
         log_created("compute pipeline state", E_INVALIDARG);
         return E_INVALIDARG;
     }
-    HRESULT hr = h_ID3D12Device->CreateComputePipelineState(desc, riid, ppv);
+    if (!desc) {
+        HRESULT hr = h_ID3D12Device->CreateComputePipelineState(desc, riid, ppv);
+        log_created("compute pipeline state", hr);
+        return hr;
+    }
+    /* M2 shader format gate (#466): DXIL is passed on, an ACCC-only container is refused. */
+    BxShaderGate gate;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC admitted = *desc;
+    const HRESULT gated = gate.admit("compute", "CS", desc->CS, admitted.CS);
+    if (FAILED(gated)) {
+        if (ppv) *ppv = nullptr;
+        log_created("compute pipeline state", gated);
+        return gated;
+    }
+    HRESULT hr = h_ID3D12Device->CreateComputePipelineState(&admitted, riid, ppv);
     log_created("compute pipeline state", hr);
     return hr;
 }
