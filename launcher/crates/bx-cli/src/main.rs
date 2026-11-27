@@ -40,29 +40,16 @@ const HOST_ENV_ALLOWLIST: &[&str] = &[
     "XPC_SERVICE_NAME",
 ];
 
-/// Whether the usage text belongs on stdout (an explicit `--help`) or stderr
-/// (a usage error). A caller that asked for help succeeded; a caller that
-/// typed nothing did not.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum UsageStream {
-    Stdout,
-    Stderr,
-}
-
-fn print_usage(stream: UsageStream) {
-    let text = "BetterXen Hybrid CLI (bx-cli)\n\
-         \n\
-         Usage:\n\
-           bx-cli doctor                         Inspect Apple Silicon host, Rosetta 2, CrossOver & mingw-w64\n\
-           bx-cli probe <pe32+_path>             Classify PE32+ imports by BetterXen track (A-E)\n\
-           bx-cli shader <dxbc_blob_path>        Classify a DXBC shader container (DXIL vs ACCC/FSPX)\n\
-           bx-cli trace <log.jsonl>              Summarize bx_runtime_veh JSONL diagnostics\n\
-           bx-cli run --exe <path> [--shims <dir>] [--bottle <name> | --prefix <dir>] [--profile lockhart|anaconda] [--log <path>] [--inherit-env] [--timeout <secs>] [--backend d3dmetal|dxmt|dxvk|wined3d (needs --bottle)]\n\
-           (shims default to build-shims/bin; a timeout or signal stops the whole bottle or prefix)\n";
-    match stream {
-        UsageStream::Stdout => print!("{text}"),
-        UsageStream::Stderr => eprint!("{text}"),
-    }
+fn usage_text() -> &'static str {
+    "BetterXen Hybrid CLI (bx-cli)\n\
+     \n\
+     Usage:\n\
+       bx-cli doctor                         Inspect Apple Silicon host, Rosetta 2, CrossOver & mingw-w64\n\
+       bx-cli probe <pe32+_path>             Classify PE32+ imports by BetterXen track (A-E)\n\
+       bx-cli shader <dxbc_blob_path>        Classify a DXBC shader container (DXIL vs ACCC/FSPX)\n\
+       bx-cli trace <log.jsonl>              Summarize bx_runtime_veh JSONL diagnostics\n\
+       bx-cli run --exe <path> [--shims <dir>] [--bottle <name> | --prefix <dir>] [--profile lockhart|anaconda] [--log <path>] [--inherit-env] [--timeout <secs>] [--backend d3dmetal|dxmt|dxvk|wined3d (needs --bottle)]\n\
+       (shims default to build-shims/bin; a timeout or signal stops the whole bottle or prefix)\n"
 }
 
 fn run_capture(program: &str, args: &[&str]) -> Option<String> {
@@ -934,103 +921,72 @@ fn cmd_shader(path: &str) -> ExitCode {
     }
 }
 
+/// What a bare invocation of `bx-cli` should do. Split out from `main` so the
+/// choice is testable without spawning a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dispatch<'a> {
+    /// An explicit `--help` / `-h` / `help`: usage on stdout, succeed.
+    Help,
+    /// Nothing was asked for: usage on stderr, fail as a usage error.
+    NoArgs,
+    /// An unrecognised subcommand: usage on stderr, fail.
+    Unknown(&'a str),
+    /// A real subcommand.
+    Sub(&'a str),
+}
+
+impl<'a> Dispatch<'a> {
+    fn classify(args: &'a [String]) -> Self {
+        let Some(sub) = args.first() else {
+            return Dispatch::NoArgs;
+        };
+        match sub.as_str() {
+            "--help" | "-h" | "help" => Dispatch::Help,
+            "doctor" | "probe" | "shader" | "trace" | "run" => Dispatch::Sub(sub.as_str()),
+            _ => Dispatch::Unknown(sub.as_str()),
+        }
+    }
+
+    /// True when the usage text goes to stdout rather than stderr.
+    fn usage_on_stdout(self) -> bool {
+        matches!(self, Dispatch::Help)
+    }
+
+    /// True when the invocation must not report success.
+    fn is_usage_error(self) -> bool {
+        matches!(self, Dispatch::NoArgs | Dispatch::Unknown(_))
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let Some(sub) = args.first() else {
-        // A bare invocation did nothing, so it is a usage error, not success.
-        print_usage(UsageStream::Stderr);
-        return ExitCode::FAILURE;
-    };
-    match sub.as_str() {
-        // An explicit request for help succeeded; print it on stdout so
-        // `bx-cli --help | less` and `bx-cli --help && ...` both work.
-        "--help" | "-h" | "help" => {
-            print_usage(UsageStream::Stdout);
-            ExitCode::SUCCESS
-        }
-        "doctor" => cmd_doctor(),
-        "probe" if args.len() >= 2 => cmd_probe(&args[1]),
-        "shader" if args.len() >= 2 => cmd_shader(&args[1]),
-        "trace" if args.len() >= 2 => cmd_trace(&args[1]),
-        "run" => cmd_run(&args[1..]),
-        _ => {
-            print_usage(UsageStream::Stderr);
-            ExitCode::FAILURE
-        }
+    let dispatch = Dispatch::classify(&args);
+    if dispatch.usage_on_stdout() {
+        print!("{}", usage_text());
+    } else if dispatch.is_usage_error() {
+        eprint!("{}", usage_text());
+    }
+    match dispatch {
+        Dispatch::Help => ExitCode::SUCCESS,
+        Dispatch::NoArgs | Dispatch::Unknown(_) => ExitCode::FAILURE,
+        Dispatch::Sub(sub) => match sub {
+            "doctor" => cmd_doctor(),
+            "probe" if args.len() >= 2 => cmd_probe(&args[1]),
+            "shader" if args.len() >= 2 => cmd_shader(&args[1]),
+            "trace" if args.len() >= 2 => cmd_trace(&args[1]),
+            "run" => cmd_run(&args[1..]),
+            // Only reachable when a subcommand that needs an argument got none.
+            _ => {
+                eprint!("{}", usage_text());
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// The usage paths must not be inverted: an explicit `--help` succeeded,
-    /// a bare invocation did nothing, and an unknown subcommand is an error.
-    /// Runs the built binary so the real `main()` dispatch is exercised.
-    fn run_cli(args: &[&str]) -> (i32, String, String) {
-        // `CARGO_BIN_EXE_*` is not defined for a binary crate's own unit tests,
-        // so take the test executable's directory and use its `bx-cli` sibling.
-        // `cargo test` builds both into the same `target/debug/deps`-adjacent
-        // directory only for integration tests, so fall back to the parent
-        // `debug` directory where cargo puts the bin.
-        let test_exe = std::env::current_exe().expect("current test exe");
-        let deps = test_exe.parent().expect("deps dir");
-        let candidate = deps.join("bx-cli");
-        let exe = if candidate.is_file() {
-            candidate
-        } else {
-            deps.parent().expect("debug dir").join("bx-cli")
-        };
-        let out = Command::new(&exe)
-            .args(args)
-            .output()
-            .expect("spawn bx-cli");
-        (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    }
-
-    #[test]
-    fn help_succeeds_on_stdout_and_a_bare_invocation_is_a_usage_error() {
-        for flag in ["--help", "-h"] {
-            let (code, stdout, stderr) = run_cli(&[flag]);
-            assert_eq!(code, 0, "{flag} must exit 0");
-            assert!(
-                stdout.contains("BetterXen Hybrid CLI"),
-                "{flag} prints usage on stdout: {stdout:?}"
-            );
-            assert!(
-                stderr.is_empty(),
-                "{flag} must not write stderr: {stderr:?}"
-            );
-        }
-
-        let (code, stdout, stderr) = run_cli(&[]);
-        assert_ne!(
-            code, 0,
-            "a bare invocation did nothing, so it must not report success"
-        );
-        assert!(
-            stdout.is_empty(),
-            "usage goes to stderr for a bare invocation: {stdout:?}"
-        );
-        assert!(
-            stderr.contains("BetterXen Hybrid CLI"),
-            "stderr carries the usage text: {stderr:?}"
-        );
-
-        let (code, stdout, stderr) = run_cli(&["definitely-not-a-subcommand"]);
-        assert_ne!(code, 0, "an unknown subcommand is an error");
-        assert!(
-            stdout.is_empty(),
-            "unknown subcommand usage goes to stderr: {stdout:?}"
-        );
-        assert!(
-            stderr.contains("BetterXen Hybrid CLI"),
-            "stderr carries the usage text: {stderr:?}"
-        );
-    }
 
     /// A stream whose reader is gone: every write fails, as with EPIPE or EIO.
     struct ClosedStream<'a> {
@@ -1493,5 +1449,62 @@ sub setup_bottle_wineprefix {
             format_clwb_line(3, Some(4)),
             "clwb VEH traps     : at least 4 (sampled)"
         );
+    }
+
+    /// The usage paths must not be inverted: an explicit `--help` succeeded,
+    /// a bare invocation did nothing, and an unknown subcommand is an error.
+    #[test]
+    fn help_succeeds_on_stdout_and_a_bare_invocation_is_a_usage_error() {
+        for flag in ["--help", "-h", "help"] {
+            let argv = args(&[flag]);
+            let dispatch = Dispatch::classify(&argv);
+            assert_eq!(
+                dispatch,
+                Dispatch::Help,
+                "{flag} is an explicit help request"
+            );
+            assert!(dispatch.usage_on_stdout(), "{flag} prints usage on stdout");
+            assert!(!dispatch.is_usage_error(), "{flag} must exit 0");
+        }
+
+        let empty: Vec<String> = Vec::new();
+        let none = Dispatch::classify(&empty);
+        assert_eq!(none, Dispatch::NoArgs);
+        assert!(!none.usage_on_stdout(), "a bare invocation writes stderr");
+        assert!(
+            none.is_usage_error(),
+            "a bare invocation did nothing, so it must not report success"
+        );
+
+        let bogus_argv = args(&["definitely-not-a-subcommand"]);
+        let bogus = Dispatch::classify(&bogus_argv);
+        assert_eq!(bogus, Dispatch::Unknown("definitely-not-a-subcommand"));
+        assert!(
+            !bogus.usage_on_stdout(),
+            "an unknown subcommand writes stderr"
+        );
+        assert!(bogus.is_usage_error(), "an unknown subcommand is an error");
+
+        for real in ["doctor", "probe", "shader", "trace", "run"] {
+            let argv = args(&[real]);
+            let dispatch = Dispatch::classify(&argv);
+            assert_eq!(dispatch, Dispatch::Sub(real), "{real} is a real subcommand");
+            assert!(!dispatch.usage_on_stdout(), "{real} prints no usage");
+            assert!(!dispatch.is_usage_error(), "{real} is not a usage error");
+        }
+    }
+
+    /// The usage text must name every subcommand, so the classifier above is
+    /// not testing a table that nothing prints.
+    #[test]
+    fn the_usage_text_names_every_subcommand() {
+        let text = usage_text();
+        assert!(
+            text.contains("BetterXen Hybrid CLI"),
+            "usage carries the banner"
+        );
+        for sub in ["doctor", "probe", "shader", "trace", "run"] {
+            assert!(text.contains(sub), "usage documents {sub}");
+        }
     }
 }
