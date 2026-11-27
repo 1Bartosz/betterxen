@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <atomic>
 #include <windows.h>
 
 /*
@@ -82,10 +83,11 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config);
 /* Patches the device proxy vtable so CreateHeap and CreatePlacedResource run the code in vmem.cpp. */
 void bx_vmem_install_device_hooks(void* device);
 
-/* Called from BxDeviceProxy::Release when the proxy's last reference drops.
-   If the cached backing heap's weak device pointer is this proxy, it becomes null
-   so a later GetDevice returns E_FAIL instead of using freed memory. */
-void bx_vmem_clear_backing_device(void* device_proxy);
+/* Called from BxDeviceProxy::Release when its atomic count has dropped to zero.
+   Under g_section: if `refs` is no longer zero, GetDevice won the race and AddRef'd,
+   so the caller must not free the proxy and this returns false. Otherwise the cached
+   backing heap's weak pointer is cleared and this returns true. */
+bool bx_vmem_clear_backing_device(void* device_proxy, std::atomic<ULONG>* refs);
 
 /* AddRefs the host ID3D12Device that created the cached backing heap, or returns null.
    The test sets BX_D3D12_REUSE_BACKING_HOST=1 so a second proxy wraps this same host

@@ -236,7 +236,22 @@ public:
         if (!ppv) {
             return E_POINTER;
         }
-        /* The proxy, never the host device. QueryInterface AddRefs for the caller only. */
+        /* The proxy, never the host device. QueryInterface AddRefs for the caller only.
+           An ordinary heap owns its proxy, and nothing else writes device_, so that
+           read stays lock-free. The backing heap's device_ is weak: clear and
+           return_backing write it under g_section, so this read and the AddRef have
+           to hold that same lock or the proxy can be freed between them.
+           QueryInterface does not Release and does not enter g_section. Guard uses
+           EnterCriticalSection, which the same thread may enter again; this path
+           does not re-enter it. */
+        if (owns_device_) {
+            if (!device_) {
+                *ppv = nullptr;
+                return E_FAIL;
+            }
+            return device_->QueryInterface(riid, ppv);
+        }
+        Guard guard(g_section);
         if (!device_) {
             *ppv = nullptr;
             return E_FAIL;
@@ -761,12 +776,18 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
     return S_OK;
 }
 
-void bx_vmem_clear_backing_device(void* device_proxy) {
+bool bx_vmem_clear_backing_device(void* device_proxy, std::atomic<ULONG>* refs) {
     Guard guard(g_section);
+    /* GetDevice AddRefs under this same lock. If that landed after Release
+       observed zero, the proxy is still owned by the caller and must not be freed. */
+    if (refs && refs->load(std::memory_order_acquire) != 0) {
+        return false;
+    }
     auto* proxy = static_cast<BxDeviceProxy*>(device_proxy);
     if (g_record.backing && g_record.backing->device() == proxy) {
         g_record.backing->set_device(nullptr);
     }
+    return !refs || refs->load(std::memory_order_acquire) == 0;
 }
 
 void* bx_vmem_addref_backing_host() {

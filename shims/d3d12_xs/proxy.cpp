@@ -207,10 +207,14 @@ ULONG STDMETHODCALLTYPE BxDeviceProxy::AddRef() {
 ULONG STDMETHODCALLTYPE BxDeviceProxy::Release() {
     ULONG left = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (left == 0) {
-        /* Before this object is freed. The cached backing heap does not own this proxy. */
-        bx_vmem_clear_backing_device(this);
+        /* GetDevice on the cached heap AddRefs under the same lock. If it did,
+           this is no longer the last reference and the proxy stays alive. */
+        if (!bx_vmem_clear_backing_device(this, &refs_)) {
+            return refs_.load(std::memory_order_acquire);
+        }
         bx_release_hosts();
         delete this;
+        return 0;
     }
     return left;
 }
