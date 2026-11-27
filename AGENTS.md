@@ -64,8 +64,8 @@ Every feature issue belongs to **one track** and defines an **exclusive file sco
 | **Track F** | `tests/conformance/`, `docs/` | Synthetic PE32+ conformance tests, integration fixture, benchmarks, documentation |
 
 ### Cross-Track `[ABI]` Rule
-- Never edit another track's directory inside a feature PR.
-- If your track needs a new cross-DLL helper or export, open a small `[ABI]` PR touching only `abi/` first. Once merged, both provider and consumer tracks implement against the frozen contract in parallel.
+- For issue-claimed contributor work, stay inside your issue's track directory; if your track needs a new cross-DLL helper or export, open a small `[ABI]` PR touching only `abi/` first so provider and consumer tracks can implement in parallel.
+- Maintainer-directed compatibility and startup-unblocking tasks may touch the required shim and `tests/conformance/` directories directly without a pre-existing issue claim.
 - When adding a new conformance test, create `tests/conformance/test_<name>/CMakeLists.txt` + `main.cpp` — CMake auto-discovers `test_*` directories without editing `tests/conformance/CMakeLists.txt`.
 
 ---
@@ -83,7 +83,7 @@ Every feature issue belongs to **one track** and defines an **exclusive file sco
 
 - Before integrating or copying any third-party code: verify the **per-file** license (not just repository metadata), confirm compatibility with `GPL-3.0-or-later` and every selected component, preserve copyright notices, record the upstream repository and exact commit/version, document modifications, and record the entry in `docs/research/upstream-registry.md` and `docs/research/component-reuse-matrix.md`. If licensing is uncertain, do not use it until resolved.
 - Never bundle, modify, or redistribute proprietary components (CrossOver binaries, D3DMetal, Rosetta 2, Apple tools) unless their license explicitly allows it. Never bypass licensing or activation requirements of any dependency.
-- **Provenance first:** Exclude anything derived from leaked proprietary material or unauthorized software. A project's license being GPL does not clear material it was built from or for. Projects whose stated purpose depends on leaked or unauthorized builds (including VIctory, PE-Vulkan, KyTx, AnyPS5, and similar efforts) are never adopted as code, shader, asset, or tooling sources without a recorded per-file provenance and license audit. Game-specific, asset-specific, and decryption-related code is never adopted.
+- **Provenance first:** Exclude third-party code derived from leaked proprietary material or unauthorized software. A project's license being GPL does not clear material it was built from or for. Projects whose stated purpose depends on leaked or unauthorized builds (including VIctory, PE-Vulkan, KyTx, AnyPS5, and similar efforts) are never adopted as code, shader, asset, or tooling sources without a recorded per-file provenance and license audit. Game-specific patches, asset-specific workarounds, and decryption-related code are never adopted; general Xbox Game OS, Direct3D, DirectStorage, and runtime ABI contracts established from project-authorized builds are in-scope compatibility work.
 
 ---
 
@@ -97,26 +97,25 @@ Every feature issue belongs to **one track** and defines an **exclusive file sco
 
 ---
 
-## 6. Legal & Clean-Room Rules
+## 6. Compatibility Evidence & Legal Boundaries
 
-- Use only publicly accessible documentation, publicly licensed software, and authorized synthetic workloads. Never obtain, paste, or commit leaked executables or SDKs, confidential Xbox documentation, restricted console tools, firmware, encryption keys, unauthorized assets or source code, or proprietary game builds and shader collections.
+- **Authorized compatibility evidence:** Contributors and agents may use publicly accessible documentation, publicly licensed software, synthetic workloads, and **project-authorized target builds** (via local call-site inspection and runtime diagnostics) to establish undocumented Xbox OS, graphics, memory, storage, and runtime ABI contracts (struct layouts, flags, COM IIDs, vtable slot orders, and expected return/error semantics). Separate direct observations from inferences and verify every implemented contract with a synthetic conformance test under `tests/conformance/`.
+- **Repository & clean-tree boundary:** Never commit or paste proprietary executables, SDKs, confidential vendor documentation, restricted console tools, firmware, encryption keys, unauthorized assets or source code, raw caller memory dumps, executable contents/addresses, private traces, personal paths, or secrets into the repository, commit messages, or PR descriptions.
 - **Legal boundary (`docs/legal.md`):** BetterXen does not circumvent console security or DRM and does not load encrypted or protected content. Validate technical compatibility and safety of user-provided files; do not ask for ownership receipts, accounts, or acquisition provenance as part of file loading.
-- Never place restricted material, personal paths, or secrets in the repository or its Git history.
 
 ---
 
 ## 7. Claiming, Git Safety & Changelog
 
-1. **Check before coding:** Read every comment on the issue and check open PRs. Never claim over an active claim.
-2. **Claim in plain text:** Reply `Claiming — branch: track-<a..f>/<issue>-<slug>` on the issue (earliest claim wins; stale after 7 days without commits/PR).
-3. **Isolate with branches or worktrees:**
+1. **Check before coding (open backlog issues):** When picking an unclaimed backlog issue, read every comment and check open PRs so you never claim over an active claim; reply `Claiming — branch: track-<a..f>/<issue>-<slug>` (stale after 7 days without commits/PR). Direct maintainer-assigned tasks do not require a prior issue claim.
+2. **Isolate with branches or worktrees:**
    ```sh
    git worktree add ../wt-<issue> -b track-<a..f>/<issue>-<slug> origin/main
    ```
-4. **Link & sign off:** Put `Closes #<issue>` in the PR description and sign off every commit (`git commit -s`, DCO).
-5. **Git safety:** Never commit, push, or change remote visibility without explicit user authorization. Do not add AI attribution or `Co-authored-by` trailers to commits. Preserve the configured Git author and committer identity.
-6. **Changelog & docs index:** Read `CHANGELOG.md` before starting and update `[Unreleased]` for every meaningful addition, change, fix, removal, or security update. Update `docs/README.md` whenever documentation is added, removed, or reorganized.
-7. **Subagent reasoning:** When spawning helper subagents in automated workflows, keep subagent reasoning effort low unless the user explicitly asks otherwise.
+3. **Link & sign off:** Reference any related issue (`Closes #<issue>` when applicable) in the PR description and sign off every commit (`git commit -s`, DCO).
+4. **Git safety:** Commit, push, and open PRs only when requested or authorized by the user; never change repository visibility without explicit instruction. Do not add AI attribution or `Co-authored-by` trailers to commits. Preserve the configured Git author and committer identity.
+5. **Changelog & docs index:** Read `CHANGELOG.md` before starting and update `[Unreleased]` for every meaningful addition, change, fix, removal, or security update. Update `docs/README.md` whenever documentation is added, removed, or reorganized.
+6. **Subagent reasoning:** When spawning helper subagents in automated workflows, keep subagent reasoning effort low unless the user explicitly asks otherwise.
 
 ---
 
