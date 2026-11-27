@@ -37,6 +37,22 @@ inline constexpr DWORD BX_PRESENT_WAIT_MS = 5000;
  * Do not present that frame again. Call WaitForIdle until it returns S_OK before reusing a buffer.
  */
 inline constexpr HRESULT BX_PRESENT_E_NEXT_BUFFER_BUSY = static_cast<HRESULT>(0x80040201u);
+/*
+ * Present() result: the frame was NOT handed to the host, because another Present or WaitForIdle
+ * on this swapchain is in progress. Present never waits for that call. Try again after it returns.
+ */
+inline constexpr HRESULT BX_PRESENT_E_BUSY = static_cast<HRESULT>(0x80040202u);
+/*
+ * Present() result: the frame WAS handed to the host, but the fence signal that tracks it failed,
+ * so its completion is unknown. Do not present that frame again. Call WaitForIdle until it returns
+ * S_OK before recording to any back buffer or presenting again.
+ */
+inline constexpr HRESULT BX_PRESENT_E_COMPLETION_UNCONFIRMED = static_cast<HRESULT>(0x80040203u);
+/*
+ * Present() result: the frame was NOT handed to the host, because an earlier Present returned
+ * BX_PRESENT_E_COMPLETION_UNCONFIRMED and no WaitForIdle has succeeded since.
+ */
+inline constexpr HRESULT BX_PRESENT_E_NEEDS_IDLE = static_cast<HRESULT>(0x80040204u);
 
 struct BxPresentDesc {
     UINT width;          /* 1..16384; 0 ("use the window size") is not accepted */
@@ -59,11 +75,15 @@ struct IBxPresentSwapChain : public IUnknown {
     virtual UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() = 0;
     /*
      * Waits (bounded) until the current back buffer is idle, calls IDXGISwapChain::Present,
-     * signals a fence on the queue, then waits until the next back buffer is idle. Results:
+     * signals a fence on the queue, then waits until the next back buffer is idle. It never waits
+     * for another thread's call on this swapchain. Results:
      *   - a DXGI success code, including DXGI_STATUS_OCCLUDED: presented, next buffer idle;
      *   - HRESULT_FROM_WIN32(ERROR_TIMEOUT): NOT presented (the current buffer is still busy);
      *   - BX_PRESENT_E_NEXT_BUFFER_BUSY: presented, see its definition;
-     *   - another failure: the host's Present failure, or a fence or device failure. A fence
+     *   - BX_PRESENT_E_BUSY: NOT presented, another call holds the swapchain;
+     *   - BX_PRESENT_E_COMPLETION_UNCONFIRMED: presented, the fence signal failed;
+     *   - BX_PRESENT_E_NEEDS_IDLE: NOT presented, WaitForIdle must succeed first;
+     *   - another failure: the host's Present failure, or a fence or device failure. A fence wait
      *     or device failure can follow a successful host Present.
      * The bounds cover BetterXen's own waits, not time spent inside the host's Present.
      *
@@ -74,7 +94,8 @@ struct IBxPresentSwapChain : public IUnknown {
      */
     virtual HRESULT STDMETHODCALLTYPE Present(UINT sync_interval, UINT flags) = 0;
     /*
-     * Waits until everything submitted to the queue before this call has finished.
+     * Waits until everything submitted to the queue before this call has finished. S_OK also ends
+     * the state left by BX_PRESENT_E_COMPLETION_UNCONFIRMED.
      * INFINITE is rejected with E_INVALIDARG; a timeout returns HRESULT_FROM_WIN32(ERROR_TIMEOUT).
      * timeout_ms includes any time spent waiting for a Present on another thread.
      */

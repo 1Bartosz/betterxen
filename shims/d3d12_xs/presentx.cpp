@@ -75,6 +75,7 @@ private:
     std::atomic<DWORD> owner_{0}; /* thread holding lock_ */
     UINT64 last_signaled_ = 0;
     UINT64 presented_ = 0;
+    bool needs_idle_ = false; /* a presented frame has no fence value; only an idle queue clears this */
     UINT64 buffer_value_[DXGI_MAX_SWAP_CHAIN_BUFFERS] = {};
 };
 
@@ -333,8 +334,19 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
         bx_log_emit(BX_LOG_WARN, "d3d12_xs", "present_rejected", "re-entered on the same thread");
         return DXGI_ERROR_INVALID_CALL;
     }
-    AcquireSRWLockExclusive(&lock_);
+    /*
+     * Never wait for the lock. Its holder may be inside the host's Present, and DXGI can make that
+     * call wait for the window's thread: the caller here.
+     */
+    if (!TryAcquireSRWLockExclusive(&lock_)) {
+        bx_log_emit(BX_LOG_WARN, "d3d12_xs", "present_busy", "another call holds the swapchain; nothing presented");
+        return BX_PRESENT_E_BUSY;
+    }
     SrwOwner guard(lock_, owner_);
+    if (needs_idle_) {
+        bx_log_emit(BX_LOG_WARN, "d3d12_xs", "present_needs_idle", "completion unconfirmed; nothing presented");
+        return BX_PRESENT_E_NEEDS_IDLE;
+    }
     const UINT presented_index = swap_->GetCurrentBackBufferIndex();
     if (presented_index < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
         /* Busy only after an earlier BX_PRESENT_E_NEXT_BUFFER_BUSY. Nothing is presented then. */
@@ -356,7 +368,12 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
     UINT64 value = 0;
     HRESULT sync_hr = signal_locked(&value);
     if (FAILED(sync_hr)) {
-        return sync_hr;
+        /*
+         * The host has the frame, but no fence value follows it, so buffer_value_ would still name
+         * older work. signal_locked logged the host HRESULT.
+         */
+        needs_idle_ = true;
+        return BX_PRESENT_E_COMPLETION_UNCONFIRMED;
     }
     if (presented_index < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
         buffer_value_[presented_index] = value;
@@ -388,7 +405,12 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::WaitForIdle(DWORD timeout_ms) {
     }
     SrwOwner guard(lock_, owner_);
     const ULONGLONG spent = GetTickCount64() - start;
-    return idle_locked(spent < timeout_ms ? static_cast<DWORD>(timeout_ms - spent) : 0);
+    const HRESULT hr = idle_locked(spent < timeout_ms ? static_cast<DWORD>(timeout_ms - spent) : 0);
+    if (hr == S_OK) {
+        /* A signal queued after every presented frame has completed. */
+        needs_idle_ = false;
+    }
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE BxPresentSwapChain::GetHostSwapChain(REFIID riid, void** ppv) {
