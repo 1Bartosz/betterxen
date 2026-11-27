@@ -43,8 +43,8 @@ inline constexpr HRESULT BX_PRESENT_E_NEXT_BUFFER_BUSY = static_cast<HRESULT>(0x
  */
 inline constexpr HRESULT BX_PRESENT_E_BUSY = static_cast<HRESULT>(0x80040202u);
 /*
- * Present() result: the frame WAS handed to the host, but the fence signal that tracks it failed,
- * so its completion is unknown. Do not present that frame again. Call WaitForIdle until it returns
+ * Present() result: the frame WAS handed to the host, but the following fence signal or
+ * back-buffer wait failed. Do not present that frame again. Call WaitForIdle until it returns
  * S_OK before recording to any back buffer or presenting again.
  */
 inline constexpr HRESULT BX_PRESENT_E_COMPLETION_UNCONFIRMED = static_cast<HRESULT>(0x80040203u);
@@ -81,10 +81,9 @@ struct IBxPresentSwapChain : public IUnknown {
      *   - HRESULT_FROM_WIN32(ERROR_TIMEOUT): NOT presented (the current buffer is still busy);
      *   - BX_PRESENT_E_NEXT_BUFFER_BUSY: presented, see its definition;
      *   - BX_PRESENT_E_BUSY: NOT presented, another call holds the swapchain;
-     *   - BX_PRESENT_E_COMPLETION_UNCONFIRMED: presented, the fence signal failed;
+     *   - BX_PRESENT_E_COMPLETION_UNCONFIRMED: presented, the fence signal or next-buffer wait failed;
      *   - BX_PRESENT_E_NEEDS_IDLE: NOT presented, WaitForIdle must succeed first;
-     *   - another failure: the host's Present failure, or a fence or device failure. A fence wait
-     *     or device failure can follow a successful host Present.
+     *   - another failure: the host's Present failure, or a failure before calling host Present.
      * The bounds cover BetterXen's own waits, not time spent inside the host's Present.
      *
      * The bridge itself returns DXGI_ERROR_INVALID_CALL, without calling the host, for a

@@ -75,7 +75,7 @@ private:
     std::atomic<DWORD> owner_{0}; /* thread holding lock_ */
     UINT64 last_signaled_ = 0;
     UINT64 presented_ = 0;
-    bool needs_idle_ = false; /* a presented frame has no fence value; only an idle queue clears this */
+    bool needs_idle_ = false; /* completion after Present is unconfirmed until the queue is idle */
     UINT64 buffer_value_[DXGI_MAX_SWAP_CHAIN_BUFFERS] = {};
 };
 
@@ -384,8 +384,13 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
     const UINT next = swap_->GetCurrentBackBufferIndex();
     if (next < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
         sync_hr = wait_locked(buffer_value_[next], GetTickCount64(), BX_PRESENT_WAIT_MS);
+        if (sync_hr == kWaitTimedOut) {
+            return BX_PRESENT_E_NEXT_BUFFER_BUSY;
+        }
         if (FAILED(sync_hr)) {
-            return sync_hr == kWaitTimedOut ? BX_PRESENT_E_NEXT_BUFFER_BUSY : sync_hr;
+            log_hr(BX_LOG_ERROR, "present_post_wait_failed", "wait for next back buffer", sync_hr);
+            needs_idle_ = true;
+            return BX_PRESENT_E_COMPLETION_UNCONFIRMED;
         }
     }
     return hr;
