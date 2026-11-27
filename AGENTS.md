@@ -4,9 +4,9 @@ These rules apply to every human contributor and coding agent (`CLAUDE.md` is a 
 
 ---
 
-## 0. First-Time Contributor Onboarding
+## 0. Contributor & Agent Task Dispatch (Onboarding & Priority Order)
 
-If the user asks to contribute, get started, or pick a task (even with a short prompt like *"help me contribute"*), walk them through this exact end-to-end flow:
+Whenever a user points their agent at BetterXen to contribute, get started, or pick work (even with a short prompt like *"help me contribute"* or *"what should we work on?"*), walk through preflight and then select work in the **strict 3-tier priority order** below:
 
 1. **Preflight host & tools:**
    - Check `uname -m` (`arm64`), `git`, `gh`, `cargo`, `cmake`, `x86_64-w64-mingw32-g++`, and `python3`.
@@ -14,14 +14,26 @@ If the user asks to contribute, get started, or pick a task (even with a short p
    - Run `gh auth status` (if not logged in, pause and ask the user to run `gh auth login`).
    - Run `cargo build --locked -p bx-cli && target/debug/bx-cli doctor` to report Apple Silicon, Rosetta 2, CrossOver, and toolchain readiness.
    - Verify whether the user has push access or needs a fork (`gh repo fork MacosPorters/betterxen --remote`), and sync with `origin/main`.
-2. **Discover & pick an unclaimed issue:**
-   - Query ready issues in the active milestone:
+2. **Select work in strict priority order:**
+   - **Priority 1 (Highest) — Handle your own claimed PRs with requested changes or review feedback:**
+     ```sh
+     gh pr list --repo MacosPorters/betterxen --author "@me" --state open --json number,title,headRefName,reviewDecision,reviews,statusCheckRollup,mergeStateStatus
+     ```
+     Inspect comments and reviews (`gh pr view <pr> --repo MacosPorters/betterxen --comments` and `gh api repos/MacosPorters/betterxen/pulls/<pr>/comments`). If any of the user's open/claimed PRs has `CHANGES_REQUESTED`, unresolved reviewer feedback, failing CI, or merge conflicts, **address that PR first before starting new work**: check out the PR branch, resolve every review item, re-run Section 8 checks, push the DCO-signed update, and summarize how each comment was addressed.
+   - **Priority 2 — Pick an unclaimed open issue:**
+     If Priority 1 is clear, query open issues (preferring `status: ready` in the active milestone, then other actionable open issues):
      ```sh
      gh issue list --repo MacosPorters/betterxen --state open --label "status: ready" --json number,title,labels,assignees
+     gh issue list --repo MacosPorters/betterxen --state open --json number,title,labels,assignees
      ```
-   - Inspect comments and open PRs on candidate issues to filter out any issue that already has an active claim (< 7 days old).
-   - Present the unclaimed options in plain English (recommending 1–2 good starting issues matching the user's background) and wait for the user to choose one before coding.
-3. **Claim & isolate:**
+     Inspect comments and open PRs on candidate issues to filter out any issue with an active claim (< 7 days old) or open PR. Present the unclaimed options in plain English (recommending 1–2 good matches) and confirm with the user before coding.
+   - **Priority 3 — Review & independently verify open PRs needing review:**
+     When Priority 1 is clear and no unclaimed open issues remain (or the user asks to help unblock the queue), query open non-draft PRs by other contributors that still need review/verification:
+     ```sh
+     gh pr list --repo MacosPorters/betterxen --state open --json number,title,author,headRefName,reviewDecision,isDraft
+     ```
+     Fetch a candidate PR (`reviewDecision` empty or `REVIEW_REQUIRED`) into an isolated worktree, independently verify its contract and implementation per Section 5, run the Section 8 checks locally (including live CrossOver / D3DMetal runs where available), and draft an honest evidence-backed review for user approval before posting.
+3. **Claim & isolate (for Priority 2 issue work):**
    - Post `Claiming — branch: track-<a..f>/<issue>-<slug>` on the chosen issue and create that branch (or `git worktree`) off `origin/main`.
 4. **Implement strictly in scope:**
    - Read the full issue body (`gh issue view <issue> --repo MacosPorters/betterxen`) and the relevant contracts in `abi/defs/` and `abi/include/`.
