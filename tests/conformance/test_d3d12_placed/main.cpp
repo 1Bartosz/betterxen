@@ -319,6 +319,101 @@ bool get_device_closed(ID3D12Heap* heap) {
     return closed;
 }
 
+struct DeviceStartupCheck {
+    HANDLE start;
+    HRESULT device_hr = E_FAIL;
+    HRESULT heap_hr = E_FAIL;
+};
+
+DWORD WINAPI check_device_startup(LPVOID context) {
+    auto& result = *static_cast<DeviceStartupCheck*>(context);
+    if (WaitForSingleObject(result.start, INFINITE) != WAIT_OBJECT_0) {
+        return 1;
+    }
+    ID3D12Device* device = nullptr;
+    result.device_hr = D3D12XboxCreateDevice(nullptr, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
+    if (SUCCEEDED(result.device_hr) && device) {
+        const auto desc = heap_of(D3D12_HEAP_TYPE_UPLOAD, 600ull << 20, D3D12_HEAP_FLAG_NONE);
+        ID3D12Heap* heap = nullptr;
+        result.heap_hr = device->CreateHeap(&desc, __uuidof(ID3D12Heap), reinterpret_cast<void**>(&heap));
+        if (heap) heap->Release();
+        device->Release();
+    }
+    return 0;
+}
+
+void check_concurrent_device_startup() {
+    HANDLE start = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!check(start != nullptr, "startup barrier for concurrent devices")) {
+        return;
+    }
+    DeviceStartupCheck results[2] = {{start}, {start}};
+    HANDLE threads[2] = {
+        CreateThread(nullptr, 0, check_device_startup, &results[0], 0, nullptr),
+        CreateThread(nullptr, 0, check_device_startup, &results[1], 0, nullptr),
+    };
+    SetEvent(start);
+    for (size_t i = 0; i < 2; ++i) {
+        if (check(threads[i] != nullptr, "concurrent device worker %zu started", i)) {
+            const DWORD waited = WaitForSingleObject(threads[i], INFINITE);
+            check(waited == WAIT_OBJECT_0 && results[i].device_hr == S_OK && results[i].heap_hr == E_OUTOFMEMORY,
+                  "concurrent device %zu enforces the cap (device=0x%08lx heap=0x%08lx)", i,
+                  ul(results[i].device_hr), ul(results[i].heap_hr));
+            CloseHandle(threads[i]);
+        }
+    }
+    CloseHandle(start);
+}
+
+void check_placed_heap_charge(ID3D12Device* device, const char* log_path, uint64_t region_base, uint64_t cap) {
+    const bool capped = cap == (512ull << 20);
+    const uint64_t heap_bytes = capped ? 300ull << 20 : kAlign;
+    const auto heap_desc = heap_of(D3D12_HEAP_TYPE_UPLOAD, heap_bytes, D3D12_HEAP_FLAG_NONE);
+    ID3D12Heap* heap = nullptr;
+    HRESULT hr = device->CreateHeap(&heap_desc, __uuidof(ID3D12Heap), reinterpret_cast<void**>(&heap));
+    if (!check(hr == S_OK && heap, "heap for placed-resource charge check hr=0x%08lx", ul(hr))) {
+        return;
+    }
+    ID3D12Resource* resource = nullptr;
+    const auto desc = buffer_desc(kBufBytes);
+    hr = device->CreatePlacedResource(heap, 0, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resource));
+    heap->Release();
+    if (!check(hr == S_OK && resource, "placed resource can outlive the caller's heap reference hr=0x%08lx", ul(hr))) {
+        return;
+    }
+
+    void* data = nullptr;
+    hr = resource->Map(0, nullptr, &data);
+    if (check(hr == S_OK && data, "retained placed resource still maps hr=0x%08lx", ul(hr))) {
+        *static_cast<uint8_t*>(data) = 0x5a;
+        resource->Unmap(0, nullptr);
+    }
+    auto cfg = make_block(region_base, kRegionBytes, kFlagBacking);
+    hr = D3D12ConfigureVirtualMemoryX(&cfg);
+    check(hr == S_OK && last_log_u64(log_path, "gpu_heap_bytes=") == kRegionBytes + heap_bytes,
+          "live placed resource keeps the original heap charge");
+
+    if (capped) {
+        ID3D12Heap* second = nullptr;
+        hr = device->CreateHeap(&heap_desc, __uuidof(ID3D12Heap), reinterpret_cast<void**>(&second));
+        check(hr == E_OUTOFMEMORY && !second, "second 300 MiB heap exceeds the 512 MiB cap hr=0x%08lx", ul(hr));
+        if (second) second->Release();
+    }
+
+    resource->Release();
+    hr = D3D12ConfigureVirtualMemoryX(&cfg);
+    check(hr == S_OK && last_log_u64(log_path, "gpu_heap_bytes=") == kRegionBytes,
+          "final placed resource release credits the original heap");
+
+    if (capped) {
+        ID3D12Heap* second = nullptr;
+        hr = device->CreateHeap(&heap_desc, __uuidof(ID3D12Heap), reinterpret_cast<void**>(&second));
+        check(hr == S_OK && second, "second 300 MiB heap fits after releasing the resource hr=0x%08lx", ul(hr));
+        if (second) second->Release();
+    }
+}
+
 /* CreatePlacedResource1 must accept a heap from CreateHeap. CreatePlacedResource2
    is checked only when the host device implements ID3D12Device10. */
 void check_newer_placement(ID3D12Device* device) {
@@ -581,6 +676,9 @@ int main() {
     check(mapped, "xmem must map two contiguous 64 KiB pages");
     const uint64_t region_base = reinterpret_cast<uint64_t>(view);
 
+    if (cfg->title_memory_limit_bytes == (512ull << 20)) {
+        check_concurrent_device_startup();
+    }
     ID3D12Device* device = nullptr;
     HRESULT hr = D3D12XboxCreateDevice(nullptr, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
     if (!check(hr == S_OK && device, "D3D12XboxCreateDevice hr=0x%08lx", ul(hr))) {
@@ -1191,6 +1289,10 @@ int main() {
     if (readback) readback->Release();
     if (placed_tex) placed_tex->Release();
     if (placed_buf) placed_buf->Release();
+
+    if (mapped && backing && have_log) {
+        check_placed_heap_charge(device, log_path, region_base, cfg->title_memory_limit_bytes);
+    }
 
     /*
      * An ordinary heap AddRefs its device, matching BxChildProxy. Releasing the

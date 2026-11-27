@@ -11,15 +11,13 @@
  * The configured region is backed by one CUSTOM WRITE_BACK / L0 heap and a buffer
  * that stays mapped. That heap is created with D3D12_HEAP_FLAG_NONE, 64 KiB
  * alignment, and node masks 0. CreateHeap returns it only for the explicit
- * opt-in desc documented in vmem.h. atesahmet0 and Arths17 measured this for
- * #473: WRITE_BACK or WRITE_COMBINE on L0 is shared memory, and both
- * OpenExistingHeap methods return E_NOTIMPL. This file does not call them.
+ * opt-in desc documented in vmem.h. In #473, CPU and GPU reads agreed after
+ * a fence on tested L0 heaps. Both OpenExistingHeap methods returned E_NOTIMPL.
  * This file does not request L1 and does not treat an xmem address as a GPU pointer.
  *
- * Any other CreateHeap forwards the caller's D3D12_HEAP_DESC unmodified and
- * returns the host HRESULT. The wrapper and the live-heap xmem budget charge
- * are the only differences: charge on create, credit on the wrapper's final
- * Release, E_OUTOFMEMORY only when that budget is exceeded.
+ * Any other CreateHeap forwards the caller's D3D12_HEAP_DESC unmodified.
+ * The wrapper charges the heap on create and credits it on final Release.
+ * Resources created by CreatePlacedResource retain the wrapper.
  * GetDevice on every wrapper returns the BxDeviceProxy. An ordinary heap AddRefs
  * that proxy and Releases it after the wrapper is destroyed, matching
  * BxChildProxy, so the caller may release the device and keep the heap.
@@ -32,9 +30,9 @@
  * vkd3d on CrossOver 26.2 faults on that pointer with or without this shim.
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createheap
  *
- * CreatePlacedResource on any heap other than the backing heap is forwarded
- * the same way, with no extra checks. On the backing heap the offset must be a
- * multiple of the alignment GetResourceAllocationInfo reports, the resource
+ * CreatePlacedResource forwards the caller's parameters to the host.
+ * On the backing heap the offset must be a multiple of the alignment
+ * GetResourceAllocationInfo reports, the resource
  * must fit, and an upload or readback heap (not this CUSTOM heap) must use the
  * initial state Microsoft Learn requires:
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createplacedresource
@@ -50,6 +48,7 @@ namespace {
 
 constexpr uint64_t k64K = 64ull * 1024ull;
 constexpr uint32_t kConfigVersion = 1;
+constexpr GUID kPlacedResourceHeap = {0x3a652cbb, 0xb5b3, 0x4e09, {0xb3, 0x6c, 0xc0, 0x2c, 0xa9, 0x83, 0xae, 0x1a}};
 
 struct Record {
     bool configured = false;
@@ -203,13 +202,13 @@ public:
         if (left == 0) {
             /* Final Release of a live heap. D3DMetal may pool the pages after this,
                so the budget credit is the live-heap count, not a physical-memory drop. */
-            release_charge(bytes_);
             if (host1_) {
                 host1_->Release();
             }
             if (host_) {
                 host_->Release();
             }
+            release_charge(bytes_);
             /* Same order as BxChildProxy::Release: destroy the wrapper, then Release the device. */
             BxDeviceProxy* owned = owns_device_ ? device_ : nullptr;
             device_ = nullptr;
@@ -661,24 +660,9 @@ HRESULT STDMETHODCALLTYPE create_placed(BxDeviceProxy* self, ID3D12Heap* heap, U
         BX_VTABLE_STUB_LOG("ID3D12Device", 29u, "CreatePlacedResource");
         return E_NOTIMPL;
     }
-    if (!out) {
-        /* A null out pointer is forwarded unchanged to the host.
-         * vkd3d on CrossOver 26.2 faults on that pointer with or without this shim.
-         */
-        if (is_backing_heap(heap)) {
-            const HRESULT check_hr = validate_backing_placement(self->h_ID3D12Device, heap, offset, desc, state, clear);
-            if (FAILED(check_hr)) {
-                log_placed(offset, check_hr);
-                return check_hr;
-            }
-        }
-        ID3D12Heap* host_heap = bx_unwrap(heap);
-        const HRESULT hr =
-            self->h_ID3D12Device->CreatePlacedResource(host_heap, offset, desc, state, clear, riid, nullptr);
-        log_placed(offset, hr);
-        return hr;
+    if (out) {
+        *out = nullptr;
     }
-    *out = nullptr;
     if (is_backing_heap(heap)) {
         const HRESULT check_hr = validate_backing_placement(self->h_ID3D12Device, heap, offset, desc, state, clear);
         if (FAILED(check_hr)) {
@@ -687,8 +671,23 @@ HRESULT STDMETHODCALLTYPE create_placed(BxDeviceProxy* self, ID3D12Heap* heap, U
         }
     }
     ID3D12Heap* host_heap = bx_unwrap(heap);
-    const HRESULT hr =
-        self->h_ID3D12Device->CreatePlacedResource(host_heap, offset, desc, state, clear, riid, out);
+    HRESULT hr = self->h_ID3D12Device->CreatePlacedResource(host_heap, offset, desc, state, clear, riid, out);
+    if (SUCCEEDED(hr) && out && *out && host_heap != heap) {
+        /* The resource owns a reference to the shim heap through its host
+           object's private data, including across QueryInterface calls. */
+        auto* created = static_cast<IUnknown*>(*out);
+        ID3D12Object* object = nullptr;
+        HRESULT retain_hr = created->QueryInterface(__uuidof(ID3D12Object), reinterpret_cast<void**>(&object));
+        if (SUCCEEDED(retain_hr)) {
+            retain_hr = object->SetPrivateDataInterface(kPlacedResourceHeap, heap);
+            object->Release();
+        }
+        if (FAILED(retain_hr)) {
+            created->Release();
+            *out = nullptr;
+            hr = retain_hr;
+        }
+    }
     log_placed(offset, hr);
     return hr;
 }
@@ -843,33 +842,35 @@ void* bx_vmem_addref_backing_host() {
     return g_record.backing_host;
 }
 
-void bx_vmem_install_device_hooks(void* device) {
+bool bx_vmem_install_device_hooks(void* device) {
     /*
      * CreateHeap is slot 28 and CreatePlacedResource is slot 29 on ID3D12Device.
-     * BxDeviceProxy does not override those methods, and proxy.cpp / proxy.h are left
-     * untouched, so the slots cannot be replaced by a virtual override.
+     * BxDeviceProxy inherits both methods from the generated forwarders.
      * The proxy vtable is shared static data: every BxDeviceProxy instance points at
      * the same function table. Patching it once covers every device this DLL creates.
      * That table is in a read-only section, so VirtualProtect opens the two slots for
      * the store and then puts the previous protection back.
      * No other hook in this DLL replaces those methods without editing the proxy sources.
      */
-    static LONG installed = 0;
-    if (!device || InterlockedCompareExchange(&installed, 1, 0) != 0) {
-        return;
+    /* No caller may publish a proxy until both shared slots are ready. */
+    static bool installed = false;
+    Guard guard(g_section);
+    if (installed) {
+        return true;
     }
     auto* proxy = static_cast<BxDeviceProxy*>(device);
     void** vtable = *reinterpret_cast<void***>(proxy);
     DWORD old = 0;
     if (!VirtualProtect(vtable + 28, sizeof(void*) * 2, PAGE_READWRITE, &old)) {
-        InterlockedExchange(&installed, 0);
         bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "vmem_hook", "VirtualProtect on the device vtable failed");
         BX_VTABLE_STUB_LOG("ID3D12Device", 28u, "CreateHeap");
-        return;
+        return false;
     }
     vtable[28] = reinterpret_cast<void*>(&create_heap);
     vtable[29] = reinterpret_cast<void*>(&create_placed);
     DWORD ignored = 0;
     VirtualProtect(vtable + 28, sizeof(void*) * 2, old, &ignored);
+    installed = true;
     bx_log_emit(BX_LOG_INFO, "d3d12_xs", "vmem_hook", "CreateHeap and CreatePlacedResource installed");
+    return true;
 }

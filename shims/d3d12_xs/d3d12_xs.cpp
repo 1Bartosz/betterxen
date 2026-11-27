@@ -2,6 +2,7 @@
 #include "vmem.h"
 
 #include <cstdio>
+#include <mutex>
 
 /*
  * Track C (M1-C1, #414): Xbox Series D3D12 entry points over the host's d3d12.dll
@@ -19,9 +20,12 @@ HMODULE get_host_d3d12() {
     return mod;
 }
 
-void refresh_trace_flag() {
-    const bx_runtime_config_t* cfg = bx_get_runtime_config();
-    g_bx_trace_d3d = (cfg && cfg->trace_d3d) ? 1u : 0u;
+void initialize_trace_flag() {
+    static std::once_flag initialized;
+    std::call_once(initialized, [] {
+        const bx_runtime_config_t* cfg = bx_get_runtime_config();
+        g_bx_trace_d3d = (cfg && cfg->trace_d3d) ? 1u : 0u;
+    });
 }
 
 } // namespace
@@ -39,7 +43,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(PVOID params, REFIID riid, void** ppv) {
         return E_POINTER;
     }
     *ppv = nullptr;
-    refresh_trace_flag();
+    initialize_trace_flag();
 
     using CreateFn = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
     HMODULE d3d12 = get_host_d3d12();
@@ -77,7 +81,10 @@ HRESULT WINAPI D3D12XboxCreateDevice(PVOID params, REFIID riid, void** ppv) {
     if (!proxy) {
         return E_OUTOFMEMORY;
     }
-    bx_vmem_install_device_hooks(proxy);
+    if (!bx_vmem_install_device_hooks(proxy)) {
+        proxy->Release();
+        return E_FAIL;
+    }
 
     /* Record how far up the ID3D12DeviceN chain the host goes: QueryInterface on the proxy stops there. */
     int highest = 0;

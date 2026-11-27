@@ -30,7 +30,11 @@
  * does not write the block. A caller that needs the address after the backing
  * heap has been created calls D3D12ConfigureVirtualMemoryX again with the same
  * region (same base_va and size). That second call does not reset or recreate
- * the backing heap. It writes the current map into the new block.
+ * the backing heap. It writes the current map into the new block. A nonzero
+ * cpu_pointer is valid only while that backing buffer remains cached. Changing
+ * the region or replacing the cache for another host device unmaps it, even if
+ * the caller retains the heap. Callers must synchronize those operations with
+ * access through the pointer and obtain a fresh pointer after replacement.
  *
  * CreateHeap returns that backing heap only when all of the following hold:
  * the block opted in with BX_D3D12_VMEM_FLAG_BACKING_HEAP, the region size is
@@ -42,8 +46,9 @@
  * If the backing configuration changes during a backing request, CreateHeap
  * returns HRESULT_FROM_WIN32(ERROR_RETRY) and discards any newly allocated heap.
  * Any other CreateHeap is the host CreateHeap. The desc is not modified.
- * The live-heap xmem budget charge (taken on create, dropped on the wrapper's
- * final Release) is the budget difference, and the returned object is the wrapper.
+ * The live-heap budget charge is taken on create and dropped on the wrapper's
+ * final Release. A resource created by CreatePlacedResource holds the wrapper
+ * for its lifetime.
  * GetDevice on every wrapper returns the BxDeviceProxy. An ordinary heap AddRefs
  * that proxy until the wrapper's final Release, matching BxChildProxy, so the
  * caller can release the device and keep the heap. The process-wide backing heap
@@ -85,7 +90,7 @@ static_assert(offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer) == 40, "cpu_poin
 extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config);
 
 /* Patches the device proxy vtable so CreateHeap and CreatePlacedResource run the code in vmem.cpp. */
-void bx_vmem_install_device_hooks(void* device);
+bool bx_vmem_install_device_hooks(void* device);
 
 /* 1->0 Release of a device proxy, under g_section. Compare-exchanges the count from
    1 to 0 and clears every weak backing-heap pointer aimed at that proxy. Returns false
