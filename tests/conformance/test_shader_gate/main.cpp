@@ -457,8 +457,11 @@ int main() {
           "shader_gate record rejecting the ACCC-only vertex shader");
     check(log_has(log, {"\"event\":\"shader_gate\"", "decision=reject_wave_wide", "hr=0x80004001"}),
           "shader_gate record refusing the wave64 stage");
-    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=pass_dxil", "wave_ops=1", "wave_lanes=64-64"}),
-          "shader_gate record with WaveSize(64)");
+    // The wave64 stage is now refused before `pass_dxil` is logged (#591), so the record to
+    // assert is the rejection, carrying the same wave constraints the gap was measured on.
+    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=reject_wave_wide", "wave_ops=1",
+                        "wave_lanes=64-64"}),
+          "shader_gate record with WaveSize(64), refused");
     check(log_has(log, {"\"event\":\"shader_d3dmetal_gap\"", "wave_lanes_min=64"}),
           "shader_d3dmetal_gap record for WaveSize(64)");
     check(log_has(log, {"\"event\":\"shader_gate\"", "decision=pass_dxil", "int64_ops=1", "atomic64=typed,"}),

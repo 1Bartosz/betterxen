@@ -268,11 +268,17 @@ HRESULT BxShaderGate::admit(const char* pso_kind, const char* stage, const D3D12
              * PSO call returns. */
             if (wave_wider_than_32(constraints)) {
                 log_gate(pso_kind, stage, len, &info, &constraints, "reject_wave_wide", E_NOTIMPL);
-                char detail[160];
+                /* Keep the established gap-detail shape: the consumer (#593) strips a trailing
+                 * colon from the last value and treats `atomic64_flags` as always present, so
+                 * `wave_lanes_min` must not be the final field. */
+                char detail[200];
                 std::snprintf(detail, sizeof(detail),
-                              "pso=%s stage=%s wave_lanes_min=%lu: a wave wider than 32 lanes is created "
-                              "but never run on D3DMetal (#453); refused at PSO creation (#591)",
-                              pso_kind, stage, static_cast<unsigned long>(constraints.lanes_min));
+                              "pso=%s stage=%s wave_lanes_min=%lu atomic64_flags=0x%llx: a wave wider "
+                              "than 32 lanes is created but never run on D3DMetal (#453); refused at "
+                              "PSO creation (#591)",
+                              pso_kind, stage, static_cast<unsigned long>(constraints.lanes_min),
+                              static_cast<unsigned long long>(
+                                  constraints.flags & (kAtomic64Typed | kAtomic64GroupShared | kAtomic64Heap)));
                 bx_log_emit(BX_LOG_WARN, "d3d12_xs", "shader_d3dmetal_gap", detail);
                 return E_NOTIMPL;
             }
