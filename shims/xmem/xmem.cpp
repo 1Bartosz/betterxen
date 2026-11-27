@@ -63,6 +63,10 @@ CommitTable virtual_commits;
 uint64_t heap_bytes = 0;
 uint64_t virtual_bytes = 0;
 uint64_t physical_bytes = 0;
+/* Bytes admitted through bx_xmem_try_charge_external() on behalf of other
+ * DLLs (e.g. d3d12_xs private host heaps). Counted in can_commit so both
+ * allocation orders (graphics-first or xmem-first) obey one title cap. */
+uint64_t external_bytes = 0;
 uint64_t peak_bytes = 0;
 
 uint64_t title_limit() {
@@ -72,12 +76,12 @@ uint64_t title_limit() {
 
 bool can_commit(uint64_t bytes) {
     const uint64_t limit = title_limit();
-    const uint64_t used = heap_bytes + virtual_bytes + physical_bytes;
+    const uint64_t used = heap_bytes + virtual_bytes + physical_bytes + external_bytes;
     return used <= limit && bytes <= limit - used;
 }
 
 void update_peak() {
-    peak_bytes = std::max(peak_bytes, heap_bytes + virtual_bytes + physical_bytes);
+    peak_bytes = std::max(peak_bytes, heap_bytes + virtual_bytes + physical_bytes + external_bytes);
 }
 
 uintptr_t region_end(const MEMORY_BASIC_INFORMATION& region) {
@@ -308,6 +312,26 @@ void bx_xmem_get_internal_stats(bx_xmem_stats_t* out_stats) {
         std::lock_guard guard(usage_lock);
         *out_stats = {title_limit(), heap_bytes + virtual_bytes, physical_bytes, peak_bytes};
     }
+}
+
+int bx_xmem_try_charge_external(uint64_t bytes) {
+    std::lock_guard guard(usage_lock);
+    if (!can_commit(bytes) && (!refresh_virtual_commits() || !can_commit(bytes))) {
+        return 0;
+    }
+    external_bytes += bytes;
+    update_peak();
+    return 1;
+}
+
+void bx_xmem_release_charge_external(uint64_t bytes) {
+    std::lock_guard guard(usage_lock);
+    if (bytes > external_bytes) {
+        bx_log_emit(BX_LOG_ERROR, "xmem", "external_charge", "external charge underflow on release");
+        external_bytes = 0;
+        return;
+    }
+    external_bytes -= bytes;
 }
 
 } // extern "C"

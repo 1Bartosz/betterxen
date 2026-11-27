@@ -36,6 +36,16 @@ int bx_xmem_query_region(uint64_t va, bx_xmem_region_info_t* out_info);
 /* Snapshot current XMem usage against the active Lockhart/Anaconda cap. */
 void bx_xmem_get_internal_stats(bx_xmem_stats_t* out_stats);
 
+/* Admit `bytes` against the combined title cap, counting every owner.
+ * Returns 1 on success, 0 when the cap would be exceeded. On success the
+ * caller owns the charge and must release it exactly once with
+ * bx_xmem_release_charge_external(). Never silently succeeds on failure. */
+int bx_xmem_try_charge_external(uint64_t bytes);
+
+/* Release a charge previously admitted by bx_xmem_try_charge_external().
+ * Releasing more than is outstanding clamps to zero and logs. */
+void bx_xmem_release_charge_external(uint64_t bytes);
+
 #ifdef __cplusplus
 }
 #endif
