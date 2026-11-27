@@ -60,9 +60,10 @@ struct Record {
     uint64_t config_size = 0;
     uint64_t config_generation = 0;
     bx_xmem_region_info_t region{};
-    /* Bytes of host heaps still alive. D3DMetal keeps freed memory in its own
-       pool, so this counts live heaps only: charge on create, credit on the
-       final Release. It does not assume the OS reclaimed the pages. */
+    /* Diagnostic mirror of the external xmem charges for live host heaps.
+       D3DMetal keeps freed memory in its own pool, so this counts live heaps
+       only: charge on create, credit on the final Release. It does not assume
+       the OS reclaimed the pages. xmem's external_bytes is authoritative. */
     uint64_t charged_private_bytes = 0;
     uint64_t cpu_pointer = 0;
     class BxChargedHeap* backing = nullptr;
@@ -108,7 +109,30 @@ const char* profile_name(bx_hardware_profile_t profile) {
     return profile == BX_PROFILE_ANACONDA ? "anaconda" : "lockhart";
 }
 
-/* Private host heaps count against the same Lockhart/Anaconda cap as xmem. */
+/* Private host heaps count against the same Lockhart/Anaconda cap as xmem.
+ * xmem's external_bytes is the authoritative ledger. The local mirror is
+ * retained only for the gpu_heap_bytes diagnostic log.
+ *
+ * Overflow/underflow arithmetic (all uint64_t):
+ *   xmem_used = stats.committed_virtual_bytes + stats.allocated_physical_bytes
+ *   room      = cap - xmem_used - charged_private_bytes
+ *   charged_private_bytes + bytes   (on success)
+ *
+ * Guard (1) `bytes > cap` rejects a request larger than the cap, so the
+ *   later `bytes <= room` test can never be satisfied by a wrapped `room`.
+ * Guard (2) `xmem_used > cap` rejects before `cap - xmem_used`, protecting
+ *   the FIRST subtraction from unsigned underflow.
+ * Guard (3) `charged_private_bytes > cap - xmem_used` rejects before the
+ *   SECOND subtraction, protecting `cap - xmem_used - charged_private_bytes`
+ *   from unsigned underflow. After (2), `cap - xmem_used` is well-defined.
+ * The addition `xmem_used` cannot wrap: it is a snapshot of xmem's own
+ *   committed_virtual_bytes + allocated_physical_bytes, which xmem admits
+ *   only while their sum stays <= cap (can_commit), and cap <= 2^64-1.
+ * The addition `charged_private_bytes += bytes` cannot wrap: after (1)-(3)
+ *   we have bytes <= room = cap - xmem_used - charged_private_bytes, hence
+ *   charged_private_bytes + bytes <= cap - xmem_used <= cap.
+ * The hook is called while g_section is held (lock order g_section ->
+ *   usage_lock, matching every other path in both DLLs). */
 bool try_charge(uint64_t bytes) {
     Guard guard(g_section);
     bx_xmem_stats_t stats{};
@@ -122,12 +146,18 @@ bool try_charge(uint64_t bytes) {
     if (bytes > room) {
         return false;
     }
+    if (!bx_xmem_try_charge_external(bytes)) {
+        return false;
+    }
     g_record.charged_private_bytes += bytes;
     return true;
 }
 
 void release_charge(uint64_t bytes) {
     Guard guard(g_section);
+    /* Release the authoritative xmem charge first; it logs and clamps on
+     * underflow. Then keep the diagnostic mirror in sync. */
+    bx_xmem_release_charge_external(bytes);
     if (bytes > g_record.charged_private_bytes) {
         bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "heap_budget", "GPU heap charge underflow on release");
         g_record.charged_private_bytes = 0;
