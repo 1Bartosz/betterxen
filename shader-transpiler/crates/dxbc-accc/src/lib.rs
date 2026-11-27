@@ -9,7 +9,10 @@
 //! An `ACCC` payload that begins with `FSPX` uses the layout documented on
 //! [`fspx`]. Version 0 is a magic-only stub. Version 1 is a section table of
 //! at most [`FSPX_MAX_SECTIONS`] descriptors. A larger count is
-//! [`ParseError::FspxTooManySections`] before any pairwise comparison.
+//! [`ParseError::FspxTooManySections`] before any pairwise comparison. A
+//! descriptor whose offset lands inside the header plus descriptor table is
+//! [`ParseError::FspxLayoutMismatch`], kept apart from
+//! [`ParseError::FspxSectionOutOfBounds`] (a section past the payload end).
 //! Section 0 and section 7 are opaque header ranges, section 1 is the stage
 //! configuration (`bx_shader_stage_t` values), and section 6 is the RDNA 2
 //! code byte range. The code bytes are not decoded. This layout is synthetic.
@@ -100,16 +103,49 @@ pub enum ParseError {
     BadMagic,
     UnsupportedVersion(u32),
     TruncatedChunkTable,
-    ChunkOutOfBounds { index: usize },
+    ChunkOutOfBounds {
+        index: usize,
+    },
     TruncatedContainer,
-    FspxTruncated { chunk: usize },
-    FspxBadVersion { chunk: usize, version: u32 },
-    FspxSectionOutOfBounds { chunk: usize, section_id: u32 },
-    FspxDuplicateSection { chunk: usize, section_id: u32 },
-    FspxSectionOverlap { chunk: usize, section_id: u32 },
-    FspxBadStageConfig { chunk: usize },
-    FspxTooManySections { chunk: usize, count: u32 },
-    BadDxilHeader { chunk: usize },
+    FspxTruncated {
+        chunk: usize,
+    },
+    FspxBadVersion {
+        chunk: usize,
+        version: u32,
+    },
+    FspxSectionOutOfBounds {
+        chunk: usize,
+        section_id: u32,
+    },
+    /// A descriptor's offset lands inside the `FSPX` header plus descriptor
+    /// table (`table_end` bytes), which the synthetic layout reserves. The
+    /// table does not follow BetterXen's clean-room layout; it is not reported
+    /// as an out-of-bounds section. The container is still rejected.
+    FspxLayoutMismatch {
+        chunk: usize,
+        section_id: u32,
+        offset: u32,
+        table_end: u32,
+    },
+    FspxDuplicateSection {
+        chunk: usize,
+        section_id: u32,
+    },
+    FspxSectionOverlap {
+        chunk: usize,
+        section_id: u32,
+    },
+    FspxBadStageConfig {
+        chunk: usize,
+    },
+    FspxTooManySections {
+        chunk: usize,
+        count: u32,
+    },
+    BadDxilHeader {
+        chunk: usize,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -133,6 +169,15 @@ impl fmt::Display for ParseError {
                     "FSPX section {section_id} out of bounds in chunk {chunk}"
                 )
             }
+            Self::FspxLayoutMismatch {
+                chunk,
+                section_id,
+                offset,
+                table_end,
+            } => write!(
+                f,
+                "FSPX section {section_id} starts at offset {offset}, inside the {table_end}-byte header and section table, in chunk {chunk}: the table does not follow the synthetic FSPX layout"
+            ),
             Self::FspxDuplicateSection { chunk, section_id } => {
                 write!(f, "duplicate FSPX section {section_id} in chunk {chunk}")
             }
@@ -185,6 +230,16 @@ fn fspx_error(chunk: usize, err: fspx::FspxError) -> ParseError {
         fspx::FspxError::SectionOutOfBounds { section_id } => {
             ParseError::FspxSectionOutOfBounds { chunk, section_id }
         }
+        fspx::FspxError::LayoutMismatch {
+            section_id,
+            offset,
+            table_end,
+        } => ParseError::FspxLayoutMismatch {
+            chunk,
+            section_id,
+            offset,
+            table_end,
+        },
         fspx::FspxError::DuplicateSection { section_id } => {
             ParseError::FspxDuplicateSection { chunk, section_id }
         }
@@ -868,9 +923,11 @@ mod tests {
             ),
             (
                 fspx_header(1, 1, &[(1, 0, 4)], 28),
-                ParseError::FspxSectionOutOfBounds {
+                ParseError::FspxLayoutMismatch {
                     chunk: 0,
                     section_id: 1,
+                    offset: 0,
+                    table_end: 28,
                 },
             ),
             (
@@ -927,12 +984,156 @@ mod tests {
         let blobs = [
             synthetic_dxil_blob(),
             build_synthetic_dxbc(&[(b"ACCC", &synthetic_fspx_payload())]),
+            build_synthetic_dxbc(&[(b"ACCC", &fspx_two_sections(20))]),
             vec![0xFF; 64],
         ];
         for blob in blobs {
             for len in 0..=blob.len() {
                 let _ = inspect_dxbc(&blob[..len]);
             }
+        }
+    }
+
+    /// A two-section table (`table_end` = 16 + 2 * 12 = 40) whose second
+    /// descriptor's offset is `second_offset`. The first descriptor is a valid
+    /// 12-byte stage section at 40, and the payload is 64 bytes long.
+    fn fspx_two_sections(second_offset: u32) -> Vec<u8> {
+        let mut payload = fspx_header(1, 2, &[(1, 40, 12), (6, second_offset, 4)], 64);
+        payload[40..44].copy_from_slice(&6u32.to_le_bytes());
+        payload[44..48].copy_from_slice(&6u32.to_le_bytes());
+        payload
+    }
+
+    #[test]
+    fn fspx_offset_inside_header_or_table_is_layout_mismatch() {
+        // Inside the 16-byte header, inside the first descriptor, inside the
+        // descriptor itself, and the last reserved byte.
+        for offset in [0u32, 8, 16, 28, 39] {
+            let blob = build_synthetic_dxbc(&[(b"ACCC", &fspx_two_sections(offset))]);
+            let expected = ParseError::FspxLayoutMismatch {
+                chunk: 0,
+                section_id: 6,
+                offset,
+                table_end: 40,
+            };
+            assert_eq!(
+                inspect_dxbc(&blob),
+                Err(expected.clone()),
+                "offset {offset}"
+            );
+            // The C ABI path walks the table through `scan_fspx`, not
+            // `parse_fspx`, and must classify it the same way.
+            assert_eq!(
+                summarize_dxbc(&blob).map(|_| ()),
+                Err(expected),
+                "offset {offset}"
+            );
+        }
+
+        // The first byte after the table is outside the reserved region.
+        let blob = build_synthetic_dxbc(&[(b"ACCC", &fspx_two_sections(56))]);
+        let info = inspect_dxbc(&blob).expect("offset at the end of the stage section");
+        assert_eq!(info.kind, ShaderKind::AcccOnly);
+        assert_eq!(info.stage, ShaderStage::Compute);
+        assert!(summarize_dxbc(&blob).is_ok());
+    }
+
+    #[test]
+    fn fspx_layout_mismatch_is_not_out_of_bounds() {
+        // Past the payload end is still out of bounds, not a layout mismatch.
+        let mut payload = fspx_two_sections(62);
+        payload.truncate(64);
+        let blob = build_synthetic_dxbc(&[(b"ACCC", &payload)]);
+        let out_of_bounds = ParseError::FspxSectionOutOfBounds {
+            chunk: 0,
+            section_id: 6,
+        };
+        assert_eq!(inspect_dxbc(&blob), Err(out_of_bounds.clone()));
+        assert_eq!(summarize_dxbc(&blob).map(|_| ()), Err(out_of_bounds));
+
+        // A reserved offset wins even when the size would also overrun.
+        let mut payload = fspx_header(1, 1, &[(6, 20, u32::MAX)], 32);
+        payload.truncate(32);
+        let blob = build_synthetic_dxbc(&[(b"ACCC", &payload)]);
+        assert_eq!(
+            inspect_dxbc(&blob),
+            Err(ParseError::FspxLayoutMismatch {
+                chunk: 0,
+                section_id: 6,
+                offset: 20,
+                table_end: 28,
+            })
+        );
+
+        let message = ParseError::FspxLayoutMismatch {
+            chunk: 2,
+            section_id: 6,
+            offset: 20,
+            table_end: 28,
+        }
+        .to_string();
+        assert!(message.contains("section 6"), "{message}");
+        assert!(message.contains("offset 20"), "{message}");
+        assert!(message.contains("28-byte"), "{message}");
+        assert!(message.contains("chunk 2"), "{message}");
+        assert!(!message.contains("out of bounds"), "{message}");
+    }
+
+    #[test]
+    fn c_abi_still_refuses_fspx_layout_mismatch() {
+        clear_shader_log();
+        let blob = build_synthetic_dxbc(&[(b"ACCC", &fspx_two_sections(20))]);
+
+        let mut c_info = BxShaderInspection {
+            kind: 99,
+            ..BxShaderInspection::default()
+        };
+        let status = unsafe { bx_shader_inspect(blob.as_ptr(), blob.len(), &mut c_info) };
+        assert_eq!(status, BX_SHADER_ERR_INVALID_BLOB);
+        assert_eq!(c_info.kind, 0);
+
+        let mut out_ptr = ptr_sentinel();
+        let mut out_len = 8usize;
+        let status = unsafe {
+            bx_shader_prepare_for_d3dmetal(blob.as_ptr(), blob.len(), &mut out_ptr, &mut out_len)
+        };
+        assert_eq!(status, BX_SHADER_ERR_INVALID_BLOB);
+        assert!(out_ptr.is_null());
+        assert_eq!(out_len, 0);
+        assert!(shader_log_lines().is_empty());
+    }
+
+    #[test]
+    fn arbitrary_fspx_tables_do_not_panic() {
+        // Deterministic xorshift so a failure reproduces.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..4096u32 {
+            let len = 16 + (next() % 240) as usize;
+            let mut payload: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            payload[..4].copy_from_slice(b"FSPX");
+            payload[4..8].copy_from_slice(&1u32.to_le_bytes());
+            let count = round % (FSPX_MAX_SECTIONS as u32 + 2);
+            payload[8..12].copy_from_slice(&count.to_le_bytes());
+            // Keep some offsets small so the reserved-region branch is hit.
+            if round % 2 == 0 {
+                let mut at = 20;
+                while at + 4 <= len.min(16 + count as usize * 12) {
+                    let small = (next() % 64) as u32;
+                    payload[at..at + 4].copy_from_slice(&small.to_le_bytes());
+                    at += 12;
+                }
+            }
+            let blob = build_synthetic_dxbc(&[(b"ACCC", &payload)]);
+            let _ = inspect_dxbc(&blob);
+            let _ = summarize_dxbc(&blob);
+            let mut c_info = BxShaderInspection::default();
+            let _ = unsafe { bx_shader_inspect(blob.as_ptr(), blob.len(), &mut c_info) };
         }
     }
 
