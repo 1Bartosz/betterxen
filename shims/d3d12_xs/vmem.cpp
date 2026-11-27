@@ -147,11 +147,10 @@ void release_charge(uint64_t bytes) {
  * The process-wide backing heap does not. g_record holds that heap for the
  * life of the region, so a strong reference would pin the device and the
  * budget charge after the caller dropped the proxy. `device_` on that heap is
- * weak: bx_vmem_clear_backing_device nulls it when the proxy is destroyed, and
- * return_backing points it at the proxy currently receiving the cache. Those
- * two writes happen under g_section. A host ID3D12Heap keeps its host device
- * alive, and a later D3D12CreateDevice can return that same pointer; retargeting
- * `device_` is what makes GetDevice return the new proxy instead of the freed one.
+ * weak. It is cleared when the heap leaves the cache and when its proxy's
+ * reference count goes from 1 to 0. hand_out_backing_locked points it at the
+ * proxy that receives the cache. Those writes happen under g_section, together
+ * with the 1->0 transition, so GetDevice cannot resurrect a proxy at zero.
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12heap1
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12devicechild-getdevice
  */
@@ -236,14 +235,15 @@ public:
         if (!ppv) {
             return E_POINTER;
         }
-        /* The proxy, never the host device. QueryInterface AddRefs for the caller only.
-           An ordinary heap owns its proxy, and nothing else writes device_, so that
-           read stays lock-free. The backing heap's device_ is weak: clear and
-           return_backing write it under g_section, so this read and the AddRef have
-           to hold that same lock or the proxy can be freed between them.
-           QueryInterface does not Release and does not enter g_section. Guard uses
-           EnterCriticalSection, which the same thread may enter again; this path
-           does not re-enter it. */
+        /* The proxy, never the host device.
+           An ordinary heap owns its proxy and nothing else writes device_, so that
+           path stays lock-free. The backing heap is weak. Its acquire and the
+           proxy's 1->0 Release share g_section. The acquire is a compare-exchange
+           that refuses zero, so it cannot resurrect a proxy that Release has
+           already claimed. QueryInterface below adds one more reference from a
+           non-zero count and does not enter g_section; the compare-exchange
+           reference is then dropped. Guard's critical section is recursive, and
+           this path does not re-enter it. */
         if (owns_device_) {
             if (!device_) {
                 *ppv = nullptr;
@@ -251,12 +251,22 @@ public:
             }
             return device_->QueryInterface(riid, ppv);
         }
-        Guard guard(g_section);
-        if (!device_) {
-            *ppv = nullptr;
-            return E_FAIL;
+        BxDeviceProxy* proxy = nullptr;
+        {
+            Guard guard(g_section);
+            proxy = device_;
+            if (!proxy || !proxy->bx_try_acquire_if_nonzero()) {
+                *ppv = nullptr;
+                return E_FAIL;
+            }
         }
-        return device_->QueryInterface(riid, ppv);
+        /* The compare-exchange reference keeps the proxy alive. QueryInterface
+           adds the caller's reference from a non-zero count, then the
+           compare-exchange reference is dropped. Release is outside g_section
+           so a 1->0 transition cannot try to take that lock on this thread. */
+        const HRESULT hr = proxy->QueryInterface(riid, ppv);
+        proxy->Release();
+        return hr;
     }
     D3D12_HEAP_DESC* STDMETHODCALLTYPE GetDesc(D3D12_HEAP_DESC* ret) override { return host_->GetDesc(ret); }
     HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID riid, void** session) override {
@@ -356,25 +366,47 @@ bool backing_request(const D3D12_HEAP_DESC* desc) {
 
 HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFIID riid, void** out, bool own_device);
 
-/* True when the cached backing heap was created for `host`.
-   Otherwise moves a foreign cache out of g_record so the caller can release it
-   without holding g_section (Release takes that lock to credit the budget). */
-bool detach_foreign_backing(ID3D12Device* host, BxChargedHeap** heap, ID3D12Resource** buffer) {
-    Guard guard(g_section);
-    *heap = nullptr;
-    *buffer = nullptr;
-    if (g_record.backing && g_record.backing_host == host) {
-        return true;
+/* Test hook. One CreateHeap treats the cached host as foreign even when the
+   runtime returns the same ID3D12Device, so the replacement path can be checked
+   on a machine that keeps a single host device alive. */
+bool force_backing_replace() {
+    char buf[8] = {};
+    return GetEnvironmentVariableA("BX_D3D12_FORCE_BACKING_REPLACE", buf, sizeof(buf)) > 0 && buf[0] == '1' &&
+           buf[1] == '\0';
+}
+
+/* Caller holds g_section. */
+bool cache_matches_locked(ID3D12Device* host, uint64_t bytes) {
+    if (force_backing_replace()) {
+        return false;
     }
-    if (g_record.backing) {
-        *heap = g_record.backing;
-        *buffer = g_record.backing_buffer;
-        g_record.backing = nullptr;
-        g_record.backing_buffer = nullptr;
-        g_record.backing_host = nullptr;
-        g_record.cpu_pointer = 0;
+    return g_record.backing && g_record.backing_host == host && g_record.configured && g_record.backing_opt_in &&
+           g_record.have_region && g_record.config_size == bytes;
+}
+
+/* Caller holds g_section. A heap that leaves the cache loses its weak proxy
+   pointer before the cache drops it, so a caller who still holds the heap
+   gets E_FAIL from GetDevice instead of a freed proxy. */
+void take_cached_heap_locked(BxChargedHeap** heap, ID3D12Resource** buffer) {
+    *heap = g_record.backing;
+    *buffer = g_record.backing_buffer;
+    if (*heap) {
+        (*heap)->set_device(nullptr);
     }
-    return false;
+    g_record.backing = nullptr;
+    g_record.backing_buffer = nullptr;
+    g_record.backing_host = nullptr;
+    g_record.cpu_pointer = 0;
+}
+
+/* Caller holds g_section. Host and size were just checked. Retarget and take
+   the caller's reference before the lock is released. */
+HRESULT hand_out_backing_locked(BxDeviceProxy* self, REFIID riid, void** out) {
+    g_record.backing->set_device(self);
+    g_record.backing->AddRef();
+    const HRESULT hr = g_record.backing->QueryInterface(riid, out);
+    g_record.backing->Release();
+    return hr;
 }
 
 void release_backing_pair(BxChargedHeap* heap, ID3D12Resource* buffer) {
@@ -387,25 +419,20 @@ void release_backing_pair(BxChargedHeap* heap, ID3D12Resource* buffer) {
     }
 }
 
-HRESULT return_backing(BxDeviceProxy* self, REFIID riid, void** out) {
-    Guard guard(g_section);
-    if (!g_record.backing) {
-        return E_FAIL;
-    }
-    /* The host device can outlive proxy A and be wrapped again by proxy B.
-       Point GetDevice at the proxy that is receiving this heap. */
-    g_record.backing->set_device(self);
-    g_record.backing->AddRef();
-    const HRESULT hr = g_record.backing->QueryInterface(riid, out);
-    g_record.backing->Release();
-    return hr;
-}
-
 HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** out) {
     BxChargedHeap* stale_heap = nullptr;
     ID3D12Resource* stale_buffer = nullptr;
-    if (detach_foreign_backing(self->h_ID3D12Device, &stale_heap, &stale_buffer)) {
-        return return_backing(self, riid, out);
+    {
+        /* One section covers the host and config check, the heap choice, and the
+           reference handed to the caller. A second device cannot swap the cache
+           in the middle of that. */
+        Guard guard(g_section);
+        if (cache_matches_locked(self->h_ID3D12Device, bytes)) {
+            return hand_out_backing_locked(self, riid, out);
+        }
+        if (g_record.backing) {
+            take_cached_heap_locked(&stale_heap, &stale_buffer);
+        }
     }
     release_backing_pair(stale_heap, stale_buffer);
     stale_heap = nullptr;
@@ -450,24 +477,34 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
         return FAILED(hr) ? hr : E_FAIL;
     }
 
+    HRESULT published = E_FAIL;
+    bool discard_new = false;
     {
+        /* Re-check under the lock. If another thread already published a heap for
+           this host and size, return that one and drop the heap just built. */
         Guard guard(g_section);
-        if (g_record.backing && g_record.backing_host == self->h_ID3D12Device) {
-            resource->Unmap(0, nullptr);
-            resource->Release();
-            wrap->Release();
-            return return_backing(self, riid, out);
+        if (cache_matches_locked(self->h_ID3D12Device, bytes)) {
+            discard_new = true;
+            published = hand_out_backing_locked(self, riid, out);
+        } else {
+            if (g_record.backing) {
+                take_cached_heap_locked(&stale_heap, &stale_buffer);
+            }
+            g_record.backing = wrap;
+            g_record.backing_buffer = resource;
+            g_record.backing_host = self->h_ID3D12Device;
+            /* Remember the map. The caller's config block is not stored and is not written here. */
+            g_record.cpu_pointer = reinterpret_cast<uint64_t>(mapped);
+            published = hand_out_backing_locked(self, riid, out);
         }
-        stale_heap = g_record.backing;
-        stale_buffer = g_record.backing_buffer;
-        g_record.backing = wrap;
-        g_record.backing_buffer = resource;
-        g_record.backing_host = self->h_ID3D12Device;
-        /* Remember the map. The caller's config block is not stored and is not written here. */
-        g_record.cpu_pointer = reinterpret_cast<uint64_t>(mapped);
+    }
+    if (discard_new) {
+        resource->Unmap(0, nullptr);
+        resource->Release();
+        wrap->Release();
     }
     release_backing_pair(stale_heap, stale_buffer);
-    return return_backing(self, riid, out);
+    return published;
 }
 
 HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFIID riid, void** out, bool own_device) {
@@ -732,12 +769,7 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
         Guard guard(g_section);
         const bool same = g_record.configured && g_record.config_base == new_base && g_record.config_size == new_size;
         if (!same) {
-            old_heap = g_record.backing;
-            old_buffer = g_record.backing_buffer;
-            g_record.backing = nullptr;
-            g_record.backing_buffer = nullptr;
-            g_record.backing_host = nullptr;
-            g_record.cpu_pointer = 0;
+            take_cached_heap_locked(&old_heap, &old_buffer);
         }
         g_record.configured = true;
         g_record.backing_opt_in = (in.flags & BX_D3D12_VMEM_FLAG_BACKING_HEAP) != 0;
@@ -776,18 +808,18 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
     return S_OK;
 }
 
-bool bx_vmem_clear_backing_device(void* device_proxy, std::atomic<ULONG>* refs) {
+bool bx_vmem_final_release(void* device_proxy) {
     Guard guard(g_section);
-    /* GetDevice AddRefs under this same lock. If that landed after Release
-       observed zero, the proxy is still owned by the caller and must not be freed. */
-    if (refs && refs->load(std::memory_order_acquire) != 0) {
+    auto* proxy = static_cast<BxDeviceProxy*>(device_proxy);
+    if (!proxy->bx_try_release_last()) {
         return false;
     }
-    auto* proxy = static_cast<BxDeviceProxy*>(device_proxy);
+    /* The only weak pointer is the cached backing heap. Heaps that already left
+       the cache were cleared in take_cached_heap_locked. */
     if (g_record.backing && g_record.backing->device() == proxy) {
         g_record.backing->set_device(nullptr);
     }
-    return !refs || refs->load(std::memory_order_acquire) == 0;
+    return true;
 }
 
 void* bx_vmem_addref_backing_host() {

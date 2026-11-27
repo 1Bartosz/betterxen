@@ -3,7 +3,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <atomic>
 #include <windows.h>
 
 /*
@@ -47,11 +46,14 @@
  * that proxy until the wrapper's final Release, matching BxChildProxy, so the
  * caller can release the device and keep the heap. The process-wide backing heap
  * does not AddRef. The cache would keep the device and its charge alive. That
- * pointer is weak: it is cleared when the proxy is destroyed, and it is set to
- * the proxy that next receives the cached heap. The cache records the host
- * ID3D12Device that built the heap. CreateHeap for a different host device
- * releases the heap and its buffer, credits the charge, and builds a new one.
- * CreateHeap for the same host device returns the cached heap.
+ * pointer is weak. It is cleared when the heap leaves the cache (a new region
+ * or a different host device) and when that proxy's last reference drops.
+ * CreatePlacedResource1 and CreatePlacedResource2 unwrap the wrapper to the
+ * host heap before the host call. The cache records the host ID3D12Device
+ * that built the heap. CreateHeap for a different host device releases the
+ * heap and its buffer, credits the charge, and builds a new one. CreateHeap
+ * for the same host device returns the cached heap. The check, the retarget,
+ * and the caller's reference happen in one critical section.
  *
  * The layout must match tests/conformance/test_d3d12_placed/main.cpp.
  */
@@ -83,11 +85,11 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config);
 /* Patches the device proxy vtable so CreateHeap and CreatePlacedResource run the code in vmem.cpp. */
 void bx_vmem_install_device_hooks(void* device);
 
-/* Called from BxDeviceProxy::Release when its atomic count has dropped to zero.
-   Under g_section: if `refs` is no longer zero, GetDevice won the race and AddRef'd,
-   so the caller must not free the proxy and this returns false. Otherwise the cached
-   backing heap's weak pointer is cleared and this returns true. */
-bool bx_vmem_clear_backing_device(void* device_proxy, std::atomic<ULONG>* refs);
+/* 1->0 Release of a device proxy, under g_section. Compare-exchanges the count from
+   1 to 0 and clears every weak backing-heap pointer aimed at that proxy. Returns false
+   when the count was no longer 1, so the caller retries. A true return is the only
+   path into final cleanup. */
+bool bx_vmem_final_release(void* device_proxy);
 
 /* AddRefs the host ID3D12Device that created the cached backing heap, or returns null.
    The test sets BX_D3D12_REUSE_BACKING_HOST=1 so a second proxy wraps this same host

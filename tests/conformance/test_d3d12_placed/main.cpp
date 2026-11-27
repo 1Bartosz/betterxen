@@ -306,6 +306,66 @@ uint64_t last_log_u64(const char* path, const char* key) {
 
 bool same_object(IUnknown* a, IUnknown* b);
 
+bool get_device_closed(ID3D12Heap* heap) {
+    if (!heap) {
+        return false;
+    }
+    ID3D12Device* got = nullptr;
+    const HRESULT hr = heap->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&got));
+    const bool closed = hr == E_FAIL && got == nullptr;
+    if (got) {
+        got->Release();
+    }
+    return closed;
+}
+
+/* CreatePlacedResource1 must accept a heap from CreateHeap. CreatePlacedResource2
+   is checked only when the host device implements ID3D12Device10. */
+void check_newer_placement(ID3D12Device* device) {
+    D3D12_HEAP_DESC heap_desc = heap_of(D3D12_HEAP_TYPE_DEFAULT, kAlign, D3D12_HEAP_FLAG_NONE);
+    ID3D12Heap* heap = nullptr;
+    const HRESULT heap_hr = device->CreateHeap(&heap_desc, __uuidof(ID3D12Heap), reinterpret_cast<void**>(&heap));
+    if (!check(heap_hr == S_OK && heap, "wrapped heap for newer placement calls hr=0x%08lx", ul(heap_hr))) {
+        return;
+    }
+    D3D12_RESOURCE_DESC1 desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Device8* dev8 = nullptr;
+    const HRESULT q8 = device->QueryInterface(__uuidof(ID3D12Device8), reinterpret_cast<void**>(&dev8));
+    check(q8 == S_OK && dev8, "ID3D12Device8 for CreatePlacedResource1 hr=0x%08lx", ul(q8));
+    if (dev8) {
+        ID3D12Resource* resource = nullptr;
+        const HRESULT placed = dev8->CreatePlacedResource1(heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                           __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resource));
+        check(placed == S_OK && resource, "CreatePlacedResource1 accepts a wrapped CreateHeap hr=0x%08lx", ul(placed));
+        if (resource) resource->Release();
+        dev8->Release();
+    }
+    ID3D12Device10* dev10 = nullptr;
+    const HRESULT q10 = device->QueryInterface(__uuidof(ID3D12Device10), reinterpret_cast<void**>(&dev10));
+    if (q10 == S_OK && dev10) {
+        ID3D12Resource* resource = nullptr;
+        const HRESULT placed =
+            dev10->CreatePlacedResource2(heap, 0, &desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 0, nullptr,
+                                         __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resource));
+        check(placed == S_OK && resource, "CreatePlacedResource2 accepts a wrapped CreateHeap hr=0x%08lx", ul(placed));
+        if (resource) resource->Release();
+        dev10->Release();
+    } else {
+        std::printf("CreatePlacedResource2 not checked: ID3D12Device10 hr=0x%08lx\n", ul(q10));
+        std::fflush(stdout);
+    }
+    heap->Release();
+}
+
 void check_heap_get_device(ID3D12Heap* heap, ID3D12Device* proxy, ID3D12Device* host_device, const char* what) {
     if (!check(heap != nullptr, "%s exists for GetDevice", what)) {
         return;
@@ -1169,15 +1229,75 @@ int main() {
      * the proxy to zero. GetDevice on the heap we still hold must then fail closed.
      * Device B is forced onto the same host device, which is still alive because
      * the cached host heap owns it, and must receive that same backing heap.
+     *
+     * The zero-reference race and the cache hand-out race are closed by g_section.
+     * A weak GetDevice never increments a proxy whose count is already zero, and
+     * the host check, retarget, and returned reference happen in one critical
+     * section. There is no timing stress test for those windows.
      */
+    check_newer_placement(device);
+
+    if (backing) {
+        backing->AddRef();
+        BxD3d12VirtualMemoryConfig detached = make_block(0, 0, kFlagBacking);
+        const HRESULT away = D3D12ConfigureVirtualMemoryX(&detached);
+        check(away == S_OK, "reconfigure drops the cached backing heap hr=0x%08lx", ul(away));
+        check(get_device_closed(backing), "GetDevice on a heap detached by reconfigure fails closed");
+        const ULONG left = device->Release();
+        check(left == 0, "proxy released to zero while the detached heap is still held (refs=%lu)", left);
+        check(get_device_closed(backing), "GetDevice on the retained heap stays closed after the proxy is gone");
+        /* The device was released. Recreate it and the backing heap for the checks below. */
+        device = nullptr;
+        backing->Release();
+        backing = nullptr;
+        hr = D3D12XboxCreateDevice(nullptr, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
+        check(hr == S_OK && device, "device recreated after the detach check hr=0x%08lx", ul(hr));
+        if (device && mapped) {
+            BxD3d12VirtualMemoryConfig again = make_block(region_base, kRegionBytes, kFlagBacking);
+            check(D3D12ConfigureVirtualMemoryX(&again) == S_OK, "region restored after the detach check");
+            D3D12_HEAP_DESC again_desc = backing_desc();
+            hr = device->CreateHeap(&again_desc, __uuidof(ID3D12Heap), reinterpret_cast<void**>(&backing));
+            check(hr == S_OK && backing, "backing heap restored hr=0x%08lx", ul(hr));
+        }
+    }
+    if (device && backing) {
+        backing->AddRef();
+        check(SetEnvironmentVariableA("BX_D3D12_FORCE_BACKING_REPLACE", "1") != 0,
+              "test hook BX_D3D12_FORCE_BACKING_REPLACE=1 is set");
+        ID3D12Heap* replaced = nullptr;
+        D3D12_HEAP_DESC replace_desc = backing_desc();
+        hr = device->CreateHeap(&replace_desc, __uuidof(ID3D12Heap), reinterpret_cast<void**>(&replaced));
+        SetEnvironmentVariableA("BX_D3D12_FORCE_BACKING_REPLACE", nullptr);
+        check(hr == S_OK && replaced && !same_object(replaced, backing),
+              "forced host replacement publishes a different backing heap hr=0x%08lx", ul(hr));
+        check(get_device_closed(backing), "GetDevice on the heap replaced by another host device fails closed");
+        const ULONG left = device->Release();
+        check(left == 0, "proxy released to zero while the replaced heap is still held (refs=%lu)", left);
+        check(get_device_closed(backing), "GetDevice on the replaced heap stays closed after the proxy is gone");
+        backing->Release();
+        backing = replaced;
+        device = nullptr;
+        hr = D3D12XboxCreateDevice(nullptr, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
+        check(hr == S_OK && device, "device recreated after the replacement check hr=0x%08lx", ul(hr));
+        if (device && mapped && backing) {
+            /* The replacement already published a heap for this region. A same-host
+               create on the new proxy must retarget that heap, which the checks below cover. */
+            BxD3d12VirtualMemoryConfig again = make_block(region_base, kRegionBytes, kFlagBacking);
+            check(D3D12ConfigureVirtualMemoryX(&again) == S_OK, "region still configured after replacement");
+        }
+    }
     BxD3d12VirtualMemoryConfig charge_before_block = make_block(region_base, kRegionBytes, kFlagBacking);
     hr = mapped ? D3D12ConfigureVirtualMemoryX(&charge_before_block) : E_FAIL;
     const uint64_t charged_before = have_log ? last_log_u64(log_path, "gpu_heap_bytes=") : ~0ull;
     check(hr == S_OK && charged_before == kRegionBytes,
           "one backing heap remains charged before device recreation (gpu_heap_bytes=%llu)",
           static_cast<unsigned long long>(charged_before));
-    check(device->Release() == 0, "device A proxy released while the backing cache still holds the heap");
-    device = nullptr;
+    if (device) {
+        check(device->Release() == 0, "device A proxy released while the backing cache still holds the heap");
+        device = nullptr;
+    } else {
+        check(false, "device A was already gone before the cache-lifetime check");
+    }
     if (backing) {
         ID3D12Device* dead = nullptr;
         const HRESULT gd = backing->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dead));
@@ -1185,21 +1305,26 @@ int main() {
         if (dead) dead->Release();
     }
 
+    uint64_t host_before = 0;
+    uint64_t host_ignored = 0;
+    int host_before_count = 0;
+    if (have_log) {
+        log_u64_ends(log_path, "host_device=", &host_ignored, &host_before, &host_before_count);
+    }
     check(SetEnvironmentVariableA("BX_D3D12_REUSE_BACKING_HOST", "1") != 0,
           "test hook BX_D3D12_REUSE_BACKING_HOST=1 is set");
     ID3D12Device* device_b = nullptr;
     hr = D3D12XboxCreateDevice(nullptr, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device_b));
     SetEnvironmentVariableA("BX_D3D12_REUSE_BACKING_HOST", nullptr);
     check(hr == S_OK && device_b, "device B is a new proxy on the cached host device hr=0x%08lx", ul(hr));
-    uint64_t host_first = 0;
-    uint64_t host_last = 0;
-    int host_count = 0;
+    uint64_t host_after = 0;
+    int host_after_count = 0;
     if (have_log) {
-        log_u64_ends(log_path, "host_device=", &host_first, &host_last, &host_count);
+        log_u64_ends(log_path, "host_device=", &host_ignored, &host_after, &host_after_count);
     }
-    check(have_log && host_count >= 2 && host_first != 0 && host_first == host_last,
-          "device A and device B wrap the same host ID3D12Device (first=0x%llx last=0x%llx count=%d)",
-          static_cast<unsigned long long>(host_first), static_cast<unsigned long long>(host_last), host_count);
+    check(have_log && host_after_count == host_before_count + 1 && host_before != 0 && host_before == host_after,
+          "device B wraps the host ID3D12Device the cache is holding (before=0x%llx after=0x%llx)",
+          static_cast<unsigned long long>(host_before), static_cast<unsigned long long>(host_after));
     ID3D12Heap* backing_b = nullptr;
     if (device_b) {
         D3D12_HEAP_DESC again_desc = backing_desc();
