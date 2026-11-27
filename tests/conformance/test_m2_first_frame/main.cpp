@@ -1,17 +1,19 @@
-// Original synthetic M2 workload. The compute output is copied into the actual
-// flip buffer and back into an xmem-configured placed buffer before Present.
+// Original synthetic M2 workload. The compute output is copied into the flip
+// buffer and read back through a placed D3D12 buffer before the host flip.
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <string>
-#include "contracts.h"
 #include "bx_log.h"
 #include "fill_cs66.h"
+#include "presentx.h"
+#include "vmem.h"
 
 using Microsoft::WRL::ComPtr;
 extern "C" {
@@ -74,13 +76,16 @@ struct Runtime {
     }
 };
 struct Region {
+    static constexpr size_t page_bytes = 65536;
+    static constexpr unsigned char sentinel = 0xa5;
     SIZE_T count = 1;
     ULONG_PTR page = 0;
     void* view = nullptr;
-    VmemConfig config{0x4d565842, sizeof(VmemConfig), 1, 1, 0, 65536, 0, 0};
+    BxD3d12VirtualMemoryConfig config{BX_D3D12_VMEM_MAGIC, sizeof(BxD3d12VirtualMemoryConfig), 1,
+                                     BX_D3D12_VMEM_FLAG_BACKING_HEAP, 0, page_bytes, 0, 0};
     ~Region() {
-        if (config.base) {
-            config.base = config.bytes = 0;
+        if (config.base_va) {
+            config.base_va = config.size_bytes = 0;
             cleanup(D3D12ConfigureVirtualMemoryX(&config) == S_OK, "clear configured region");
         }
         if (view)
@@ -98,7 +103,7 @@ struct Window {
     }
 };
 
-void run() {
+void run(bool inject_pixel_mismatch) {
     Runtime rt;
     require(rt.module, "LoadLibraryExW system32");
     auto init = symbol<HRESULT(WINAPI*)(uint32_t, uint32_t)>(rt.module, "InitializeApiImpl");
@@ -122,12 +127,13 @@ void run() {
     require(XMemAllocatePhysicalPages(&region.count, &region.page, 0) && region.count == 1, "allocate physical page");
     region.view = XMemMapPhysicalPages(nullptr, 1, 0, &region.page);
     require(region.view, "map physical page");
-    region.config.base = reinterpret_cast<uintptr_t>(region.view);
+    std::memset(region.view, Region::sentinel, Region::page_bytes);
+    region.config.base_va = reinterpret_cast<uintptr_t>(region.view);
     checked(D3D12ConfigureVirtualMemoryX(&region.config), "configure xmem region");
     ComPtr<ID3D12Device> device;
     checked(D3D12XboxCreateDevice(nullptr, IID_PPV_ARGS(&device)), "create Xbox device");
     D3D12_HEAP_DESC hd{};
-    hd.SizeInBytes = region.config.bytes;
+    hd.SizeInBytes = region.config.size_bytes;
     hd.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
     hd.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
     hd.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
@@ -135,6 +141,8 @@ void run() {
     checked(device->CreateHeap(&hd, IID_PPV_ARGS(&heap)), "create configured heap");
     checked(D3D12ConfigureVirtualMemoryX(&region.config), "query backing map");
     require(region.config.cpu_pointer != 0, "configured heap must publish its backing map");
+    require(region.config.cpu_pointer != reinterpret_cast<uintptr_t>(region.view),
+            "D3D12 backing map must be distinct from the xmem region view");
     constexpr UINT width = 64, height = 4, pitch = 256;
     D3D12_RESOURCE_DESC buffer{};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -145,7 +153,7 @@ void run() {
     checked(device->CreatePlacedResource(heap.Get(), 0, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                          IID_PPV_ARGS(&readback)),
             "place readback buffer");
-    checkpoint(true, "placed frame readback in configured WRITE_BACK heap");
+    checkpoint(true, "xmem region configured; readback placed in a separate D3D12 WRITE_BACK heap");
 
     stage = "shader_gate";
     char path[MAX_PATH];
@@ -222,6 +230,10 @@ void run() {
     linear.PlacedFootprint.Footprint = {desc.format, width, height, 1, pitch};
     linear.pResource = output.Get();
     list->CopyTextureRegion(&texture, 0, 0, 0, &linear, nullptr);
+    if (inject_pixel_mismatch) {
+        const D3D12_BOX second_pixel{1, 0, 0, 2, 1, 1};
+        list->CopyTextureRegion(&texture, 0, 0, 0, &linear, &second_pixel);
+    }
     transition(back.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
     linear.pResource = readback.Get();
     list->CopyTextureRegion(&linear, 0, 0, 0, &texture, nullptr);
@@ -251,14 +263,22 @@ void run() {
             require(false, detail);
         }
     }
-    checkpoint(true, "256 RGBA8 pixels matched");
+    const auto* xmem_bytes = static_cast<const unsigned char*>(region.view);
+    require(std::all_of(xmem_bytes, xmem_bytes + Region::page_bytes,
+                        [](unsigned char byte) { return byte == Region::sentinel; }),
+            "xmem region bytes changed during frame readback");
+    checkpoint(true, "256 pre-flip RGBA8 pixels matched in the D3D12 map; xmem region sentinel intact");
     stage = "teardown";
 }
 } // namespace
 
 int main() {
+    char inject[2];
+    const bool inject_pixel_mismatch =
+        GetEnvironmentVariableA("BX_M2_FIRST_FRAME_INJECT_PIXEL_MISMATCH", inject, sizeof(inject)) == 1 &&
+        inject[0] == '1';
     try {
-        run();
+        run(inject_pixel_mismatch);
     } catch (const Failure&) {
         return 1;
     }
