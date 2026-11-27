@@ -1238,7 +1238,6 @@ int main() {
     check_newer_placement(device);
 
     if (backing) {
-        backing->AddRef();
         BxD3d12VirtualMemoryConfig detached = make_block(0, 0, kFlagBacking);
         const HRESULT away = D3D12ConfigureVirtualMemoryX(&detached);
         check(away == S_OK, "reconfigure drops the cached backing heap hr=0x%08lx", ul(away));
@@ -1261,7 +1260,6 @@ int main() {
         }
     }
     if (device && backing) {
-        backing->AddRef();
         check(SetEnvironmentVariableA("BX_D3D12_FORCE_BACKING_REPLACE", "1") != 0,
               "test hook BX_D3D12_FORCE_BACKING_REPLACE=1 is set");
         ID3D12Heap* replaced = nullptr;

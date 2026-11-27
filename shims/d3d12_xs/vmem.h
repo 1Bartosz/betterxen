@@ -39,6 +39,8 @@
  * SizeInBytes equal to the configured region, Alignment 0 or 64 KiB,
  * Flags exactly D3D12_HEAP_FLAG_NONE (the flag set used when the backing heap
  * is created), and CreationNodeMask and VisibleNodeMask each 0 or 1.
+ * If the backing configuration changes during a backing request, CreateHeap
+ * returns HRESULT_FROM_WIN32(ERROR_RETRY) and discards any newly allocated heap.
  * Any other CreateHeap is the host CreateHeap. The desc is not modified.
  * The live-heap xmem budget charge (taken on create, dropped on the wrapper's
  * final Release) is the budget difference, and the returned object is the wrapper.

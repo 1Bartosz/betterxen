@@ -59,6 +59,7 @@ struct Record {
     bool have_region = false;
     uint64_t config_base = 0;
     uint64_t config_size = 0;
+    uint64_t config_generation = 0;
     bx_xmem_region_info_t region{};
     /* Bytes of host heaps still alive. D3DMetal keeps freed memory in its own
        pool, so this counts live heaps only: charge on create, credit on the
@@ -307,6 +308,7 @@ struct RegionSnap {
     bool eligible = false;
     uint64_t base = 0;
     uint64_t size = 0;
+    uint64_t generation = 0;
 };
 
 RegionSnap region_snap() {
@@ -315,6 +317,7 @@ RegionSnap region_snap() {
     snap.eligible = g_record.configured && g_record.backing_opt_in && g_record.have_region && g_record.config_size != 0;
     snap.base = g_record.region.base_va;
     snap.size = g_record.config_size;
+    snap.generation = g_record.config_generation;
     return snap;
 }
 
@@ -339,7 +342,7 @@ bool region_still_mapped(const RegionSnap& snap) {
 }
 
 /* True only for the explicit backing-heap request documented in vmem.h. */
-bool backing_request(const D3D12_HEAP_DESC* desc) {
+bool backing_request(const D3D12_HEAP_DESC* desc, RegionSnap& snap) {
     if (!desc) {
         return false;
     }
@@ -357,7 +360,7 @@ bool backing_request(const D3D12_HEAP_DESC* desc) {
     if (desc->Properties.CreationNodeMask > 1 || desc->Properties.VisibleNodeMask > 1) {
         return false;
     }
-    const RegionSnap snap = region_snap();
+    snap = region_snap();
     if (!snap.eligible || desc->SizeInBytes != snap.size) {
         return false;
     }
@@ -419,7 +422,8 @@ void release_backing_pair(BxChargedHeap* heap, ID3D12Resource* buffer) {
     }
 }
 
-HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** out) {
+HRESULT ensure_backing(BxDeviceProxy* self, const RegionSnap& snap, REFIID riid, void** out) {
+    const uint64_t bytes = snap.size;
     BxChargedHeap* stale_heap = nullptr;
     ID3D12Resource* stale_buffer = nullptr;
     {
@@ -427,6 +431,9 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
            reference handed to the caller. A second device cannot swap the cache
            in the middle of that. */
         Guard guard(g_section);
+        if (snap.generation != g_record.config_generation) {
+            return HRESULT_FROM_WIN32(ERROR_RETRY);
+        }
         if (cache_matches_locked(self->h_ID3D12Device, bytes)) {
             return hand_out_backing_locked(self, riid, out);
         }
@@ -478,18 +485,20 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
     }
 
     HRESULT published = E_FAIL;
-    bool discard_new = false;
+    bool keep_new = false;
     {
-        /* Re-check under the lock. If another thread already published a heap for
-           this host and size, return that one and drop the heap just built. */
+        /* The host allocation may have raced with a config change or another
+           creator. Publish only for the configuration this request validated. */
         Guard guard(g_section);
-        if (cache_matches_locked(self->h_ID3D12Device, bytes)) {
-            discard_new = true;
+        if (snap.generation != g_record.config_generation) {
+            published = HRESULT_FROM_WIN32(ERROR_RETRY);
+        } else if (cache_matches_locked(self->h_ID3D12Device, bytes)) {
             published = hand_out_backing_locked(self, riid, out);
         } else {
             if (g_record.backing) {
                 take_cached_heap_locked(&stale_heap, &stale_buffer);
             }
+            keep_new = true;
             g_record.backing = wrap;
             g_record.backing_buffer = resource;
             g_record.backing_host = self->h_ID3D12Device;
@@ -498,10 +507,8 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
             published = hand_out_backing_locked(self, riid, out);
         }
     }
-    if (discard_new) {
-        resource->Unmap(0, nullptr);
-        resource->Release();
-        wrap->Release();
+    if (!keep_new) {
+        release_backing_pair(wrap, resource);
     }
     release_backing_pair(stale_heap, stale_buffer);
     return published;
@@ -608,8 +615,9 @@ HRESULT STDMETHODCALLTYPE create_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC
         return self->h_ID3D12Device->CreateHeap(desc, riid, nullptr);
     }
     *out = nullptr;
-    if (backing_request(desc)) {
-        return ensure_backing(self, desc->SizeInBytes, riid, out);
+    RegionSnap snap;
+    if (backing_request(desc, snap)) {
+        return ensure_backing(self, snap, riid, out);
     }
     return host_private_heap(self, desc, riid, out, true);
 }
@@ -762,6 +770,7 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
 
     const uint64_t new_base = have_region ? region.base_va : in.base_va;
     const uint64_t new_size = have_region ? region.size_bytes : in.size_bytes;
+    const bool backing_opt_in = (in.flags & BX_D3D12_VMEM_FLAG_BACKING_HEAP) != 0;
     BxChargedHeap* old_heap = nullptr;
     ID3D12Resource* old_buffer = nullptr;
     uint64_t published = 0;
@@ -771,8 +780,11 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
         if (!same) {
             take_cached_heap_locked(&old_heap, &old_buffer);
         }
+        if (!same || g_record.backing_opt_in != backing_opt_in || g_record.have_region != have_region) {
+            ++g_record.config_generation;
+        }
         g_record.configured = true;
-        g_record.backing_opt_in = (in.flags & BX_D3D12_VMEM_FLAG_BACKING_HEAP) != 0;
+        g_record.backing_opt_in = backing_opt_in;
         g_record.profile = profile;
         g_record.title_limit = cap;
         g_record.have_region = have_region;
