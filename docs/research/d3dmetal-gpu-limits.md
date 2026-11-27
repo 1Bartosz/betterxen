@@ -108,7 +108,13 @@ independently reproduced, not CrossOver 26.3, and not an Xbox hardware result.
 
 | Check | Outcome |
 | --- | --- |
-| `device.shader_model` | 6.6 (the fixture skips with exit 77 below 6.6) |
+| `device.shader_model` | 6.6 |
+
+**Exit codes.** The fixture exits **0** with every required check passed, **1** on a failed
+required check, and **77** with a `SKIP: <reason>` line when `d3d12.dll`, its exports, device
+creation, or shader model 6.6 is unavailable. 77 is not a pass; see the exit-status section of
+[`tests/conformance/README.md`](../../tests/conformance/README.md#exit-status-pass-fail-and-unavailable)
+for a recording recipe. Through `bx-cli run` the guest status is returned unchanged.
 | `wave.reported` | `WaveOps=1`, lane count min 32, max 32 |
 | `wave.control` | ran at width 32, lanes a permutation within each wave (required: pass) |
 | `wave.wavesize64` | created but not run (output still sentinel) |
