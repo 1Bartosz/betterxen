@@ -20,6 +20,9 @@
  * returns the host HRESULT. The wrapper and the live-heap xmem budget charge
  * are the only differences: charge on create, credit on the wrapper's final
  * Release, E_OUTOFMEMORY only when that budget is exceeded.
+ * GetDevice on the wrapper returns the BxDeviceProxy that created the heap.
+ * The wrapper does not AddRef that proxy. The cached backing heap is keyed by
+ * the host ID3D12Device that created it and is released when that device changes.
  * A null out pointer is forwarded unchanged to the host.
  * vkd3d on CrossOver 26.2 faults on that pointer with or without this shim.
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createheap
@@ -59,6 +62,9 @@ struct Record {
     uint64_t cpu_pointer = 0;
     class BxChargedHeap* backing = nullptr;
     ID3D12Resource* backing_buffer = nullptr;
+    /* Host device that created `backing`. Not an owning reference. A later
+       CreateHeap whose host device pointer differs releases the cache. */
+    ID3D12Device* backing_host = nullptr;
 };
 
 struct Section {
@@ -130,12 +136,20 @@ void release_charge(uint64_t bytes) {
  * QueryInterface for ID3D12Heap, and for ID3D12Heap1 when the host heap answers it,
  * returns this object. bx_unwrap sees IID_BxProxyHost and receives the host heap.
  * GetProtectedResourceSession forwards to the host ID3D12Heap1.
+ * GetDevice returns the BxDeviceProxy, matching BxChildProxy::GetDevice.
+ * `device_` is not an owning reference. AddRef would keep the proxy alive for as
+ * long as g_record.backing holds this heap, so the caller's last Release would
+ * not destroy the device and the budget charge would stick across device
+ * recreation. The pointer stays valid while that proxy is alive. ensure_backing
+ * releases a cached heap when the host device changes and does not call GetDevice
+ * on the heap it is dropping.
  * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nn-d3d12-id3d12heap1
+ * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12devicechild-getdevice
  */
 class BxChargedHeap final : public ID3D12Heap1 {
 public:
-    static BxChargedHeap* create(ID3D12Heap* host, ID3D12Heap1* host1, uint64_t bytes) {
-        return new (std::nothrow) BxChargedHeap(host, host1, bytes);
+    static BxChargedHeap* create(ID3D12Heap* host, ID3D12Heap1* host1, uint64_t bytes, BxDeviceProxy* device) {
+        return new (std::nothrow) BxChargedHeap(host, host1, bytes, device);
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
@@ -193,7 +207,18 @@ public:
         return host_->SetPrivateDataInterface(guid, data);
     }
     HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return host_->SetName(name); }
-    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppv) override { return host_->GetDevice(riid, ppv); }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppv) override {
+        BX_D3D_TRACE("ID3D12DeviceChild", "GetDevice");
+        if (!ppv) {
+            return E_POINTER;
+        }
+        /* The proxy, never the host device. QueryInterface AddRefs for the caller only. */
+        if (!device_) {
+            *ppv = nullptr;
+            return E_FAIL;
+        }
+        return device_->QueryInterface(riid, ppv);
+    }
     D3D12_HEAP_DESC* STDMETHODCALLTYPE GetDesc(D3D12_HEAP_DESC* ret) override { return host_->GetDesc(ret); }
     HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID riid, void** session) override {
         if (!session) {
@@ -207,7 +232,8 @@ public:
     }
 
 private:
-    BxChargedHeap(ID3D12Heap* host, ID3D12Heap1* host1, uint64_t bytes) : host_(host), host1_(host1), bytes_(bytes) {
+    BxChargedHeap(ID3D12Heap* host, ID3D12Heap1* host1, uint64_t bytes, BxDeviceProxy* device)
+        : host_(host), host1_(host1), bytes_(bytes), device_(device) {
         if (host_) {
             host_->AddRef();
         }
@@ -220,6 +246,7 @@ private:
     ID3D12Heap* host_;
     ID3D12Heap1* host1_;
     uint64_t bytes_;
+    BxDeviceProxy* device_; /* non-owning; see the class comment */
     LONG refs_ = 1;
 };
 
@@ -286,7 +313,39 @@ bool backing_request(const D3D12_HEAP_DESC* desc) {
 
 HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFIID riid, void** out);
 
+/* True when the cached backing heap was created for `host`.
+   Otherwise moves a foreign cache out of g_record so the caller can release it
+   without holding g_section (Release takes that lock to credit the budget). */
+bool detach_foreign_backing(ID3D12Device* host, BxChargedHeap** heap, ID3D12Resource** buffer) {
+    Guard guard(g_section);
+    *heap = nullptr;
+    *buffer = nullptr;
+    if (g_record.backing && g_record.backing_host == host) {
+        return true;
+    }
+    if (g_record.backing) {
+        *heap = g_record.backing;
+        *buffer = g_record.backing_buffer;
+        g_record.backing = nullptr;
+        g_record.backing_buffer = nullptr;
+        g_record.backing_host = nullptr;
+        g_record.cpu_pointer = 0;
+    }
+    return false;
+}
+
+void release_backing_pair(BxChargedHeap* heap, ID3D12Resource* buffer) {
+    if (buffer) {
+        buffer->Unmap(0, nullptr);
+        buffer->Release();
+    }
+    if (heap) {
+        heap->Release();
+    }
+}
+
 HRESULT return_backing(REFIID riid, void** out) {
+    Guard guard(g_section);
     if (!g_record.backing) {
         return E_FAIL;
     }
@@ -297,12 +356,14 @@ HRESULT return_backing(REFIID riid, void** out) {
 }
 
 HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** out) {
-    {
-        Guard guard(g_section);
-        if (g_record.backing) {
-            return return_backing(riid, out);
-        }
+    BxChargedHeap* stale_heap = nullptr;
+    ID3D12Resource* stale_buffer = nullptr;
+    if (detach_foreign_backing(self->h_ID3D12Device, &stale_heap, &stale_buffer)) {
+        return return_backing(riid, out);
     }
+    release_backing_pair(stale_heap, stale_buffer);
+    stale_heap = nullptr;
+    stale_buffer = nullptr;
 
     D3D12_HEAP_DESC desc = {};
     desc.SizeInBytes = bytes;
@@ -345,17 +406,21 @@ HRESULT ensure_backing(BxDeviceProxy* self, uint64_t bytes, REFIID riid, void** 
 
     {
         Guard guard(g_section);
-        if (g_record.backing) {
+        if (g_record.backing && g_record.backing_host == self->h_ID3D12Device) {
             resource->Unmap(0, nullptr);
             resource->Release();
             wrap->Release();
             return return_backing(riid, out);
         }
+        stale_heap = g_record.backing;
+        stale_buffer = g_record.backing_buffer;
         g_record.backing = wrap;
         g_record.backing_buffer = resource;
+        g_record.backing_host = self->h_ID3D12Device;
         /* Remember the map. The caller's config block is not stored and is not written here. */
         g_record.cpu_pointer = reinterpret_cast<uint64_t>(mapped);
     }
+    release_backing_pair(stale_heap, stale_buffer);
     return return_backing(riid, out);
 }
 
@@ -385,7 +450,7 @@ HRESULT host_private_heap(BxDeviceProxy* self, const D3D12_HEAP_DESC* desc, REFI
     if (host->QueryInterface(__uuidof(ID3D12Heap1), &probed) == S_OK && probed) {
         host1 = static_cast<ID3D12Heap1*>(probed);
     }
-    BxChargedHeap* wrap = BxChargedHeap::create(host, host1, desc->SizeInBytes);
+    BxChargedHeap* wrap = BxChargedHeap::create(host, host1, desc->SizeInBytes, self);
     if (host1) {
         host1->Release();
     }
@@ -625,6 +690,7 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
             old_buffer = g_record.backing_buffer;
             g_record.backing = nullptr;
             g_record.backing_buffer = nullptr;
+            g_record.backing_host = nullptr;
             g_record.cpu_pointer = 0;
         }
         g_record.configured = true;
@@ -646,14 +712,20 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
     if (old_heap) {
         old_heap->Release();
     }
+    uint64_t charged = 0;
+    {
+        Guard guard(g_section);
+        charged = g_record.charged_private_bytes;
+    }
 
-    char detail[320];
+    char detail[384];
     std::snprintf(detail, sizeof(detail),
-                  "profile=%s title_limit=%llu xmem_used=%llu xmem_region=%d base=0x%llx region_bytes=%llu",
+                  "profile=%s title_limit=%llu xmem_used=%llu xmem_region=%d base=0x%llx region_bytes=%llu gpu_heap_bytes=%llu",
                   profile_name(profile), static_cast<unsigned long long>(cap),
                   static_cast<unsigned long long>(stats.committed_virtual_bytes + stats.allocated_physical_bytes),
                   have_region ? 1 : 0, static_cast<unsigned long long>(have_region ? region.base_va : 0),
-                  static_cast<unsigned long long>(have_region ? region.size_bytes : 0));
+                  static_cast<unsigned long long>(have_region ? region.size_bytes : 0),
+                  static_cast<unsigned long long>(charged));
     bx_log_emit(BX_LOG_INFO, "d3d12_xs", "D3D12ConfigureVirtualMemoryX", detail);
     return S_OK;
 }

@@ -42,6 +42,12 @@
  * Any other CreateHeap is the host CreateHeap. The desc is not modified.
  * The live-heap xmem budget charge (taken on create, dropped on the wrapper's
  * final Release) is the budget difference, and the returned object is the wrapper.
+ * GetDevice on the wrapper returns the BxDeviceProxy that created the heap and
+ * does not AddRef it. The process-wide backing cache holds that heap, so a strong
+ * reference would keep the device and its charge alive after the caller released
+ * the device. The cache records the host ID3D12Device that built the heap.
+ * CreateHeap for a different host device releases the heap and its buffer,
+ * credits the charge, and builds a new backing heap.
  *
  * The layout must match tests/conformance/test_d3d12_placed/main.cpp.
  */

@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "bx_log.h"
@@ -245,6 +246,47 @@ D3D12_RESOURCE_DESC texture_desc() {
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     return desc;
+}
+
+/* Last unsigned value of `key` (for example "gpu_heap_bytes=") in a JSONL log. */
+uint64_t last_log_u64(const char* path, const char* key) {
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        return ~0ull;
+    }
+    uint64_t found = ~0ull;
+    LARGE_INTEGER size = {};
+    if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && size.QuadPart < (64ll << 20)) {
+        auto* buf = static_cast<char*>(HeapAlloc(GetProcessHeap(), 0, static_cast<SIZE_T>(size.QuadPart) + 1));
+        DWORD got = 0;
+        if (buf && ReadFile(f, buf, static_cast<DWORD>(size.QuadPart), &got, nullptr)) {
+            buf[got] = '\0';
+            const size_t key_len = std::strlen(key);
+            for (char* p = buf; (p = std::strstr(p, key)) != nullptr; p += key_len) {
+                found = std::strtoull(p + key_len, nullptr, 10);
+            }
+        }
+        if (buf) HeapFree(GetProcessHeap(), 0, buf);
+    }
+    CloseHandle(f);
+    return found;
+}
+
+bool same_object(IUnknown* a, IUnknown* b);
+
+void check_heap_get_device(ID3D12Heap* heap, ID3D12Device* proxy, ID3D12Device* host_device, const char* what) {
+    if (!check(heap != nullptr, "%s exists for GetDevice", what)) {
+        return;
+    }
+    ID3D12Device* got = nullptr;
+    const HRESULT hr = heap->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&got));
+    check(hr == S_OK && got == proxy, "%s GetDevice returns the device proxy pointer (hr=0x%08lx got=%p proxy=%p)", what,
+          ul(hr), static_cast<void*>(got), static_cast<void*>(proxy));
+    check(got != host_device && !same_object(got, host_device), "%s GetDevice is not the raw host device", what);
+    if (got) {
+        got->Release();
+    }
 }
 
 bool same_object(IUnknown* a, IUnknown* b) {
@@ -531,6 +573,10 @@ int main() {
     }
     check(!same_object(custom_a, backing) && !same_object(custom_b, backing),
           "CUSTOM heaps created without the opt-in are not the backing heap");
+    check_heap_get_device(backing, device, host, "backing heap");
+    if (custom_a) {
+        check_heap_get_device(custom_a, device, host, "ordinary CUSTOM heap");
+    }
 
     live.cpu_pointer = 0;
     hr = D3D12ConfigureVirtualMemoryX(&live);
@@ -1055,8 +1101,51 @@ int main() {
     if (placed_tex) placed_tex->Release();
     if (placed_buf) placed_buf->Release();
     if (backing) backing->Release();
+
+    /*
+     * Caller-held heaps are released above. g_record still holds the backing heap,
+     * so the charge must be exactly one region. Releasing device A must drop the
+     * proxy to zero (the cache does not own it). Device B then places into the
+     * same region; the charge must stay one region, not two.
+     */
+    BxD3d12VirtualMemoryConfig charge_before_block = make_block(region_base, kRegionBytes, kFlagBacking);
+    hr = mapped ? D3D12ConfigureVirtualMemoryX(&charge_before_block) : E_FAIL;
+    const uint64_t charged_before = have_log ? last_log_u64(log_path, "gpu_heap_bytes=") : ~0ull;
+    check(hr == S_OK && charged_before == kRegionBytes,
+          "one backing heap remains charged before device recreation (gpu_heap_bytes=%llu)",
+          static_cast<unsigned long long>(charged_before));
+    check(device->Release() == 0, "device A proxy released while the backing cache still holds the heap");
+    device = nullptr;
+
+    ID3D12Device* device_b = nullptr;
+    hr = D3D12XboxCreateDevice(nullptr, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device_b));
+    check(hr == S_OK && device_b, "device B is a new proxy hr=0x%08lx", ul(hr));
+    ID3D12Heap* backing_b = nullptr;
+    if (device_b) {
+        D3D12_HEAP_DESC again_desc = backing_desc();
+        hr = device_b->CreateHeap(&again_desc, __uuidof(ID3D12Heap), reinterpret_cast<void**>(&backing_b));
+        check(hr == S_OK && backing_b, "device B backing CreateHeap hr=0x%08lx", ul(hr));
+    }
+    if (device_b && backing_b) {
+        check_heap_get_device(backing_b, device_b, host, "device B backing heap");
+        ID3D12Resource* placed_b = nullptr;
+        D3D12_RESOURCE_DESC placed_desc = buffer_desc(kBufBytes);
+        hr = device_b->CreatePlacedResource(backing_b, 0, &placed_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                            __uuidof(ID3D12Resource), reinterpret_cast<void**>(&placed_b));
+        check(hr == S_OK && placed_b, "device B CreatePlacedResource in the configured region hr=0x%08lx", ul(hr));
+        if (placed_b) placed_b->Release();
+    }
+    BxD3d12VirtualMemoryConfig charge_after_block = make_block(region_base, kRegionBytes, kFlagBacking);
+    hr = mapped ? D3D12ConfigureVirtualMemoryX(&charge_after_block) : E_FAIL;
+    const uint64_t charged_after = have_log ? last_log_u64(log_path, "gpu_heap_bytes=") : ~0ull;
+    check(hr == S_OK && charged_after == kRegionBytes && charged_after != kRegionBytes * 2,
+          "budget charge after device B is one region, not two (gpu_heap_bytes=%llu)",
+          static_cast<unsigned long long>(charged_after));
+    if (backing_b) backing_b->Release();
     if (host) host->Release();
-    check(device->Release() == 0, "device proxy leaked references");
+    if (device_b) {
+        check(device_b->Release() == 0, "device B proxy released");
+    }
 
     if (view) {
         XMemMapPhysicalPages(view, page_count, 0, nullptr);
