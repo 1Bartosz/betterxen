@@ -136,6 +136,18 @@ Every feature issue belongs to **one track** and defines an **exclusive file sco
 4. **Git safety:** Commit, push, and open PRs only when requested or authorized by the user; never change repository visibility without explicit instruction. Do not add AI attribution or `Co-authored-by` trailers to commits. Preserve the configured Git author and committer identity.
 5. **Changelog & docs index:** Read `CHANGELOG.md` before starting and update `[Unreleased]` for every meaningful addition, change, fix, removal, or security update. Update `docs/README.md` whenever documentation is added, removed, or reorganized.
 
+### Merge eligibility
+
+Four roles are separate: the **original author** (who opened the PR), **corrective contributors** (who later push to its branch), **independent approvers**, and the **merger**.
+
+- The original author never merges their own PR. Any other maintainer may merge once required checks pass, at least one approval is current and blocking review conversations are resolved.
+- Maintainers may resolve conflicts, correct defects, update documentation and push fixes to a contributor's PR branch where GitHub permissions allow. Doing so does not disqualify them from merging.
+- Any push that changes the PR dismisses earlier approvals. After a **routine** push (conflict resolution that changes no behaviour, changelog correction, minor documentation fix), one new approval is enough and may come from the maintainer who pushed it, if they are not the original author. No further approval is required beyond the ruleset.
+- **Substantive** implementation changes need independent review (Section 5): the approval must come from someone who did not write them. A maintainer who wrote substantive corrections may merge after another person has approved those corrections, but may not approve them. If in doubt, treat a change as substantive.
+- A coding agent acts as the person it works for and merges only with that person's authorization.
+
+The `Protect main` ruleset enforces pull requests, one approval, dismissal of stale approvals, resolved conversations, the required CI checks and no force push or deletion, with no bypass actors. GitHub cannot enforce two rules above: who may merge (`Merge policy audit` only fails after an author self-merge) and whether an approver wrote part of the change.
+
 ---
 
 ## 8. Verification Commands (Run Before Every Handoff / PR)
@@ -175,5 +187,5 @@ These rules apply to every coding agent, whatever its model, vendor or plan. Sav
 - **Verify without redundancy:** Use targeted checks while iterating and for small changes. This does not replace Section 8 or required CI. Do not repeat builds, tests or CI runs when nothing relevant has changed, and do not poll workflows repeatedly.
 - **Communicate concisely:** Report outcomes, blockers and what is needed next; skip lengthy status reports and repeated summaries.
 - **Blocked work:** Do not re-review an unchanged PR that is waiting on an unresolved external blocker.
-- **Finish authorized work:** Carry an authorized task through to completion, including a merge that is authorized and meets every required approval and check, instead of stopping at intermediate reports. This grants no permission beyond Section 7.
+- **Finish authorized work:** Carry an authorized task through to completion, including a merge that is authorized and eligible (Section 7), instead of stopping at intermediate reports. This grants no permission beyond Section 7.
 - **Escalate real uncertainty:** Raise genuine doubt about ABI compatibility, memory safety, concurrency, security, GPU synchronization, licensing or architecture with a maintainer rather than guessing.
