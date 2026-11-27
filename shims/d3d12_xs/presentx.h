@@ -97,7 +97,8 @@ struct IBxPresentSwapChain : public IUnknown {
      * Waits until everything submitted to the queue before this call has finished. S_OK also ends
      * the state left by BX_PRESENT_E_COMPLETION_UNCONFIRMED.
      * INFINITE is rejected with E_INVALIDARG; a timeout returns HRESULT_FROM_WIN32(ERROR_TIMEOUT).
-     * timeout_ms includes any time spent waiting for a Present on another thread.
+     * Lock acquisition and fence waiting share timeout_ms. Time spent inside host calls reduces
+     * the remaining wait, but the bridge cannot interrupt those calls.
      */
     virtual HRESULT STDMETHODCALLTYPE WaitForIdle(DWORD timeout_ms) = 0;
     /*

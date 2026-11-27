@@ -477,6 +477,8 @@ struct Faults {
     volatile LONG hold_present = 0;    /* one-shot: wait inside the host Present */
     volatile LONG fail_after = 0;      /* one-shot: fail the Signal that follows the host Present */
     volatile LONG fail_signal = 0;
+    volatile LONG signal_delay_ms = 0;  /* one-shot: consume the wait budget inside Signal */
+    ULONGLONG delayed_signal_finished = 0;
     volatile LONG signals_failed = 0;
     volatile LONG hold_timed_out = 0;
 } g_faults;
@@ -499,7 +501,11 @@ HRESULT STDMETHODCALLTYPE hooked_signal(void* self, ID3D12Fence* fence, UINT64 v
         InterlockedIncrement(&g_faults.signals_failed);
         return E_FAIL; /* nothing is queued */
     }
-    return g_faults.signal(self, fence, value);
+    const LONG delay_ms = InterlockedExchange(&g_faults.signal_delay_ms, 0);
+    if (delay_ms > 0) Sleep(static_cast<DWORD>(delay_ms));
+    const HRESULT hr = g_faults.signal(self, fence, value);
+    if (delay_ms > 0) g_faults.delayed_signal_finished = GetTickCount64();
+    return hr;
 }
 
 /* Waits for a thread while still dispatching this thread's window messages. */
@@ -1041,6 +1047,12 @@ int main(int argc, char** argv) {
               host_present_count(cycle) - before);
         hr = cycle->WaitForIdle(300);
         check(hr == kTimedOut, "WaitForIdle with the queue blocked: hr=0x%08lx", ul(hr));
+        InterlockedExchange(&g_faults.signal_delay_ms, 1300);
+        hr = cycle->WaitForIdle(1000);
+        const ULONGLONG after_signal = GetTickCount64() - g_faults.delayed_signal_finished;
+        check(hr == kTimedOut && g_faults.delayed_signal_finished != 0 && after_signal < 650,
+              "WaitForIdle after its signal used the budget: hr=0x%08lx, extra wait=%llu ms",
+              ul(hr), static_cast<unsigned long long>(after_signal));
         check(cycle->Present(0, 0) == BX_PRESENT_E_NEEDS_IDLE, "an unsuccessful WaitForIdle must not recover the swapchain");
         REQUIRE(SUCCEEDED(gate->Signal(1)), "release the gate");
         check(cycle->WaitForIdle(5000) == S_OK, "queue did not drain after the gate opened");
