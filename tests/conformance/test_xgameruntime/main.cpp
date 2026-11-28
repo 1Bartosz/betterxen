@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "task_queue.h"
+
 namespace {
 
 struct Async {
@@ -305,6 +307,56 @@ void check_delayed_callback(HRESULT(WINAPI* query_api)(const GUID*, const GUID*,
         for (int i = 0; i < 200 && async.runs.load() == 0; ++i) Sleep(1);
         CHECK(async.runs.load() == 1 && async.cancels.load() == 0);
         XTaskQueueCloseHandle(pooled);
+    }
+
+    // delay_ms == 0xFFFFFFFF is a valid uint32_t delay (~49.7 days). The wait
+    // loop must never pass INFINITE to Sleep, because that is an infinite wait:
+    // the loop would never re-check the deadline. Assert the chunk helper
+    // clamps the maximum delay to a finite, positive chunk, then show the
+    // callback still fires for that delay on a lane that only holds it until
+    // the queue is closed (a full 49-day wait is obviously not run here).
+    {
+        using bx::gdk::finite_sleep_chunk_ms;
+        using bx::gdk::kMaxFiniteSleepMs;
+        CHECK(kMaxFiniteSleepMs == INFINITE - 1);
+        CHECK(kMaxFiniteSleepMs == 0xFFFFFFFEu);
+        // The exact remainder that used to be passed to Sleep as INFINITE.
+        const uint32_t max_chunk = finite_sleep_chunk_ms(0xFFFFFFFFull);
+        CHECK(max_chunk <= 0xFFFFFFFEu && max_chunk > 0);
+        CHECK(max_chunk == 0xFFFFFFFEu);
+        // Never INFINITE, whatever the remainder, and never a zero chunk.
+        CHECK(finite_sleep_chunk_ms(0x100000000ull) == 0xFFFFFFFEu);
+        CHECK(finite_sleep_chunk_ms(~0ull) == 0xFFFFFFFEu);
+        CHECK(finite_sleep_chunk_ms(1) == 1);
+        CHECK(finite_sleep_chunk_ms(0xFFFFFFFEull) == 0xFFFFFFFEu);
+        CHECK(finite_sleep_chunk_ms(0xFFFFFFFDull) == 0xFFFFFFFDu);
+    }
+
+    // The maximum delay is accepted and its callback still fires. A parallel
+    // lane holds the task until its deadline, and closing the queue drains it
+    // on a worker, so the callback runs without waiting out the 49 days.
+    {
+        void* pooled = nullptr;
+        CHECK(XTaskQueueCreate(pool, manual, &pooled) == S_OK && pooled);
+        DelayRecord record{};
+        CHECK(submit_delayed(core, pooled, work, 0xFFFFFFFFu, &record, record_delay) == S_OK);
+        Sleep(early_margin_ms);
+        CHECK(record.runs.load() == 0 && record.cancels.load() == 0);
+        XTaskQueueCloseHandle(pooled);
+        for (int i = 0; i < 500 && record.runs.load() == 0; ++i) Sleep(1);
+        CHECK(record.runs.load() == 1 && record.cancels.load() == 0 && record.canary == 0xA5);
+    }
+
+    // Same maximum delay on a manual lane: closing it cancels the pending
+    // task, which must still reach the callback rather than being lost.
+    {
+        void* queue = nullptr;
+        CHECK(XTaskQueueCreate(manual, manual, &queue) == S_OK && queue);
+        DelayRecord record{};
+        CHECK(submit_delayed(core, queue, work, 0xFFFFFFFFu, &record, record_delay) == S_OK);
+        CHECK(record.runs.load() == 0 && record.cancels.load() == 0);
+        XTaskQueueCloseHandle(queue);
+        CHECK(record.runs.load() == 0 && record.cancels.load() == 1 && record.canary == 0xA5);
     }
 }
 

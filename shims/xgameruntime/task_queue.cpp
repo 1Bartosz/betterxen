@@ -77,7 +77,9 @@ public:
                 const uint64_t now = GetTickCount64();
                 if (due_ms == 0 || now >= due_ms) return;
                 const uint64_t left = due_ms - now;
-                Sleep(static_cast<DWORD>(left < 0xFFFFFFFFull ? left : 0xFFFFFFFFull));
+                // INFINITE would mean "wait forever", so a `left` of exactly
+                // 0xFFFFFFFF would never wake to re-check the deadline.
+                Sleep(finite_sleep_chunk_ms(left));
             }
         }
 
