@@ -104,7 +104,8 @@ impl ShaderInspection {
     /// Payload of the first chunk tagged `fourcc`, if present and fully
     /// inside the container. Returns `None` when absent, when the declared
     /// size would run past `container_size` or `container`, or when `offset`
-    /// is not a valid container offset for a chunk header.
+    /// points into the DXBC header or chunk-offset table instead of a chunk
+    /// header.
     ///
     /// `container` must be the same bytes passed to [`inspect_dxbc`]; the
     /// inspection only stores chunk metadata, so the original container is
@@ -122,6 +123,11 @@ impl ShaderInspection {
     /// the first one in table order wins, matching the C++ `find_chunk`.
     pub fn chunk_payload<'a>(&self, container: &'a [u8], fourcc: &[u8; 4]) -> Option<&'a [u8]> {
         let chunk = self.chunks.iter().find(|c| &c.fourcc == fourcc)?;
+        let table_bytes = u64::try_from(self.chunks.len()).ok()?.checked_mul(4)?;
+        let table_end = 32u64.checked_add(table_bytes)?;
+        if u64::from(chunk.offset) < table_end {
+            return None;
+        }
         let start = u64::from(chunk.offset).checked_add(8)?;
         let end = start.checked_add(u64::from(chunk.size))?;
         if end > u64::from(self.container_size) {
@@ -1859,8 +1865,13 @@ mod tests {
         // Presence without trusting the size still holds.
         assert!(info.has_chunk_tag(b"SFI0"));
 
-        // A header offset past the container must also yield None.
+        // A forged public ChunkInfo must not treat the DXBC header or offset
+        // table as a chunk header.
         info.chunks[0].size = 4;
+        info.chunks[0].offset = 0;
+        assert_eq!(info.chunk_payload(&blob, b"SFI0"), None);
+
+        // A header offset past the container must also yield None.
         info.chunks[0].offset = u32::MAX;
         assert_eq!(info.chunk_payload(&blob, b"SFI0"), None);
 
