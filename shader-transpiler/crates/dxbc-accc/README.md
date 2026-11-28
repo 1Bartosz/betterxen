@@ -2,6 +2,15 @@
 
 Classifies D3D shader containers (`DXBC` with `DXIL`, legacy `SHDR`/`SHEX`, and `ACCC` chunks carrying BetterXen's synthetic `FSPX` table) and exposes the C ABI in [`abi/include/bx_shader_bridge.h`](../../../abi/include/bx_shader_bridge.h): `bx_shader_inspect`, `bx_shader_prepare_for_d3dmetal` and `bx_shader_free_buffer`.
 
+## `FSPX` errors
+
+A malformed `FSPX` table fails inspection with a `ParseError`; it never panics. Two bounds errors are kept apart (#599):
+
+- **`FspxLayoutMismatch`:** a descriptor's offset lands inside the 16-byte header or the descriptor table, the region the synthetic layout reserves. The table does not follow BetterXen's clean-room layout. The error carries the section id, the offset and the table length.
+- **`FspxSectionOutOfBounds`:** a section starts after the table but runs past the end of the payload.
+
+Both are still errors. Over the C ABI, both are `BX_SHADER_ERR_INVALID_BLOB`, so a caller of `bx_shader_inspect` cannot tell them apart yet; that would need an `[ABI]` change to `abi/include/bx_shader_bridge.h`.
+
 ## Guest access: `bx_shader_bridge.dll` (#445)
 
 The shims that see shader bytecode (`d3d12_xs.dll`) are x86-64 Windows PE32+ DLLs running inside CrossOver. They cannot load the arm64 macOS library that `cargo build` produces on the host. The bridge reaches guests as a **Windows build of this same crate**, with no second implementation:
