@@ -294,7 +294,7 @@ BOOL WINAPI XMemGetWorkingSetStatistics(PVOID out_stats, SIZE_T stats_size) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return FALSE;
     }
-    const bx_xmem_stats_t stats{title_limit(), heap_bytes + virtual_bytes, physical_bytes, peak_bytes};
+    const bx_xmem_stats_t stats{title_limit(), heap_bytes + virtual_bytes + external_bytes, physical_bytes, peak_bytes};
     std::memset(out_stats, 0, stats_size);
     std::memcpy(out_stats, &stats, sizeof(stats));
     return TRUE;
@@ -310,14 +310,22 @@ void bx_xmem_get_internal_stats(bx_xmem_stats_t* out_stats) {
         // The internal ABI has no error return. Preserve the most recent
         // accounting snapshot if refreshing it runs out of bookkeeping memory.
         std::lock_guard guard(usage_lock);
-        *out_stats = {title_limit(), heap_bytes + virtual_bytes, physical_bytes, peak_bytes};
+        *out_stats = {title_limit(), heap_bytes + virtual_bytes + external_bytes, physical_bytes, peak_bytes};
     }
 }
 
 int bx_xmem_try_charge_external(uint64_t bytes) {
     std::lock_guard guard(usage_lock);
-    if (!can_commit(bytes) && (!refresh_virtual_commits() || !can_commit(bytes))) {
-        return 0;
+    if (!can_commit(bytes)) {
+        if (!refresh_virtual_commits()) {
+            // Bookkeeping ran out of memory: not a budget decision, so say so.
+            bx_log_emit(BX_LOG_ERROR, "xmem", "external_charge",
+                        "refresh_virtual_commits failed; charge refused without a budget check");
+            return 0;
+        }
+        if (!can_commit(bytes)) {
+            return 0;
+        }
     }
     external_bytes += bytes;
     update_peak();
@@ -327,8 +335,9 @@ int bx_xmem_try_charge_external(uint64_t bytes) {
 void bx_xmem_release_charge_external(uint64_t bytes) {
     std::lock_guard guard(usage_lock);
     if (bytes > external_bytes) {
-        bx_log_emit(BX_LOG_ERROR, "xmem", "external_charge", "external charge underflow on release");
-        external_bytes = 0;
+        // Refuse: zeroing would also drop other owners' outstanding charges.
+        bx_log_emit(BX_LOG_ERROR, "xmem", "external_charge",
+                    "release exceeds outstanding external charge; counter left unchanged");
         return;
     }
     external_bytes -= bytes;
