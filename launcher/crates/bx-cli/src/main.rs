@@ -922,6 +922,16 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     }
 
+    // Drive links are prefix-global. Keep them stable until this guest exits so another bx-cli
+    // process cannot retarget G: underneath a running title.
+    let _drive_lock = match drives::lock_drive_mappings(&environment_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            diag(format_args!("error: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
     // An Xbox title opens its package on G: and writes temporary files to T:. A missing drive
     // only matters to such a title, so it is reported and the run goes on.
     match abs_exe.parent() {

@@ -14,13 +14,64 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::os::unix::fs::symlink;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{OpenOptionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 const MANIFEST: &str = ".bx-drives";
+const LOCK_FILE: &str = ".bx-drive-mapping.lock";
 
 /// The prefix-relative target of `t:`, in the form Wine itself uses for `c:`.
 pub const TEMP_TARGET: &str = "../drive_c/bx_temp";
+
+#[derive(Debug)]
+pub struct DriveMappingLock {
+    _file: fs::File,
+}
+
+/// Holds the prefix's drive mappings stable until the returned lock is dropped.
+pub fn lock_drive_mappings(prefix: &Path) -> Result<DriveMappingLock, String> {
+    fs::create_dir_all(prefix).map_err(|e| {
+        format!(
+            "cannot prepare prefix {} for drive lock: {e}",
+            prefix.display()
+        )
+    })?;
+    let prefix = fs::canonicalize(prefix).map_err(|e| {
+        format!(
+            "cannot resolve prefix {} for drive lock: {e}",
+            prefix.display()
+        )
+    })?;
+    let path = prefix.join(LOCK_FILE);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| format!("cannot open drive lock {}: {e}", path.display()))?;
+
+    loop {
+        // The open file descriptor stays alive in DriveMappingLock for the full launch.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(DriveMappingLock { _file: file });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Err(format!(
+                "another bx-cli run is active for prefix {}; refusing to launch with shared Xbox drive mappings",
+                prefix.display()
+            ));
+        }
+        return Err(format!("cannot lock {}: {error}", path.display()));
+    }
+}
 
 #[derive(Debug)]
 pub enum Mapping {
@@ -82,7 +133,13 @@ fn read_manifest(dosdevices: &Path) -> Result<BTreeMap<char, PathBuf>, String> {
         let mut chars = line.chars();
         match (chars.next(), chars.next()) {
             (Some(letter), Some('\t')) if letter.is_ascii_lowercase() => {
-                owned.insert(letter, PathBuf::from(chars.as_str()));
+                let encoded = chars.as_str();
+                let target = match encoded.strip_prefix('@') {
+                    Some(hex) => decode_path(hex)
+                        .ok_or_else(|| format!("malformed path in {}: {line:?}", path.display()))?,
+                    None => PathBuf::from(encoded),
+                };
+                owned.insert(letter, target);
             }
             _ => return Err(format!("malformed line in {}: {line:?}", path.display())),
         }
@@ -94,9 +151,41 @@ fn write_manifest(dosdevices: &Path, owned: &BTreeMap<char, PathBuf>) -> Result<
     let path = dosdevices.join(MANIFEST);
     let mut text = String::new();
     for (letter, target) in owned {
-        text.push_str(&format!("{letter}\t{}\n", target.display()));
+        text.push_str(&format!("{letter}\t@{}\n", encode_path(target)));
     }
     fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+fn encode_path(path: &Path) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = path.as_os_str().as_bytes();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_path(hex: &str) -> Option<PathBuf> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = hex.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        decoded.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
 }
 
 /// Points `link` at `target`, replacing what is there through a rename so the link never
@@ -348,6 +437,46 @@ mod tests {
         assert_eq!(
             read_manifest(&t.prefix().join("dosdevices")).unwrap()[&'g'],
             t.game()
+        );
+    }
+
+    #[test]
+    fn a_prefix_lock_rejects_another_launcher_until_released() {
+        let t = TempDir::new("lock");
+        let lock = lock_drive_mappings(&t.prefix()).unwrap();
+        let error = lock_drive_mappings(&t.prefix()).unwrap_err();
+        assert!(error.contains("another bx-cli run"), "{error}");
+
+        drop(lock);
+        assert!(lock_drive_mappings(&t.prefix()).is_ok());
+    }
+
+    #[test]
+    fn a_non_utf8_target_round_trips_through_the_manifest() {
+        let t = TempDir::new("non-utf8");
+        let mut game_bytes = t.0.as_os_str().as_bytes().to_vec();
+        game_bytes.extend_from_slice(b"/game-\xff");
+        let game = PathBuf::from(std::ffi::OsString::from_vec(game_bytes));
+        let owned = BTreeMap::from([('g', game.clone())]);
+        write_manifest(&t.prefix().join("dosdevices"), &owned).unwrap();
+        assert_eq!(
+            read_manifest(&t.prefix().join("dosdevices")).unwrap()[&'g'],
+            game
+        );
+    }
+
+    #[test]
+    fn a_legacy_plain_text_target_still_reads() {
+        let t = TempDir::new("legacy-manifest");
+        let legacy_target = t.0.join("old-game");
+        fs::write(
+            t.prefix().join("dosdevices").join(MANIFEST),
+            format!("g\t{}\n", legacy_target.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_manifest(&t.prefix().join("dosdevices")).unwrap()[&'g'],
+            legacy_target
         );
     }
 }
