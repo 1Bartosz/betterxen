@@ -100,9 +100,23 @@ bool wait_complete(IXboxDStorageStatusArray* status, UINT32 index) {
     return false;
 }
 
+/* Reads only what this run appended: bx-cli run appends to a supplied BX_LOG_FILE,
+ * so records from an earlier run must not satisfy these checks. */
+long g_log_start = 0;
+
+long log_size(const char* path) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return 0;
+    std::fseek(f, 0, SEEK_END);
+    const long size = std::ftell(f);
+    std::fclose(f);
+    return size < 0 ? 0 : size;
+}
+
 bool file_contains(const char* path, const char* needle) {
     FILE* f = std::fopen(path, "rb");
     if (!f) return false;
+    std::fseek(f, g_log_start, SEEK_SET);
     std::string text;
     char buf[4096];
     size_t n = 0;
@@ -116,6 +130,16 @@ bool file_contains(const char* path, const char* needle) {
 } // namespace
 
 int main() {
+    /* BX_LOG_FILE must name the log before launch (bx-cli run --log): the log checks
+     * below are the only evidence for the BX_VTABLE_STUB_LOG records. */
+    char log_path[MAX_PATH] = {};
+    const DWORD log_len = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
+    if (log_len == 0 || log_len >= sizeof(log_path)) {
+        std::fprintf(stderr, "FAIL: BX_LOG_FILE must be set before launch (run under bx-cli run --log)\n");
+        return 1;
+    }
+    g_log_start = log_size(log_path);
+
     IXboxDStorageFactory* factory = nullptr;
     HRESULT hr = DStorageGetFactory(kXboxFactoryIid, reinterpret_cast<void**>(&factory));
     check(hr == S_OK && factory != nullptr, "DStorageGetFactory(Xbox) must succeed (hr=0x%08lx)",
@@ -293,6 +317,81 @@ int main() {
         mem_q->Release();
     }
 
+    /* Error paths on a fresh file queue. Each rejected command is reported in queue
+     * order, so submit and wait on the error event before reading the record. */
+    IXboxDStorageQueue* err_q = nullptr;
+    XboxQueueDesc err_desc = file_q_desc;
+    err_desc.name = "xbox_error_queue";
+    hr = factory->CreateQueueX(&err_desc, kXboxQueueIid, reinterpret_cast<void**>(&err_q));
+    check(hr == S_OK && err_q != nullptr, "CreateQueueX(error paths) must succeed (hr=0x%08lx)",
+          static_cast<unsigned long>(hr));
+    if (err_q && status) {
+        const HANDLE error_event = err_q->GetErrorEvent();
+        DSTORAGE_ERROR_RECORD record{};
+
+        /* A memory-source request (option 0x400000, as on the memory queue above) on a
+         * file queue is rejected before its source pointer is touched. */
+        uint8_t dest[16] = {};
+        XboxRequest bad_src{};
+        bad_src.options = 0x400000ull;
+        bad_src.destination = dest;
+        bad_src.destination_size = sizeof(dest);
+        bad_src.source_ptr = payload;
+        bad_src.source_size = sizeof(dest);
+        err_q->EnqueueRequest(&bad_src);
+        err_q->Submit();
+        check(error_event != nullptr && WaitForSingleObject(error_event, 5000) == WAIT_OBJECT_0,
+              "error event must signal for a memory request on a file queue");
+        err_q->RetrieveErrorRecord(&record);
+        check(record.FailureCount == 1 && record.FirstFailure.HResult == E_DSTORAGE_INVALID_SOURCE_TYPE &&
+                  record.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST,
+              "memory request on a file queue: count=%u hr=0x%08lx type=%d (want 1, E_DSTORAGE_INVALID_SOURCE_TYPE, REQUEST)",
+              static_cast<unsigned>(record.FailureCount), static_cast<unsigned long>(record.FirstFailure.HResult),
+              static_cast<int>(record.FirstFailure.CommandType));
+
+        /* A source/destination size mismatch on an otherwise valid file request. */
+        XboxRequest mismatch{};
+        mismatch.destination = dest;
+        mismatch.destination_size = sizeof(dest);
+        mismatch.source_ptr = file;
+        mismatch.source_size = sizeof(dest) - 1;
+        err_q->EnqueueRequest(&mismatch);
+        err_q->Submit();
+        check(WaitForSingleObject(error_event, 5000) == WAIT_OBJECT_0,
+              "error event must signal for a size mismatch");
+        record = {};
+        err_q->RetrieveErrorRecord(&record);
+        check(record.FailureCount == 1 && record.FirstFailure.HResult == E_DSTORAGE_INVALID_DESTINATION_SIZE &&
+                  record.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST,
+              "size mismatch: count=%u hr=0x%08lx type=%d (want 1, E_DSTORAGE_INVALID_DESTINATION_SIZE, REQUEST)",
+              static_cast<unsigned>(record.FailureCount), static_cast<unsigned long>(record.FirstFailure.HResult),
+              static_cast<int>(record.FirstFailure.CommandType));
+
+        /* A status index past the array's capacity (2). */
+        err_q->EnqueueStatus(status, 5);
+        err_q->Submit();
+        check(WaitForSingleObject(error_event, 5000) == WAIT_OBJECT_0,
+              "error event must signal for an out-of-range status index");
+        record = {};
+        err_q->RetrieveErrorRecord(&record);
+        check(record.FailureCount == 1 && record.FirstFailure.HResult == E_DSTORAGE_INDEX_BOUND &&
+                  record.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_STATUS,
+              "status index out of range: count=%u hr=0x%08lx type=%d (want 1, E_DSTORAGE_INDEX_BOUND, STATUS)",
+              static_cast<unsigned>(record.FailureCount), static_cast<unsigned long>(record.FirstFailure.HResult),
+              static_cast<int>(record.FirstFailure.CommandType));
+
+        /* An enqueue after Close is dropped and logged, not run. */
+        err_q->Close();
+        uint8_t after_close[16] = {};
+        XboxRequest late{};
+        late.destination = after_close;
+        late.destination_size = sizeof(after_close);
+        late.source_ptr = file;
+        late.source_size = sizeof(after_close);
+        err_q->EnqueueRequest(&late);
+        err_q->Release();
+    }
+
     if (status) status->Release();
     if (file) {
         file->Close();
@@ -301,13 +400,13 @@ int main() {
     factory->Release();
     DeleteFileW(temp_file);
 
-    char log_path[MAX_PATH] = {};
-    const DWORD log_len = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
-    if (log_len > 0 && log_len < sizeof(log_path)) {
+    {
         check(file_contains(log_path, "\"event\":\"dstorage_get_factory\",\"detail\":\"dispatch xbox_com=IDStorageFactoryX\""),
               "log must record Xbox factory dispatch");
-        check(file_contains(log_path, "xbox size=33554432 accepted"),
-              "log must record Xbox SetStagingBufferSize");
+        check(file_contains(log_path, "xbox size=33554432 has no effect"),
+              "log must record that Xbox SetStagingBufferSize has no effect");
+        check(file_contains(log_path, "dstorage_queue_closed"),
+              "log must record the request enqueued after Close as dropped");
         check(file_contains(log_path, "IDStorageQueueX[3]::EnqueueRequest_compressed"),
               "log must record compressed request stub");
     }

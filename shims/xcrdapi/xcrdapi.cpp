@@ -1605,7 +1605,8 @@ public:
 
     HRESULT STDMETHODCALLTYPE SetStagingBufferSize(UINT32 size) override {
         char detail[80];
-        std::snprintf(detail, sizeof(detail), "xbox size=%lu accepted", static_cast<unsigned long>(size));
+        /* Like the public factory: the engine has no staging buffer to size. */
+        std::snprintf(detail, sizeof(detail), "xbox size=%lu has no effect", static_cast<unsigned long>(size));
         bx_log_emit(BX_LOG_INFO, "xcrdapi", "dstorage_staging_buffer_size", detail);
         return S_OK;
     }
@@ -1625,6 +1626,9 @@ public:
         if (desc->source_type > 1) {
             return E_DSTORAGE_INVALID_SOURCE_TYPE;
         }
+        /* desc->priority is ignored on purpose: the Xbox priority range is not part of
+         * the inferred contract, so no value is rejected (the public queue's
+         * E_DSTORAGE_INVALID_QUEUE_PRIORITY range check is not assumed to apply). */
         const UINT slots = desc->capacity - 1u;
         auto* entries = new (std::nothrow) Entry[slots];
         if (!entries) return E_OUTOFMEMORY;
