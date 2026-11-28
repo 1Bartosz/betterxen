@@ -1,10 +1,10 @@
 /*
- * Xbox title drives: G: is the executable's directory and T: is writable temporary storage.
+ * Check BetterXen's inferred Xbox drive layout through synthetic file operations.
  *
  * The project-authorized target title we traced opens its package on G: and writes crash logs
  * to T:, and stops at startup when either is missing; that these roles hold for Xbox titles in
- * general is an inference. This fixture checks the resulting layout, not who created the links. The expected contents of G: come from this program's own path
- * (GetModuleFileNameW), not from how bx-cli maps the drive.
+ * general is an inference. The fixture checks the resulting layout. The expected contents
+ * of G: come from this program's own path (GetModuleFileNameW).
  */
 #include <windows.h>
 

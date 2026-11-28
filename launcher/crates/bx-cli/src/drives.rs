@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{OpenOptionsExt, symlink};
@@ -157,7 +157,15 @@ fn write_manifest(dosdevices: &Path, owned: &BTreeMap<char, PathBuf>) -> Result<
     // Written to a temporary file and renamed over the manifest, like `relink`, so an
     // interrupted write can never leave a truncated manifest that later runs refuse to parse.
     let tmp = dosdevices.join(format!("{MANIFEST}.tmp.{}", std::process::id()));
-    let written = fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, &path));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+    let written = file.write_all(text.as_bytes()).and_then(|()| {
+        drop(file);
+        fs::rename(&tmp, &path)
+    });
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
@@ -462,6 +470,20 @@ mod tests {
                 .unwrap()
                 .all(|e| !e.unwrap().file_name().to_string_lossy().contains(".tmp."))
         );
+    }
+
+    #[test]
+    fn manifest_temp_does_not_follow_an_existing_symlink() {
+        let t = TempDir::new("manifest-symlink");
+        let dosdevices = t.prefix().join("dosdevices");
+        let target = t.0.join("outside-manifest");
+        fs::write(&target, b"unchanged").unwrap();
+        let tmp = dosdevices.join(format!("{MANIFEST}.tmp.{}", std::process::id()));
+        symlink(&target, &tmp).unwrap();
+
+        assert!(write_manifest(&dosdevices, &BTreeMap::new()).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        assert_eq!(fs::read_link(&tmp).unwrap(), target);
     }
 
     #[test]
