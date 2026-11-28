@@ -3,10 +3,13 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 
 extern "C" {
 HRESULT WINAPI AcpHalCreate(void**);
+HRESULT WINAPI AcpHalAllocateShapeContexts(void*);
+HRESULT WINAPI AcpHalReleaseShapeContexts(void);
 HRESULT WINAPI ApuCreateHeap(uint32_t, uint32_t);
 HRESULT WINAPI ApuAlloc(void**, uint32_t*, uint32_t, uint32_t);
 HRESULT WINAPI ApuFree(void*);
@@ -29,6 +32,33 @@ HRESULT WINAPI XDspDisconnect(void*);
 
 namespace {
 void WINAPI dummy_device_callback(uint64_t, void*, void*, uint64_t, uint32_t, uint32_t) {}
+
+bool file_contains(const char* path, const char* needle_a, const char* needle_b) {
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    bool found = false;
+    LARGE_INTEGER size = {};
+    if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && size.QuadPart < (64ll << 20)) {
+        auto* buf = static_cast<char*>(HeapAlloc(GetProcessHeap(), 0, static_cast<SIZE_T>(size.QuadPart) + 1));
+        DWORD got = 0;
+        if (buf && ReadFile(f, buf, static_cast<DWORD>(size.QuadPart), &got, nullptr)) {
+            buf[got] = '\0';
+            /* Both needles must sit on the same JSONL line. */
+            for (char* line = buf; line && *line && !found;) {
+                char* end = std::strchr(line, '\n');
+                if (end) *end = '\0';
+                found = std::strstr(line, needle_a) && std::strstr(line, needle_b);
+                line = end ? end + 1 : nullptr;
+            }
+        }
+        if (buf) HeapFree(GetProcessHeap(), 0, buf);
+    }
+    CloseHandle(f);
+    return found;
+}
 } // namespace
 
 int main() {
@@ -66,6 +96,22 @@ int main() {
     CHECK(ApuFree(va) == S_OK && !ApuMapApuAddress(base) && !ApuMapVirtualAddress(va));
     CHECK(ApuFree(va) == E_INVALIDARG && ApuMapApuAddress(other) == second);
     CHECK(ApuFree(second) == S_OK && hal->Release() == 0);
+
+    // AcpHal shape-context stubs: NDA-gated contract, so BetterXen returns
+    // E_NOTIMPL and logs the symbol. Null and sentinel pointers must not crash.
+    CHECK(AcpHalAllocateShapeContexts(nullptr) == E_NOTIMPL);
+    CHECK(AcpHalAllocateShapeContexts(reinterpret_cast<void*>(uintptr_t{0xDEADBEEF})) == E_NOTIMPL);
+    CHECK(AcpHalReleaseShapeContexts() == E_NOTIMPL);
+    CHECK(AcpHalReleaseShapeContexts() == E_NOTIMPL);
+
+    char log_path[MAX_PATH];
+    DWORD log_len = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
+    if (log_len > 0 && log_len < sizeof(log_path)) {
+        CHECK(file_contains(log_path, "\"event\":\"unimpl_api\"", "AcpHal.dll!AcpHalAllocateShapeContexts"));
+        CHECK(file_contains(log_path, "\"event\":\"unimpl_api\"", "AcpHal.dll!AcpHalReleaseShapeContexts"));
+    } else {
+        std::fprintf(stderr, "SKIP: BX_LOG_FILE is not set; stub log records not verified\n");
+    }
 
     void *apu = nullptr, *peer = nullptr, *dsp = nullptr;
     CHECK(XApuConnect(&apu) == S_OK && XApuConnect(&peer) == S_OK && peer != apu);
@@ -193,5 +239,5 @@ int main() {
     CHECK(v0->Release() == 1);
     CHECK(input->Release() == 0);
     FreeLibrary(dll);
-    std::puts("PASS: audio mappings, APU and DSP queues, GameInput ordinal 1 and device callbacks");
+    std::puts("PASS: audio mappings, APU and DSP queues, AcpHal shape contexts, GameInput ordinal 1 and device callbacks");
 }
