@@ -321,8 +321,12 @@ static TextureComputer* impl_from(bx_xg_texture_computer* self) {
  *       https://gitlab.freedesktop.org/mesa/mesa/-/tree/main/src/amd/addrlib
  *
  * At 32 bpp the two agree bit-for-bit, which is why this mode is the one worth
- * implementing first. The RB+ table is used because gfx1030 is Navi2x; the
- * non-RB+ table differs for some entries.
+ * implementing first. The RB+ table is used because gfx1030 is Navi2x. For
+ * SW_64KB_S the choice does not matter: GFX10_SW_64K_S_PATINFO and
+ * GFX10_SW_64K_S_RBPLUS_PATINFO select the same nibble indices at every
+ * element size (2,3,3,0 at 4 B; 3,4,4,0 at 8 B; 4,5,5,0 at 16 B), so both
+ * tables expand to the masks below. They differ for other tile modes, not
+ * for this one.
  *
  * For a 64 KiB tile the intra-tile byte offset of texel (x, y) is the bit
  * interleave below, for a 32-bpp format whose tile is 128x128 texels:
@@ -891,21 +895,28 @@ static HRESULT copy_tiled_sw64kb_s(
         return E_INVALIDARG;
     }
     const uint64_t tight_row = uint64_t(blocks_w) * resolved->block_bytes;
-    const uint64_t tight_depth = uint64_t(blocks_h) * resolved->block_bytes;
     const uint64_t row_pitch = image_row_pitch == 0u ? tight_row : image_row_pitch;
     if (row_pitch < tight_row) {
         return E_INVALIDARG;
     }
-    if (image_depth_pitch != 0u && image_depth_pitch < tight_depth) {
+    /* One slice spans blocks_h rows at the caller's row pitch, not at the tight
+     * row, so a depth pitch between the two would leave the last row outside
+     * the slice. Only the single-slice case is implemented, but the bound must
+     * still describe a slice. */
+    if (image_depth_pitch != 0u && image_depth_pitch < uint64_t(blocks_h) * row_pitch) {
         return E_INVALIDARG;
     }
+    /* CopyFromSubresource passes the caller's image as `resource` and the tiled
+     * resource as `image`, so the bound for each offset follows the direction. */
+    const uint64_t tiled_size = to_resource ? resource_size : image_size;
+    const uint64_t linear_size = to_resource ? image_size : resource_size;
     for (uint32_t by = 0; by < blocks_h; ++by) {
         for (uint32_t bx = 0; bx < blocks_w; ++bx) {
             const uint64_t byte_col = uint64_t(bx) * resolved->block_bytes;
             const uint64_t image_off = uint64_t(by) * row_pitch + byte_col;
             const uint64_t tile_off = uint64_t(sw64kb_s_offset(&params, bx, by));
             const uint64_t end = image_off + resolved->block_bytes;
-            if (end > image_size || tile_off + resolved->block_bytes > resource_size ||
+            if (end > linear_size || tile_off + resolved->block_bytes > tiled_size ||
                 tile_off + resolved->block_bytes > kTileBytes) {
                 return E_INVALIDARG;
             }

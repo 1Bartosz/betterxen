@@ -848,10 +848,38 @@ static void test_sw64kb_s_round_trip(uint32_t format, uint32_t block_bytes, uint
     release_computer(computer);
 }
 
+/*
+ * CopyFromSubresource into an image buffer too small for the caller's row
+ * pitch must be refused before any byte lands past the buffer. 2x2 RGBA8 with
+ * a 1000-byte pitch needs 1008 bytes; the buffer holds 1004 plus a canary.
+ * Before the direction-aware bounds check this wrote 4 bytes past the buffer.
+ */
+static void test_sw64kb_s_copy_from_bounds() {
+    bx_xg_resource_desc desc = desc_2d(DXGI_FORMAT_R8G8B8A8_UNORM, 2u, 2u, 1, 1, BX_XG_LAYOUT_SW_64KB_S);
+    void* object = nullptr;
+    check_hr("s64 short readback create", XGCreateTextureComputer(&desc, &object), S_OK);
+    auto* computer = static_cast<bx_xg_texture_computer*>(object);
+    if (!computer) {
+        return;
+    }
+    uint8_t* resource = alloc_bytes(65536u, 0x11);
+    uint8_t* readback = alloc_bytes(1004u + 32u, 0xA5);
+    if (resource && readback) {
+        check_hr("s64 short readback",
+                 computer->lpVtbl->CopyFromSubresource(computer, readback, 1004u, 1000u, 0, resource, 65536u, 0),
+                 E_INVALIDARG);
+        check(bytes_are(readback + 1004u, 32u, 0xA5), "s64 short readback leaves its canary");
+    }
+    std::free(resource);
+    std::free(readback);
+    release_computer(computer);
+}
+
 static void test_sw64kb_s_round_trips() {
     test_sw64kb_s_round_trip(DXGI_FORMAT_R8G8B8A8_UNORM, 4u, 1u, 128u, 128u, "s64 rgba round trip");
     test_sw64kb_s_round_trip(DXGI_FORMAT_BC1_UNORM, 8u, 4u, 128u, 64u, "s64 bc1 round trip");
     test_sw64kb_s_round_trip(DXGI_FORMAT_BC7_UNORM, 16u, 4u, 64u, 64u, "s64 bc7 round trip");
+    test_sw64kb_s_copy_from_bounds();
 }
 
 static bool row_is(const uint8_t* row, uint8_t value) {
