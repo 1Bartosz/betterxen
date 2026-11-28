@@ -914,7 +914,7 @@ bool reserved_fields_clear(const DSTORAGE_REQUEST_OPTIONS& options) {
 // are submitted automatically once N / 2 are waiting (the header: "until the
 // queue is half full").
 // Maps the engine's command kind onto the header's DSTORAGE_COMMAND_TYPE for
-// RetrieveErrorRecord. Shared by the public and Xbox queues.
+// RetrieveErrorRecord on the public PC queue.
 DSTORAGE_COMMAND_TYPE command_type(Kind kind) {
     switch (kind) {
         case Kind::status: return DSTORAGE_COMMAND_TYPE_STATUS;
@@ -1339,7 +1339,7 @@ struct IXboxDStorageQueue : IUnknown {
     virtual void STDMETHODCALLTYPE CancelRequestsWithTag(UINT64 mask, UINT64 value) = 0;
     virtual void STDMETHODCALLTYPE Close() = 0;
     virtual HANDLE STDMETHODCALLTYPE GetErrorEvent() = 0;
-    virtual void STDMETHODCALLTYPE RetrieveErrorRecord(DSTORAGE_ERROR_RECORD* record) = 0;
+    virtual void STDMETHODCALLTYPE RetrieveErrorRecord(void* record) = 0;
     virtual void STDMETHODCALLTYPE Query(void* info) = 0;
     virtual HRESULT STDMETHODCALLTYPE StubSlot12() = 0;
     virtual HRESULT STDMETHODCALLTYPE StubSlot13() = 0;
@@ -1488,19 +1488,10 @@ public:
 
     HANDLE STDMETHODCALLTYPE GetErrorEvent() override { return queue_->error_event(); }
 
-    void STDMETHODCALLTYPE RetrieveErrorRecord(DSTORAGE_ERROR_RECORD* record) override {
-        if (!record) return;
-        std::memset(record, 0, sizeof(*record));
-        ErrorRecord errors{};
-        Kind first = Kind::request;
-        queue_->take_errors(&errors, &first);
-        record->FailureCount = errors.failure_count > 0xffffffffull ? 0xffffffffu
-                                                                    : static_cast<UINT32>(errors.failure_count);
-        record->FirstFailure.HResult = errors.failure_count ? errors.first_error : S_OK;
-        /* Same record type and command-kind mapping as the public queue. That the
-         * Xbox queue reports the public DSTORAGE_COMMAND_TYPE values is an inference
-         * from call-site observation, like the rest of this interface. */
-        record->FirstFailure.CommandType = errors.failure_count ? command_type(first) : DSTORAGE_COMMAND_TYPE_NONE;
+    void STDMETHODCALLTYPE RetrieveErrorRecord(void*) override {
+        // The size and layout of the Xbox caller's output are unverified.
+        // Do not write the public PC record into it.
+        BX_VTABLE_STUB_LOG("IDStorageQueueX", 10u, "RetrieveErrorRecord");
     }
 
     void STDMETHODCALLTYPE Query(void*) override { BX_VTABLE_STUB_LOG("IDStorageQueueX", 11u, "Query"); }

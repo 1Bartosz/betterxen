@@ -13,7 +13,7 @@
 
 #include "bx_log.h"
 /* Public DirectStorage header (SDK 1.4.0, MIT): used here only for the
- * DSTORAGE_ERROR_RECORD layout and DSTORAGE_COMMAND_TYPE values. */
+ * PC-sized canary and the existing public DirectStorage error constants. */
 #include "dstorage.h"
 
 extern "C" __declspec(dllimport) HRESULT WINAPI DStorageGetFactory(REFIID riid, void** ppv);
@@ -243,20 +243,15 @@ int main() {
         check(status->GetHResult(1) == E_NOTIMPL, "compressed request must report E_NOTIMPL (hr=0x%08lx)",
               static_cast<unsigned long>(status->GetHResult(1)));
 
-        /* Slot 10: RetrieveErrorRecord. The rejected compressed request is the
-         * only failure on this queue, so the record must name it: one failure,
-         * its E_NOTIMPL, and the request command kind. Expected values come from
-         * the public header and the request above, not from the shim. */
-        DSTORAGE_ERROR_RECORD record{};
-        record.FirstFailure.CommandType = DSTORAGE_COMMAND_TYPE_NONE;
+        /* The Xbox output layout is unverified. A PC-sized test buffer
+         * detects any accidental writes while keeping the test memory safe. */
+        DSTORAGE_ERROR_RECORD record;
+        std::memset(&record, 0xa5, sizeof(record));
+        unsigned char before[sizeof(record)];
+        std::memcpy(before, &record, sizeof(record));
         file_q->RetrieveErrorRecord(&record);
-        check(record.FailureCount == 1, "error record must count the one rejected request (count=%u)",
-              static_cast<unsigned>(record.FailureCount));
-        check(record.FirstFailure.HResult == E_NOTIMPL, "error record HResult must be E_NOTIMPL (hr=0x%08lx)",
-              static_cast<unsigned long>(record.FirstFailure.HResult));
-        check(record.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST,
-              "error record CommandType must be DSTORAGE_COMMAND_TYPE_REQUEST (got %d)",
-              static_cast<int>(record.FirstFailure.CommandType));
+        check(std::memcmp(&record, before, sizeof(record)) == 0,
+              "Xbox RetrieveErrorRecord must leave the caller's buffer unchanged");
         file_q->Close();
         file_q->Release();
     }
@@ -289,36 +284,26 @@ int main() {
               static_cast<unsigned long>(status->GetHResult(0)));
         check(std::memcmp(dest, payload + 32, sizeof(dest)) == 0, "memory copy bytes must match payload[32..96]");
 
-        /* A rejected signal: CommandType must name the signal, not just read as
-         * zero. DSTORAGE_COMMAND_TYPE_REQUEST is 0, so a zeroed record passes the
-         * request case above by accident; only a non-request failure tells a
-         * filled-in command kind from a zeroed one. A null fence is rejected
-         * (dstorage.h: EnqueueSignal requires a fence). This is the only failure
-         * on this queue. */
+        /* A rejected null fence still signals the queue's error event. */
         mem_q->EnqueueSignal(nullptr, 1);
-        /* Rejections are reported in queue order, so the record is filled once the
-         * queue reaches the rejected command: submit, then wait on the error event. */
         mem_q->Submit();
         const HANDLE error_event = mem_q->GetErrorEvent();
         check(error_event != nullptr && WaitForSingleObject(error_event, 5000) == WAIT_OBJECT_0,
               "the error event must signal after the rejected signal is processed");
-        DSTORAGE_ERROR_RECORD signal_record{};
-        signal_record.FirstFailure.CommandType = DSTORAGE_COMMAND_TYPE_NONE;
-        mem_q->RetrieveErrorRecord(&signal_record);
-        check(signal_record.FailureCount == 1, "error record must count the one rejected signal (count=%u)",
-              static_cast<unsigned>(signal_record.FailureCount));
-        check(signal_record.FirstFailure.HResult == E_DSTORAGE_INVALID_FENCE,
-              "error record HResult must be E_DSTORAGE_INVALID_FENCE (hr=0x%08lx)",
-              static_cast<unsigned long>(signal_record.FirstFailure.HResult));
-        check(signal_record.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_SIGNAL,
-              "error record CommandType must be DSTORAGE_COMMAND_TYPE_SIGNAL (got %d)",
-              static_cast<int>(signal_record.FirstFailure.CommandType));
+
+        XboxRequest null_src = req;
+        null_src.source_ptr = nullptr;
+        mem_q->EnqueueRequest(&null_src);
+        mem_q->EnqueueStatus(status, 1);
+        mem_q->Submit();
+        check(wait_complete(status, 1) && status->GetHResult(1) == E_INVALIDARG,
+              "a null memory source must report E_INVALIDARG through queue status");
         mem_q->Close();
         mem_q->Release();
     }
 
-    /* Error paths on a fresh file queue. Each rejected command is reported in queue
-     * order, so submit and wait on the error event before reading the record. */
+    /* Error paths on a fresh file queue. The fixture checks exact rejected
+     * methods and HRESULTs in the fresh log without using an Xbox record layout. */
     IXboxDStorageQueue* err_q = nullptr;
     XboxQueueDesc err_desc = file_q_desc;
     err_desc.name = "xbox_error_queue";
@@ -327,8 +312,6 @@ int main() {
           static_cast<unsigned long>(hr));
     if (err_q && status) {
         const HANDLE error_event = err_q->GetErrorEvent();
-        DSTORAGE_ERROR_RECORD record{};
-
         /* A memory-source request (option 0x400000, as on the memory queue above) on a
          * file queue is rejected before its source pointer is touched. */
         uint8_t dest[16] = {};
@@ -342,12 +325,6 @@ int main() {
         err_q->Submit();
         check(error_event != nullptr && WaitForSingleObject(error_event, 5000) == WAIT_OBJECT_0,
               "error event must signal for a memory request on a file queue");
-        err_q->RetrieveErrorRecord(&record);
-        check(record.FailureCount == 1 && record.FirstFailure.HResult == E_DSTORAGE_INVALID_SOURCE_TYPE &&
-                  record.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST,
-              "memory request on a file queue: count=%u hr=0x%08lx type=%d (want 1, E_DSTORAGE_INVALID_SOURCE_TYPE, REQUEST)",
-              static_cast<unsigned>(record.FailureCount), static_cast<unsigned long>(record.FirstFailure.HResult),
-              static_cast<int>(record.FirstFailure.CommandType));
 
         /* A source/destination size mismatch on an otherwise valid file request. */
         XboxRequest mismatch{};
@@ -357,28 +334,10 @@ int main() {
         mismatch.source_size = sizeof(dest) - 1;
         err_q->EnqueueRequest(&mismatch);
         err_q->Submit();
-        check(WaitForSingleObject(error_event, 5000) == WAIT_OBJECT_0,
-              "error event must signal for a size mismatch");
-        record = {};
-        err_q->RetrieveErrorRecord(&record);
-        check(record.FailureCount == 1 && record.FirstFailure.HResult == E_DSTORAGE_INVALID_DESTINATION_SIZE &&
-                  record.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST,
-              "size mismatch: count=%u hr=0x%08lx type=%d (want 1, E_DSTORAGE_INVALID_DESTINATION_SIZE, REQUEST)",
-              static_cast<unsigned>(record.FailureCount), static_cast<unsigned long>(record.FirstFailure.HResult),
-              static_cast<int>(record.FirstFailure.CommandType));
 
         /* A status index past the array's capacity (2). */
         err_q->EnqueueStatus(status, 5);
         err_q->Submit();
-        check(WaitForSingleObject(error_event, 5000) == WAIT_OBJECT_0,
-              "error event must signal for an out-of-range status index");
-        record = {};
-        err_q->RetrieveErrorRecord(&record);
-        check(record.FailureCount == 1 && record.FirstFailure.HResult == E_DSTORAGE_INDEX_BOUND &&
-                  record.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_STATUS,
-              "status index out of range: count=%u hr=0x%08lx type=%d (want 1, E_DSTORAGE_INDEX_BOUND, STATUS)",
-              static_cast<unsigned>(record.FailureCount), static_cast<unsigned long>(record.FirstFailure.HResult),
-              static_cast<int>(record.FirstFailure.CommandType));
 
         /* An enqueue after Close is dropped and logged, not run. */
         err_q->Close();
@@ -409,6 +368,17 @@ int main() {
               "log must record the request enqueued after Close as dropped");
         check(file_contains(log_path, "IDStorageQueueX[3]::EnqueueRequest_compressed"),
               "log must record compressed request stub");
+        check(file_contains(log_path, "IDStorageQueueX[10]::RetrieveErrorRecord"),
+              "log must record the unimplemented Xbox error-record output");
+        const auto check_rejection = [&](const char* method, HRESULT hr) {
+            char needle[96];
+            std::snprintf(needle, sizeof(needle), "xbox %s hr=0x%08lx", method, static_cast<unsigned long>(hr));
+            check(file_contains(log_path, needle), "log must record: %s", needle);
+        };
+        check_rejection("EnqueueSignal", E_DSTORAGE_INVALID_FENCE);
+        check_rejection("EnqueueRequest", E_DSTORAGE_INVALID_SOURCE_TYPE);
+        check_rejection("EnqueueRequest", E_DSTORAGE_INVALID_DESTINATION_SIZE);
+        check_rejection("EnqueueStatus", E_DSTORAGE_INDEX_BOUND);
     }
 
     if (g_failed != 0) {
