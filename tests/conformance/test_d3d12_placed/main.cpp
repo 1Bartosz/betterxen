@@ -621,6 +621,9 @@ int main() {
         return 1;
     }
     const char* profile = cfg->profile == BX_PROFILE_ANACONDA ? "anaconda" : "lockhart";
+    char log_path[MAX_PATH];
+    DWORD log_len = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
+    const bool have_log = log_len > 0 && log_len < sizeof(log_path);
 
     check(D3D12ConfigureVirtualMemoryX(nullptr) == S_OK, "null configuration is a logged stub that returns S_OK");
 
@@ -1289,9 +1292,6 @@ int main() {
         }
     }
 
-    char log_path[MAX_PATH];
-    DWORD log_len = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
-    const bool have_log = log_len > 0 && log_len < sizeof(log_path);
     std::printf("RESULT: cpu_va=0x%llx map=0x%llx buffer_gpu_va=0x%llx flush=%d copy_buffer=%u/%u copy_texture=%u/%u "
                 "texture_path=%s cpu_after_gpu=%u/%u small_align=%llu upload_100000=%llu\n",
                 static_cast<unsigned long long>(cpu_va), static_cast<unsigned long long>(map_pointer),
@@ -1393,6 +1393,9 @@ int main() {
      */
     check_newer_placement(device);
 
+    uint64_t host_before = 0;
+    uint64_t host_ignored = 0;
+    int host_before_count = 0;
     if (backing) {
         BxD3d12VirtualMemoryConfig detached = make_block(0, 0, kFlagBacking);
         const HRESULT away = D3D12ConfigureVirtualMemoryX(&detached);
@@ -1424,6 +1427,10 @@ int main() {
         SetEnvironmentVariableA("BX_D3D12_FORCE_BACKING_REPLACE", nullptr);
         check(hr == S_OK && replaced && !same_object(replaced, backing),
               "forced host replacement publishes a different backing heap hr=0x%08lx", ul(hr));
+        if (have_log) {
+            /* Capture the device whose forced replacement heap remains in the cache. */
+            log_u64_ends(log_path, "host_device=", &host_ignored, &host_before, &host_before_count);
+        }
         check(get_device_closed(backing), "GetDevice on the heap replaced by another host device fails closed");
         const ULONG left = device->Release();
         check(left == 0, "proxy released to zero while the replaced heap is still held (refs=%lu)", left);
@@ -1459,11 +1466,9 @@ int main() {
         if (dead) dead->Release();
     }
 
-    uint64_t host_before = 0;
-    uint64_t host_ignored = 0;
-    int host_before_count = 0;
+    uint64_t latest_host_before_b = 0;
     if (have_log) {
-        log_u64_ends(log_path, "host_device=", &host_ignored, &host_before, &host_before_count);
+        log_u64_ends(log_path, "host_device=", &host_ignored, &latest_host_before_b, &host_before_count);
     }
     check(SetEnvironmentVariableA("BX_D3D12_REUSE_BACKING_HOST", "1") != 0,
           "test hook BX_D3D12_REUSE_BACKING_HOST=1 is set");
