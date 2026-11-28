@@ -75,7 +75,7 @@ private:
     std::atomic<DWORD> owner_{0}; /* thread holding lock_ */
     UINT64 last_signaled_ = 0;
     UINT64 presented_ = 0;
-    bool needs_idle_ = false; /* a presented frame has no fence value; only an idle queue clears this */
+    bool needs_idle_ = false; /* post-present signal or wait failed; only an idle queue clears this */
     UINT64 buffer_value_[DXGI_MAX_SWAP_CHAIN_BUFFERS] = {};
 };
 
@@ -382,7 +382,16 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
     if (next < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
         sync_hr = wait_locked(buffer_value_[next], BX_PRESENT_WAIT_MS);
         if (FAILED(sync_hr)) {
-            return sync_hr == kWaitTimedOut ? BX_PRESENT_E_NEXT_BUFFER_BUSY : sync_hr;
+            if (sync_hr == kWaitTimedOut) {
+                return BX_PRESENT_E_NEXT_BUFFER_BUSY;
+            }
+            /*
+             * The host has the frame, and the wait on the next buffer failed; keep the swapchain
+             * gated behind WaitForIdle so buffers are not reused without confirmed completion.
+             */
+            log_hr(BX_LOG_ERROR, "present_next_buffer_wait_failed", "wait_locked", sync_hr);
+            needs_idle_ = true;
+            return BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED;
         }
     }
     return hr;

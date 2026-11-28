@@ -50,9 +50,17 @@ inline constexpr HRESULT BX_PRESENT_E_BUSY = static_cast<HRESULT>(0x80040202u);
 inline constexpr HRESULT BX_PRESENT_E_COMPLETION_UNCONFIRMED = static_cast<HRESULT>(0x80040203u);
 /*
  * Present() result: the frame was NOT handed to the host, because an earlier Present returned
- * BX_PRESENT_E_COMPLETION_UNCONFIRMED and no WaitForIdle has succeeded since.
+ * BX_PRESENT_E_COMPLETION_UNCONFIRMED or BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED and no WaitForIdle
+ * has succeeded since.
  */
 inline constexpr HRESULT BX_PRESENT_E_NEEDS_IDLE = static_cast<HRESULT>(0x80040204u);
+/*
+ * Present() result: the frame WAS handed to the host and signaled, but waiting on the next back
+ * buffer failed (for example SetEventOnCompletion, WaitForSingleObject, or device removal). Do not
+ * present that frame again. Call WaitForIdle until it returns S_OK before reusing any back buffer
+ * or presenting again.
+ */
+inline constexpr HRESULT BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED = static_cast<HRESULT>(0x80040205u);
 
 struct BxPresentDesc {
     UINT width;          /* 1..16384; 0 ("use the window size") is not accepted */
@@ -82,9 +90,10 @@ struct IBxPresentSwapChain : public IUnknown {
      *   - BX_PRESENT_E_NEXT_BUFFER_BUSY: presented, see its definition;
      *   - BX_PRESENT_E_BUSY: NOT presented, another call holds the swapchain;
      *   - BX_PRESENT_E_COMPLETION_UNCONFIRMED: presented, the fence signal failed;
+     *   - BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED: presented, waiting on the next back buffer failed;
      *   - BX_PRESENT_E_NEEDS_IDLE: NOT presented, WaitForIdle must succeed first;
-     *   - another failure: the host's Present failure, or a fence or device failure. A fence wait
-     *     or device failure can follow a successful host Present.
+     *   - another failure: the host's Present failure, or a pre-Present fence wait or device
+     *     failure (nothing was presented).
      * The bounds cover BetterXen's own waits, not time spent inside the host's Present.
      *
      * The bridge itself returns DXGI_ERROR_INVALID_CALL, without calling the host, for a
@@ -95,7 +104,8 @@ struct IBxPresentSwapChain : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE Present(UINT sync_interval, UINT flags) = 0;
     /*
      * Waits until everything submitted to the queue before this call has finished. S_OK also ends
-     * the state left by BX_PRESENT_E_COMPLETION_UNCONFIRMED.
+     * the state left by BX_PRESENT_E_COMPLETION_UNCONFIRMED or
+     * BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED.
      * INFINITE is rejected with E_INVALIDARG; a timeout returns HRESULT_FROM_WIN32(ERROR_TIMEOUT).
      * timeout_ms includes any time spent waiting for a Present on another thread.
      */

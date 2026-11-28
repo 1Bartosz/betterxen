@@ -44,9 +44,13 @@ run wrong-expectation wrong-expectation
 must_fail wrong-expectation pixels
 expect wrong-expectation out "pixels_wrong=29184 "
 
+run skip-wait-fault skip-wait-fault
+must_fail skip-wait-fault sync
+expect skip-wait-fault out "SetEventOnCompletion fault was not injected"
+
 if [ "$bad" -ne 0 ]; then
     echo "FAIL: run_controls (output kept in $dir)"
     exit 1
 fi
 rm -rf "$dir"
-echo "PASS: run_controls (1 normal run, 3 negative controls)"
+echo "PASS: run_controls (1 normal run, 4 negative controls)"
