@@ -1,5 +1,5 @@
 /*
- * Synthetic conformance test for the evidenced 32-byte Xbox configuration
+ * Synthetic conformance test for the inferred 32-byte Xbox configuration
  * decoder in d3d12_xs.dll!D3D12ConfigureVirtualMemoryX.
  *
  * Verifies:
@@ -11,7 +11,7 @@
  *  - an Xbox configuration leaves a cached BXVM backing heap and its
  *    cpu_pointer untouched, while ordinary D3D12 heaps and XMemVirtualAlloc
  *    reservations keep working;
- *  - malformed, out-of-range, non-zero trailing, null, and page-edge
+ *  - malformed, non-zero trailing, null, and page-edge
  *    unreadable configurations fall back safely without faulting or mutating
  *    caller memory and log the exact decoder and reason.
  *
@@ -201,6 +201,20 @@ int main() {
         mark = log_size(log_path);
     }
 
+    /* No upper bound is inferred: the count is only recorded and never consumed. */
+    XboxConfig large_count = make_xbox(UINT32_MAX);
+    const XboxConfig large_count_before = large_count;
+    hr = D3D12ConfigureVirtualMemoryX(&large_count);
+    check(hr == S_OK, "unbounded recorded count must return S_OK (hr=0x%08lx)", ul(hr));
+    check(std::memcmp(&large_count, &large_count_before, sizeof(large_count)) == 0,
+          "large recorded count must not mutate caller memory");
+    if (have_log) {
+        check(log_contains_since(log_path, mark,
+                                 "decoder=xbox applied=0 recorded_only=1 virtual_segments=4294967295 repeat=0"),
+              "large count must be recorded without imposing an inferred upper bound");
+        mark = log_size(log_path);
+    }
+
     /*
      * 4. Verify XMemVirtualAlloc reservation works after Xbox configuration
      *    (matching the caller's MEM_RESERVE + console high-bit pattern).
@@ -321,17 +335,35 @@ int main() {
     check(std::memcmp(unknown_hdr, unknown_hdr_before, sizeof(unknown_hdr)) == 0,
           "unrecognized header bytes must stay unchanged");
 
+    BxvmConfig readonly_bxvm = make_bxvm(0, 0, 0);
+    SYSTEM_INFO readonly_sys{};
+    GetSystemInfo(&readonly_sys);
+    const SIZE_T readonly_page_bytes = readonly_sys.dwPageSize ? readonly_sys.dwPageSize : 4096;
+    void* readonly_page =
+        VirtualAlloc(nullptr, readonly_page_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    check(readonly_page != nullptr, "VirtualAlloc for read-only BXVM probe must succeed");
+    if (readonly_page) {
+        std::memcpy(readonly_page, &readonly_bxvm, sizeof(readonly_bxvm));
+        DWORD old_protect = 0;
+        const bool protected_readonly =
+            VirtualProtect(readonly_page, readonly_page_bytes, PAGE_READONLY, &old_protect) != 0;
+        check(protected_readonly, "BXVM config page must become read-only");
+        if (protected_readonly) {
+            check(D3D12ConfigureVirtualMemoryX(readonly_page) == S_OK,
+                  "read-only BXVM output must fall back with S_OK");
+            check(std::memcmp(readonly_page, &readonly_bxvm, sizeof(readonly_bxvm)) == 0,
+                  "read-only BXVM config bytes must stay unchanged");
+            DWORD ignored_protect = 0;
+            VirtualProtect(readonly_page, readonly_page_bytes, old_protect, &ignored_protect);
+        }
+        VirtualFree(readonly_page, 0, MEM_RELEASE);
+    }
+
     XboxConfig zero_seg = make_xbox(0);
     const XboxConfig zero_seg_before = zero_seg;
     check(D3D12ConfigureVirtualMemoryX(&zero_seg) == S_OK, "zero segment count must fall back with S_OK");
     check(std::memcmp(&zero_seg, &zero_seg_before, sizeof(zero_seg)) == 0,
           "zero segment count bytes must stay unchanged");
-
-    XboxConfig huge_seg = make_xbox(65);
-    const XboxConfig huge_seg_before = huge_seg;
-    check(D3D12ConfigureVirtualMemoryX(&huge_seg) == S_OK, "out-of-range segment count must fall back with S_OK");
-    check(std::memcmp(&huge_seg, &huge_seg_before, sizeof(huge_seg)) == 0,
-          "out-of-range segment count bytes must stay unchanged");
 
     XboxConfig bad_fields = make_xbox(4);
     bad_fields.reserved[2] = 1u;
@@ -373,8 +405,8 @@ int main() {
             "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=none applied=0 reason=null_config\"",
             "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=none applied=0 reason=unrecognized_header\"",
             "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=none applied=0 reason=unreadable_header\"",
+            "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=bxvm applied=0 reason=unwritable_output\"",
             "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=xbox applied=0 reason=zero_segment_count\"",
-            "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=xbox applied=0 reason=unsupported_segment_count\"",
             "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=xbox applied=0 reason=unsupported_fields\"",
             "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=xbox applied=0 reason=unreadable_tail\"",
         };

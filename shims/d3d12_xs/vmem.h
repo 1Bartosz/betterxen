@@ -66,7 +66,6 @@
  */
 constexpr uint32_t BX_D3D12_VMEM_MAGIC = 0x4D565842u;
 constexpr uint32_t BX_D3D12_VMEM_FLAG_BACKING_HEAP = 0x1u;
-constexpr uint32_t BX_D3D12_XBOX_VMEM_MAX_SEGMENTS = 64u;
 
 struct BxD3d12VirtualMemoryConfig {
     uint32_t magic;

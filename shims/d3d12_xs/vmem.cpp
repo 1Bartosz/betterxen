@@ -701,28 +701,25 @@ struct ConfigHeader {
 };
 static_assert(sizeof(ConfigHeader) == 8, "config probe is the 8-byte header");
 
-void write_cpu_pointer(void* config, uint64_t pointer) {
-    std::memcpy(static_cast<char*>(config) + offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer), &pointer, sizeof(pointer));
-}
-
-bool is_readable_protect(DWORD protect) {
+bool is_accessible_protect(DWORD protect, bool write) {
     if ((protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
         return false;
     }
     switch (protect & 0xFFu) {
-    case PAGE_READONLY:
     case PAGE_READWRITE:
     case PAGE_WRITECOPY:
-    case PAGE_EXECUTE_READ:
     case PAGE_EXECUTE_READWRITE:
     case PAGE_EXECUTE_WRITECOPY:
         return true;
+    case PAGE_READONLY:
+    case PAGE_EXECUTE_READ:
+        return !write;
     default:
         return false;
     }
 }
 
-bool can_read_bytes(const void* ptr, size_t len) {
+bool can_access_bytes(const void* ptr, size_t len, bool write) {
     if (!ptr || len == 0) {
         return false;
     }
@@ -737,7 +734,7 @@ bool can_read_bytes(const void* ptr, size_t len) {
         if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)) == 0) {
             return false;
         }
-        if (mbi.State != MEM_COMMIT || !is_readable_protect(mbi.Protect) || mbi.RegionSize == 0) {
+        if (mbi.State != MEM_COMMIT || !is_accessible_protect(mbi.Protect, write) || mbi.RegionSize == 0) {
             return false;
         }
         const uintptr_t region_base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
@@ -751,6 +748,24 @@ bool can_read_bytes(const void* ptr, size_t len) {
         cursor = region_end;
     }
     return true;
+}
+
+bool copy_readable_bytes(const void* source, void* destination, size_t len) {
+    if (!destination || !can_access_bytes(source, len, false)) {
+        return false;
+    }
+    SIZE_T bytes_read = 0;
+    return ReadProcessMemory(GetCurrentProcess(), source, destination, len, &bytes_read) != 0 && bytes_read == len;
+}
+
+bool write_cpu_pointer(void* config, uint64_t pointer) {
+    auto* destination = static_cast<char*>(config) + offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer);
+    if (!can_access_bytes(destination, sizeof(pointer), true)) {
+        return false;
+    }
+    SIZE_T bytes_written = 0;
+    return WriteProcessMemory(GetCurrentProcess(), destination, &pointer, sizeof(pointer), &bytes_written) != 0 &&
+           bytes_written == sizeof(pointer);
 }
 
 void log_vmem_fallback(const char* decoder, const char* reason) {
@@ -767,18 +782,23 @@ void log_vmem_failed(const char* decoder, const char* reason, HRESULT hr) {
 }
 
 HRESULT decode_bxvm_config(void* config) {
-    if (!can_read_bytes(config, sizeof(BxD3d12VirtualMemoryConfig))) {
+    BxD3d12VirtualMemoryConfig in{};
+    if (!copy_readable_bytes(config, &in, sizeof(in))) {
         log_vmem_fallback("bxvm", "unreadable_tail");
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
         return S_OK;
     }
 
-    BxD3d12VirtualMemoryConfig in{};
-    std::memcpy(&in, config, sizeof(in));
     const uint32_t unknown_flags = in.flags & ~BX_D3D12_VMEM_FLAG_BACKING_HEAP;
     if (in.version != kConfigVersion || unknown_flags != 0 || in.reserved != 0) {
         /* A console parameter block is not this struct. Leave those bytes alone. */
         log_vmem_fallback("bxvm", "unsupported_options");
+        BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
+        return S_OK;
+    }
+    if (!can_access_bytes(static_cast<char*>(config) + offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer),
+                          sizeof(in.cpu_pointer), true)) {
+        log_vmem_fallback("bxvm", "unwritable_output");
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
         return S_OK;
     }
@@ -850,9 +870,13 @@ HRESULT decode_bxvm_config(void* config) {
         g_record.region = have_region ? region : bx_xmem_region_info_t{};
         published = g_record.cpu_pointer;
     }
-    /* The only write to caller memory, and it happens before this call returns. */
-    write_cpu_pointer(config, published);
     release_backing_pair(old_heap, old_buffer);
+    /* The only write to caller memory, and it happens before this call returns. */
+    if (!write_cpu_pointer(config, published)) {
+        log_vmem_failed("bxvm", "unwritable_output", E_INVALIDARG);
+        BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
+        return E_INVALIDARG;
+    }
     uint64_t charged = 0;
     {
         Guard guard(g_section);
@@ -872,20 +896,19 @@ HRESULT decode_bxvm_config(void* config) {
 }
 
 HRESULT decode_xbox_config(const void* config, const ConfigHeader& header) {
+    BxXboxVirtualMemoryConfig in{};
     /* A zero first word alone does not identify this block: check every field before recording anything. */
     if (header.struct_size == 0u) {
         log_vmem_fallback("xbox", "zero_segment_count");
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
         return S_OK;
     }
-    if (!can_read_bytes(config, sizeof(BxXboxVirtualMemoryConfig))) {
+    if (!copy_readable_bytes(config, &in, sizeof(in))) {
         log_vmem_fallback("xbox", "unreadable_tail");
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
         return S_OK;
     }
 
-    BxXboxVirtualMemoryConfig in{};
-    std::memcpy(&in, config, sizeof(in));
     for (uint32_t word : in.reserved) {
         if (word != 0u) {
             log_vmem_fallback("xbox", "unsupported_fields");
@@ -893,12 +916,6 @@ HRESULT decode_xbox_config(const void* config, const ConfigHeader& header) {
             return S_OK;
         }
     }
-    if (in.virtual_segment_count > BX_D3D12_XBOX_VMEM_MAX_SEGMENTS) {
-        log_vmem_fallback("xbox", "unsupported_segment_count");
-        BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
-        return S_OK;
-    }
-
     /*
      * The segment count is recorded but nothing consumes it yet: no GPU VA
      * layout, reservation or CreateHeap behaviour depends on it. Until it does,
@@ -936,14 +953,13 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
      * PVOID has no size. Verify 8 bytes are committed and readable before
      * probing the header, and let each decoder verify its own full length.
      */
-    if (!can_read_bytes(config, sizeof(ConfigHeader))) {
+    ConfigHeader header{};
+    if (!copy_readable_bytes(config, &header, sizeof(header))) {
         log_vmem_fallback("none", "unreadable_header");
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
         return S_OK;
     }
 
-    ConfigHeader header{};
-    std::memcpy(&header, config, sizeof(header));
     if (header.magic == BX_D3D12_VMEM_MAGIC && header.struct_size == sizeof(BxD3d12VirtualMemoryConfig)) {
         return decode_bxvm_config(config);
     }
