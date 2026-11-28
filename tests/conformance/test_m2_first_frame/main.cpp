@@ -112,6 +112,25 @@ struct Region {
             cleanup(XMemFreePhysicalPages(&count, &page, 0), "free physical page");
     }
 };
+// Declared just before ExecuteCommandLists, so on a failure after the submit it is
+// destroyed before the queue, back buffer and output resource it protects: it
+// signals the queue and waits (bounded) so nothing is released while the GPU may
+// still be using it. Disarmed once the readback fence has completed.
+struct GpuDrain {
+    ID3D12CommandQueue* queue = nullptr;
+    ID3D12Fence* fence = nullptr;
+    bool armed = false;
+    ~GpuDrain() {
+        if (!armed) return;
+        HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        bool drained = done && SUCCEEDED(queue->Signal(fence, 2)) &&
+                       (fence->GetCompletedValue() >= 2 ||
+                        (SUCCEEDED(fence->SetEventOnCompletion(2, done)) &&
+                         WaitForSingleObject(done, 5000) == WAIT_OBJECT_0));
+        if (done) CloseHandle(done);
+        cleanup(drained, "drain the queue before releasing resources after a failure");
+    }
+};
 struct Window {
     HWND hwnd = CreateWindowExW(0, L"STATIC", L"BetterXen M2", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT,
                                 CW_USEDEFAULT, 320, 240, nullptr, nullptr, nullptr, nullptr);
@@ -265,8 +284,14 @@ void run(bool inject_pixel_mismatch) {
     checked(host->GetLastPresentCount(&before), "initial host present count");
     ComPtr<ID3D12Fence> fence;
     checked(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "readback fence");
+    GpuDrain drain{queue.Get(), fence.Get(), true};
     queue->ExecuteCommandLists(1, commands);
-    require(chain->Present(0, 0) == S_OK, "PresentX");
+    const HRESULT present_hr = chain->Present(0, 0);
+    if (present_hr != S_OK) {
+        char detail[96];
+        std::snprintf(detail, sizeof(detail), "PresentX hr=0x%08lx", static_cast<unsigned long>(present_hr));
+        require(false, detail);
+    }
     checked(chain->WaitForIdle(5000), "wait for frame");
     // Wait on our own queue fence before the CPU reads the backing map, so the
     // readback does not depend on what WaitForIdle covers.
@@ -280,6 +305,7 @@ void run(bool inject_pixel_mismatch) {
         checked(wait_hr, "readback fence SetEventOnCompletion");
         require(waited == WAIT_OBJECT_0, "readback fence wait timed out");
     }
+    drain.armed = false;  // everything submitted has completed
     checked(host->GetLastPresentCount(&after), "final host present count");
     require(after == before + 1, "host must present exactly once");
     checkpoint(true, "one host present completed");
@@ -308,10 +334,20 @@ void run(bool inject_pixel_mismatch) {
 } // namespace
 
 int main() {
-    char inject[2];
-    const bool inject_pixel_mismatch =
-        GetEnvironmentVariableA("BX_M2_FIRST_FRAME_INJECT_PIXEL_MISMATCH", inject, sizeof(inject)) == 1 &&
-        inject[0] == '1';
+    // The mismatch control is armed only by exactly "1". Any other value is a
+    // configuration error rather than a silently ignored control, so a run that
+    // meant to arm it cannot pass as an ordinary run.
+    char inject[16];
+    const DWORD inject_len =
+        GetEnvironmentVariableA("BX_M2_FIRST_FRAME_INJECT_PIXEL_MISMATCH", inject, sizeof(inject));
+    const bool inject_pixel_mismatch = inject_len == 1 && inject[0] == '1';
+    if (inject_len != 0 && !inject_pixel_mismatch) {
+        std::fprintf(stderr, "FAIL: BX_M2_FIRST_FRAME_INJECT_PIXEL_MISMATCH must be unset or exactly 1\n");
+        return 1;
+    }
+    if (inject_pixel_mismatch) {
+        std::printf("NOTE: pixel mismatch control armed; this run must fail at pixel_readback\n");
+    }
     try {
         run(inject_pixel_mismatch);
     } catch (const Failure&) {
