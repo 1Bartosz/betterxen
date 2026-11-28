@@ -3,17 +3,20 @@
  * decoder in d3d12_xs.dll!D3D12ConfigureVirtualMemoryX.
  *
  * Verifies:
- *  - valid Xbox configurations (3 and 4 virtual segments) apply without
- *    mutating caller bytes and without emitting the unimplemented-API stub;
- *  - repeated identical and updated Xbox calls behave idempotently and update
- *    recorded state cleanly;
- *  - switching from a cached BXVM backing heap to an Xbox configuration
- *    evicts and unmaps the backing heap and credits its live-heap charge,
- *    while ordinary D3D12 heaps and XMemVirtualAlloc reservations continue
- *    working;
+ *  - valid Xbox configurations (3 and 4 virtual segments) are recorded
+ *    without mutating caller bytes, report applied=0 recorded_only=1, and
+ *    still emit the unimplemented-API stub, because nothing consumes the
+ *    segment count yet;
+ *  - repeated identical and updated Xbox calls log repeat=1 and repeat=0;
+ *  - an Xbox configuration leaves a cached BXVM backing heap and its
+ *    cpu_pointer untouched, while ordinary D3D12 heaps and XMemVirtualAlloc
+ *    reservations keep working;
  *  - malformed, out-of-range, non-zero trailing, null, and page-edge
  *    unreadable configurations fall back safely without faulting or mutating
  *    caller memory and log the exact decoder and reason.
+ *
+ * Several fixtures share one BX_LOG_FILE, so every log check reads only the
+ * bytes appended since the step it checks began.
  */
 #include <d3d12.h>
 #include <windows.h>
@@ -81,10 +84,14 @@ unsigned long ul(HRESULT hr) {
     return static_cast<unsigned long>(hr);
 }
 
-bool read_file_text(const char* path, std::string& out) {
+bool read_file_from(const char* path, long start, std::string& out) {
     out.clear();
     FILE* f = std::fopen(path, "rb");
     if (!f) {
+        return false;
+    }
+    if (start > 0 && std::fseek(f, start, SEEK_SET) != 0) {
+        std::fclose(f);
         return false;
     }
     char buf[4096];
@@ -96,10 +103,26 @@ bool read_file_text(const char* path, std::string& out) {
     return true;
 }
 
-bool file_contains(const char* path, const char* needle) {
-    std::string text;
-    return read_file_text(path, text) && text.find(needle) != std::string::npos;
+/* Current size of the log, used as the start offset of the next step. */
+long log_size(const char* path) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) {
+        return 0;
+    }
+    long size = 0;
+    if (std::fseek(f, 0, SEEK_END) == 0) {
+        size = std::ftell(f);
+    }
+    std::fclose(f);
+    return size < 0 ? 0 : size;
 }
+
+bool log_contains_since(const char* path, long start, const char* needle) {
+    std::string text;
+    return read_file_from(path, start, text) && text.find(needle) != std::string::npos;
+}
+
+constexpr const char* kStubNeedle = "d3d12_xs.dll!D3D12ConfigureVirtualMemoryX";
 
 BxvmConfig make_bxvm(uint64_t base_va, uint64_t size_bytes, uint32_t flags) {
     BxvmConfig cfg{};
@@ -135,6 +158,9 @@ int main() {
     const bool have_log = log_len > 0 && log_len < sizeof(log_path);
     check(have_log, "BX_LOG_FILE must be set");
 
+    long mark = have_log ? log_size(log_path) : 0;
+    const long test_start = mark;
+
     /* 1. Valid Xbox configuration (4 virtual segments, Anaconda/24 GiB shape). */
     XboxConfig cfg4 = make_xbox(4);
     const XboxConfig cfg4_before = cfg4;
@@ -144,18 +170,22 @@ int main() {
           "Xbox decoder must not mutate caller memory");
 
     if (have_log) {
-        check(file_contains(log_path, "decoder=xbox applied=1 virtual_segments=4 repeat=0"),
-              "log must record applied Xbox config with 4 segments");
-        check(!file_contains(log_path, "d3d12_xs.dll!D3D12ConfigureVirtualMemoryX"),
-              "applied Xbox config must not emit the unimplemented-API stub");
+        check(log_contains_since(log_path, mark, "decoder=xbox applied=0 recorded_only=1 virtual_segments=4 repeat=0"),
+              "log must record the 4-segment Xbox config as recorded only");
+        check(log_contains_since(log_path, mark, kStubNeedle),
+              "a recorded-only Xbox config must still emit the unimplemented-API stub");
+        check(!log_contains_since(log_path, mark, "applied=1"),
+              "a recorded-only Xbox config must not report applied=1");
+        mark = log_size(log_path);
     }
 
-    /* 2. Repeated identical Xbox call is idempotent (repeat=1). */
+    /* 2. Repeated identical Xbox call (repeat=1). */
     hr = D3D12ConfigureVirtualMemoryX(&cfg4);
     check(hr == S_OK, "repeated identical Xbox config must return S_OK (hr=0x%08lx)", ul(hr));
     if (have_log) {
-        check(file_contains(log_path, "decoder=xbox applied=1 virtual_segments=4 repeat=1"),
+        check(log_contains_since(log_path, mark, "decoder=xbox applied=0 recorded_only=1 virtual_segments=4 repeat=1"),
               "repeated identical Xbox config must log repeat=1");
+        mark = log_size(log_path);
     }
 
     /* 3. Updated Xbox call (3 segments, Lockhart/16 GiB shape). */
@@ -166,8 +196,9 @@ int main() {
     check(std::memcmp(&cfg3, &cfg3_before, sizeof(cfg3)) == 0,
           "updated Xbox config must not mutate caller memory");
     if (have_log) {
-        check(file_contains(log_path, "decoder=xbox applied=1 virtual_segments=3 repeat=0"),
+        check(log_contains_since(log_path, mark, "decoder=xbox applied=0 recorded_only=1 virtual_segments=3 repeat=0"),
               "updated Xbox config must log virtual_segments=3 repeat=0");
+        mark = log_size(log_path);
     }
 
     /*
@@ -181,9 +212,10 @@ int main() {
     }
 
     /*
-     * 5. Real D3D12 memory effect: configure a BXVM backing heap, create and
-     *    cache it, then apply an Xbox configuration and verify the cached BXVM
-     *    backing heap is evicted/unmapped and its charge is credited on release.
+     * 5. Configure a BXVM backing heap, create and cache it, then apply an Xbox
+     *    configuration. The Xbox path only records its segment count, so the
+     *    cached BXVM backing heap, its cpu_pointer and its device link must
+     *    survive.
      */
     ID3D12Device* device = nullptr;
     hr = D3D12XboxCreateDevice(nullptr, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
@@ -222,29 +254,30 @@ int main() {
         check(hr == S_OK && query.cpu_pointer != 0,
               "BXVM query after CreateHeap must return non-zero cached cpu_pointer (hr=0x%08lx)", ul(hr));
 
-        /* Switching to Xbox config must evict the cached BXVM backing heap. */
+        /* An Xbox config between two BXVM calls must not evict the cached backing heap. */
         XboxConfig switch_cfg = make_xbox(4);
         hr = D3D12ConfigureVirtualMemoryX(&switch_cfg);
-        check(hr == S_OK, "switching from BXVM to Xbox config must return S_OK (hr=0x%08lx)", ul(hr));
+        check(hr == S_OK, "Xbox config after BXVM must return S_OK (hr=0x%08lx)", ul(hr));
 
-        /* Caller still holds backing_heap, but weak GetDevice must fail closed after eviction. */
         if (backing_heap) {
-            ID3D12Device* detached_dev = nullptr;
-            const HRESULT dev_hr = backing_heap->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&detached_dev));
-            check(FAILED(dev_hr) && detached_dev == nullptr,
-                  "evicted BXVM backing heap GetDevice must fail closed (hr=0x%08lx)", ul(dev_hr));
-            if (detached_dev) {
-                detached_dev->Release();
+            ID3D12Device* still_dev = nullptr;
+            const HRESULT dev_hr = backing_heap->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&still_dev));
+            check(SUCCEEDED(dev_hr) && still_dev != nullptr,
+                  "cached BXVM backing heap must keep its device after an Xbox config (hr=0x%08lx)", ul(dev_hr));
+            if (still_dev) {
+                still_dev->Release();
             }
+        }
+
+        BxvmConfig after_xbox = make_bxvm(region_va, region_bytes, kBxvmFlagBacking);
+        hr = D3D12ConfigureVirtualMemoryX(&after_xbox);
+        check(hr == S_OK && after_xbox.cpu_pointer == query.cpu_pointer,
+              "BXVM cpu_pointer must be unchanged after an Xbox config (hr=0x%08lx)", ul(hr));
+
+        if (backing_heap) {
             backing_heap->Release();
             backing_heap = nullptr;
         }
-
-        /* Re-entering BXVM must observe cpu_pointer == 0 (old cache was evicted) and gpu_heap_bytes == 0. */
-        BxvmConfig after_evict = make_bxvm(region_va, region_bytes, kBxvmFlagBacking);
-        hr = D3D12ConfigureVirtualMemoryX(&after_evict);
-        check(hr == S_OK && after_evict.cpu_pointer == 0,
-              "BXVM cpu_pointer must be 0 after Xbox config evicted the cache (hr=0x%08lx)", ul(hr));
 
         /* Restore Xbox config and verify ordinary D3D12 heap creation still works. */
         hr = D3D12ConfigureVirtualMemoryX(&switch_cfg);
@@ -276,6 +309,9 @@ int main() {
     }
 
     /* 6. Malformed, unsupported, and page-edge unreadable inputs. */
+    if (have_log) {
+        mark = log_size(log_path);
+    }
     check(D3D12ConfigureVirtualMemoryX(nullptr) == S_OK, "null config must fall back with S_OK");
 
     uint32_t unknown_hdr[8] = {0x11223344u, 4u, 0u, 0u, 0u, 0u, 0u, 0u};
@@ -343,8 +379,10 @@ int main() {
             "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=xbox applied=0 reason=unreadable_tail\"",
         };
         for (const char* needle : expected_fallbacks) {
-            check(file_contains(log_path, needle), "missing expected fallback log: %s", needle);
+            check(log_contains_since(log_path, mark, needle), "missing expected fallback log: %s", needle);
         }
+        check(log_contains_since(log_path, test_start, "\"event\":\"vmem_config_recorded\""),
+              "the Xbox path must log vmem_config_recorded");
     }
 
     if (g_failed != 0) {

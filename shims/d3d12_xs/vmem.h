@@ -89,7 +89,11 @@ static_assert(offsetof(BxD3d12VirtualMemoryConfig, reserved) == 32, "reserved of
 static_assert(offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer) == 40, "cpu_pointer offset");
 
 /*
- * Evidenced 32-byte Xbox virtual-memory configuration block.
+ * Inferred 32-byte Xbox virtual-memory configuration block.
+ *
+ * Source: call-site observation of a project-authorized target build, not a
+ * public API contract. Provenance is pending maintainer review (PR #592), so
+ * treat every field below as an inference.
  *
  * Unlike BXVM, this block has no magic or struct_size header: offset +0x00 is 0,
  * offset +0x04 carries a positive virtual-segment count (observed 3 for 16 GiB
@@ -97,6 +101,9 @@ static_assert(offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer) == 40, "cpu_poin
  * export takes PVOID with no size parameter, the decoder verifies via
  * VirtualQuery that all 32 bytes are committed and readable before copying past
  * the initial 8-byte probe, and never writes to caller memory.
+ *
+ * The decoder only records the count. Nothing consumes it yet, so the call
+ * still logs BX_STUB_LOG and leaves the BXVM record and backing heap alone.
  */
 struct BxXboxVirtualMemoryConfig {
     uint32_t reserved0;

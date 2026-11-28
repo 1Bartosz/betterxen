@@ -833,8 +833,7 @@ HRESULT decode_bxvm_config(void* config) {
     uint64_t published = 0;
     {
         Guard guard(g_section);
-        const bool same = g_record.configured && !g_record.xbox_configured && g_record.config_base == new_base &&
-                          g_record.config_size == new_size;
+        const bool same = g_record.configured && g_record.config_base == new_base && g_record.config_size == new_size;
         if (!same) {
             take_cached_heap_locked(&old_heap, &old_buffer);
         }
@@ -842,8 +841,6 @@ HRESULT decode_bxvm_config(void* config) {
             ++g_record.config_generation;
         }
         g_record.configured = true;
-        g_record.xbox_configured = false;
-        g_record.xbox_virtual_segment_count = 0;
         g_record.backing_opt_in = backing_opt_in;
         g_record.profile = profile;
         g_record.title_limit = cap;
@@ -875,6 +872,7 @@ HRESULT decode_bxvm_config(void* config) {
 }
 
 HRESULT decode_xbox_config(const void* config, const ConfigHeader& header) {
+    /* A zero first word alone does not identify this block: check every field before recording anything. */
     if (header.struct_size == 0u) {
         log_vmem_fallback("xbox", "zero_segment_count");
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
@@ -901,51 +899,27 @@ HRESULT decode_xbox_config(const void* config, const ConfigHeader& header) {
         return S_OK;
     }
 
-    const bx_runtime_config_t* cfg = bx_get_runtime_config();
-    const uint64_t cap = title_limit();
-    const auto profile = (cfg && cfg->profile == BX_PROFILE_ANACONDA) ? BX_PROFILE_ANACONDA : BX_PROFILE_LOCKHART;
-    bx_xmem_stats_t stats{};
-    bx_xmem_get_internal_stats(&stats);
-
-    BxChargedHeap* old_heap = nullptr;
-    ID3D12Resource* old_buffer = nullptr;
+    /*
+     * The segment count is recorded but nothing consumes it yet: no GPU VA
+     * layout, reservation or CreateHeap behaviour depends on it. Until it does,
+     * this path leaves the BXVM record and its cached backing heap untouched,
+     * reports applied=0 and keeps BX_STUB_LOG, so `bx-cli trace` still lists
+     * D3D12ConfigureVirtualMemoryX as unimplemented.
+     */
     bool repeat = false;
     {
         Guard guard(g_section);
-        repeat = g_record.configured && g_record.xbox_configured &&
-                 g_record.xbox_virtual_segment_count == in.virtual_segment_count &&
-                 !g_record.have_region && !g_record.backing_opt_in;
-        if (!repeat) {
-            take_cached_heap_locked(&old_heap, &old_buffer);
-            ++g_record.config_generation;
-        }
-        g_record.configured = true;
+        repeat = g_record.xbox_configured && g_record.xbox_virtual_segment_count == in.virtual_segment_count;
         g_record.xbox_configured = true;
         g_record.xbox_virtual_segment_count = in.virtual_segment_count;
-        g_record.backing_opt_in = false;
-        g_record.profile = profile;
-        g_record.title_limit = cap;
-        g_record.have_region = false;
-        g_record.config_base = 0;
-        g_record.config_size = 0;
-        g_record.region = bx_xmem_region_info_t{};
-    }
-    release_backing_pair(old_heap, old_buffer);
-
-    uint64_t charged = 0;
-    {
-        Guard guard(g_section);
-        charged = g_record.charged_private_bytes;
     }
 
-    char detail[384];
+    char detail[192];
     std::snprintf(detail, sizeof(detail),
-                  "decoder=xbox applied=1 virtual_segments=%u repeat=%d profile=%s title_limit=%llu xmem_used=%llu gpu_heap_bytes=%llu",
-                  in.virtual_segment_count, repeat ? 1 : 0, profile_name(profile),
-                  static_cast<unsigned long long>(cap),
-                  static_cast<unsigned long long>(stats.committed_virtual_bytes + stats.allocated_physical_bytes),
-                  static_cast<unsigned long long>(charged));
-    bx_log_emit(BX_LOG_INFO, "d3d12_xs", "D3D12ConfigureVirtualMemoryX", detail);
+                  "decoder=xbox applied=0 recorded_only=1 virtual_segments=%u repeat=%d reason=segment_count_unused",
+                  in.virtual_segment_count, repeat ? 1 : 0);
+    bx_log_emit(BX_LOG_WARN, "d3d12_xs", "vmem_config_recorded", detail);
+    BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
     return S_OK;
 }
 
