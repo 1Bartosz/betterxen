@@ -17,6 +17,10 @@
 # U — Unknown/unestablished by the reviewed public sources: a bounded statement
 #     about the evidence reviewed, not proof that no authorized source exists.
 #
+# Use B for semantics from a specification, D for a claim about what a public
+# document or sample says, and E for a claim about a tool or its format support.
+# The current registry does not assign class C.
+#
 # These are the repository's evidence classes. AGENTS.md §5 refers to this
 # file and does not define a second vocabulary; the longer VERIFIED /
 # REPRODUCED / SOURCE-DERIVED / ... vocabulary named in issue #549 is not

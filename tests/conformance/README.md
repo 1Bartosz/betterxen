@@ -13,8 +13,10 @@ Every directory matching `test_*/CMakeLists.txt` is **auto-discovered** by `test
 
 ## Exit Status: Pass, Fail, and Unavailable
 
-`bx-cli run` returns the guest's exit status unchanged. Fixtures that cannot reach a
-conclusion on the host report **exit 77** and print `SKIP: <reason>` on stdout; for example
+`bx-cli run` normally returns the guest's exit status. A timeout returns 124, a signal
+returns 128 plus its number, and a cleanup failure raises an otherwise successful status
+to at least 1. Fixtures that cannot reach a conclusion on the host report **exit 77**
+and print `SKIP: <reason>` on stdout; for example
 `test_d3dmetal_gpu_limits` skips when `d3d12.dll`, device creation, or shader model 6.6 is
 unavailable.
 
