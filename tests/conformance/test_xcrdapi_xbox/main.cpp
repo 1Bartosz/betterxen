@@ -1,5 +1,5 @@
 /*
- * Synthetic conformance test for the evidenced Xbox Series DirectStorage COM
+ * Synthetic conformance test for the inferred Xbox Series DirectStorage COM
  * interfaces (IDStorageFactoryX, IDStorageFileX, IDStorageStatusArrayX,
  * IDStorageQueueX) in XCRDAPI.dll.
  */
@@ -119,7 +119,7 @@ int main() {
           static_cast<unsigned long>(hr));
     if (!factory) return 1;
 
-    /* Slot 8: SetStagingBufferSize (32 MiB, matching Scarlett startup). */
+    /* Slot 8: SetStagingBufferSize (32 MiB, the size observed at target-build startup). */
     hr = factory->SetStagingBufferSize(0x2000000u);
     check(hr == S_OK, "SetStagingBufferSize(32 MiB) must return S_OK (hr=0x%08lx)", static_cast<unsigned long>(hr));
 

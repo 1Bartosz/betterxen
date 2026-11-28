@@ -1266,8 +1266,9 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Xbox Series DirectStorage COM interfaces (IDStorage*X) evidenced from the
-// authorized Scarlett build, layered over the same WorkQueue / StorageFile /
+// Xbox Series DirectStorage COM interfaces (IDStorage*X), inferred from call-site
+// observation of a project-authorized target build (provenance pending maintainer
+// review; not a public contract), layered over the same WorkQueue / StorageFile /
 // StatusArray engine. Unimplemented vtable slots log through BX_VTABLE_STUB_LOG
 // so any newly reached slot surfaces immediately in bx-cli trace.
 // ---------------------------------------------------------------------------
@@ -1655,7 +1656,7 @@ private:
 } // namespace
 
 // Accepts BetterXen's synthetic factory IID and IUnknown (the synthetic factory),
-// the public PC IDStorageFactory / IDStorageFactory1, and the evidenced Xbox
+// the public PC IDStorageFactory / IDStorageFactory1, and the inferred Xbox
 // IDStorageFactoryX IID. Any other IID is logged with its value so `bx-cli trace`
 // names the interface a guest asked for.
 extern "C" HRESULT WINAPI DStorageGetFactory(REFIID riid, void** ppv) {

@@ -1,0 +1,27 @@
+name: Merge policy audit
+
+# Detects a pull request merged by its own author (AGENTS.md §7, "Merge
+# eligibility"). GitHub rulesets cannot block this, so the run fails after the
+# merge. It is not a required check and never checks out pull request code.
+
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  author-merge:
+    name: Author did not merge
+    if: github.event.pull_request.merged == true && github.event.pull_request.merged_by.login == github.event.pull_request.user.login
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 2
+    steps:
+      - name: Report a self-merge
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          echo "::error::Pull request #$PR was merged by its own author, $AUTHOR. A maintainer other than the author must merge (AGENTS.md section 7)."
+          exit 1
