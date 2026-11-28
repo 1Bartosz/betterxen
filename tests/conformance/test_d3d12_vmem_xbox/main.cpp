@@ -1,19 +1,19 @@
 /*
- * Synthetic conformance test for the inferred 32-byte Xbox configuration
- * decoder in d3d12_xs.dll!D3D12ConfigureVirtualMemoryX.
+ * Conformance test for the Xbox virtual-memory configuration decoder in
+ * d3d12_xs.dll!D3D12ConfigureVirtualMemoryX (D3D12XBOX_VIRTUAL_MEMORY_CONFIGURATION).
  *
- * Verifies:
- *  - valid Xbox configurations (3 and 4 virtual segments) are recorded
- *    without mutating caller bytes, report applied=0 recorded_only=1, and
- *    still emit the unimplemented-API stub, because nothing consumes the
- *    segment count yet;
- *  - repeated identical and updated Xbox calls log repeat=1 and repeat=0;
- *  - an Xbox configuration leaves a cached BXVM backing heap and its
- *    cpu_pointer untouched, while ordinary D3D12 heaps and XMemVirtualAlloc
- *    reservations keep working;
- *  - malformed, non-zero trailing, null, and page-edge
- *    unreadable configurations fall back safely without faulting or mutating
- *    caller memory and log the exact decoder and reason.
+ * Expected values come from the authorized GDK documentation of the function and the
+ * structure, written out here rather than taken from the shim's header:
+ *  - the default page-table size (5 x 4 MB) reports a minimum graphics address of 2 GiB and
+ *    a maximum of 159.375 GiB; the input fields are left as the caller set them;
+ *  - the page-table size is clamped to 33, the frame-buffer preserve size to 64 MiB, and -1
+ *    (the legacy size) is kept;
+ *  - after a D3D12 device exists the call fails with E_FAIL and writes nothing;
+ *  - every accepted configuration is recorded only (applied=0) and still emits the
+ *    unimplemented-API stub, and leaves a cached BXVM backing heap untouched.
+ * Inferred, and marked as such in the log: the maximum for other page-table sizes scales
+ * linearly (max_estimated=1), and a page-table size of 0, an unreadable configuration and
+ * unwritable outputs fail with E_INVALIDARG.
  *
  * Several fixtures share one BX_LOG_FILE, so every log check reads only the
  * bytes appended since the step it checks began.
@@ -59,11 +59,19 @@ struct BxvmConfig {
 };
 
 struct XboxConfig {
-    uint32_t reserved0;
-    uint32_t virtual_segment_count;
-    uint32_t reserved[6];
+    uint32_t flags;
+    uint32_t page_table_4mb_pages;
+    uint32_t frame_buffer_preserve_bytes;
+    uint32_t padding;
+    uint64_t min_gpu_va;
+    uint64_t max_gpu_va;
 };
 static_assert(sizeof(XboxConfig) == 32, "XboxConfig must be 32 bytes");
+
+/* From the documentation: 2 GB minimum, about 159.375 GB maximum at the default size. */
+constexpr uint64_t kMinGpuVa = 0x80000000ull;
+constexpr uint64_t kDefaultMaxGpuVa = 0x27D8000000ull;
+constexpr uint64_t kOutputSentinel = 0xA5A5A5A5A5A5A5A5ull;
 
 int g_failed = 0;
 
@@ -137,11 +145,20 @@ BxvmConfig make_bxvm(uint64_t base_va, uint64_t size_bytes, uint32_t flags) {
     return cfg;
 }
 
-XboxConfig make_xbox(uint32_t segments) {
+XboxConfig make_xbox(uint32_t pages, uint32_t preserve = 0) {
     XboxConfig cfg{};
-    cfg.reserved0 = 0;
-    cfg.virtual_segment_count = segments;
+    cfg.page_table_4mb_pages = pages;
+    cfg.frame_buffer_preserve_bytes = preserve;
+    cfg.min_gpu_va = kOutputSentinel;
+    cfg.max_gpu_va = kOutputSentinel;
     return cfg;
+}
+
+/* The caller's input fields, which the decoder must not change. */
+bool inputs_unchanged(const XboxConfig& after, const XboxConfig& before) {
+    return after.flags == before.flags && after.page_table_4mb_pages == before.page_table_4mb_pages &&
+           after.frame_buffer_preserve_bytes == before.frame_buffer_preserve_bytes &&
+           after.padding == before.padding;
 }
 
 } // namespace
@@ -161,17 +178,22 @@ int main() {
     long mark = have_log ? log_size(log_path) : 0;
     const long test_start = mark;
 
-    /* 1. Valid Xbox configuration (4 virtual segments, Anaconda/24 GiB shape). */
-    XboxConfig cfg4 = make_xbox(4);
-    const XboxConfig cfg4_before = cfg4;
-    HRESULT hr = D3D12ConfigureVirtualMemoryX(&cfg4);
-    check(hr == S_OK, "valid Xbox config (4 segments) must return S_OK (hr=0x%08lx)", ul(hr));
-    check(std::memcmp(&cfg4, &cfg4_before, sizeof(cfg4)) == 0,
-          "Xbox decoder must not mutate caller memory");
-
+    /* 1. The default configuration reports the documented address range. */
+    XboxConfig def = make_xbox(5);
+    const XboxConfig def_before = def;
+    HRESULT hr = D3D12ConfigureVirtualMemoryX(&def);
+    check(hr == S_OK, "default Xbox config must return S_OK (hr=0x%08lx)", ul(hr));
+    check(inputs_unchanged(def, def_before), "Xbox decoder must not change the input fields");
+    check(def.min_gpu_va == kMinGpuVa, "minimum graphics address must be 2 GiB (got 0x%llx)",
+          static_cast<unsigned long long>(def.min_gpu_va));
+    check(def.max_gpu_va == kDefaultMaxGpuVa, "default maximum graphics address must be 159.375 GiB (got 0x%llx)",
+          static_cast<unsigned long long>(def.max_gpu_va));
     if (have_log) {
-        check(log_contains_since(log_path, mark, "decoder=xbox applied=0 recorded_only=1 virtual_segments=4 repeat=0"),
-              "log must record the 4-segment Xbox config as recorded only");
+        check(log_contains_since(log_path, mark,
+                                 "decoder=xbox applied=0 recorded_only=1 page_table_4mb_pages=5 clamped=0 "
+                                 "frame_buffer_preserve_bytes=0 min_gpu_va=0x80000000 max_gpu_va=0x27d8000000 "
+                                 "max_estimated=0 repeat=0"),
+              "log must record the default Xbox config as recorded only");
         check(log_contains_since(log_path, mark, kStubNeedle),
               "a recorded-only Xbox config must still emit the unimplemented-API stub");
         check(!log_contains_since(log_path, mark, "applied=1"),
@@ -179,39 +201,106 @@ int main() {
         mark = log_size(log_path);
     }
 
-    /* 2. Repeated identical Xbox call (repeat=1). */
-    hr = D3D12ConfigureVirtualMemoryX(&cfg4);
+    /* 2. Repeated identical call (repeat=1). */
+    hr = D3D12ConfigureVirtualMemoryX(&def);
     check(hr == S_OK, "repeated identical Xbox config must return S_OK (hr=0x%08lx)", ul(hr));
     if (have_log) {
-        check(log_contains_since(log_path, mark, "decoder=xbox applied=0 recorded_only=1 virtual_segments=4 repeat=1"),
+        check(log_contains_since(log_path, mark, "page_table_4mb_pages=5 clamped=0") &&
+                  log_contains_since(log_path, mark, "repeat=1"),
               "repeated identical Xbox config must log repeat=1");
         mark = log_size(log_path);
     }
 
-    /* 3. Updated Xbox call (3 segments, Lockhart/16 GiB shape). */
-    XboxConfig cfg3 = make_xbox(3);
-    const XboxConfig cfg3_before = cfg3;
-    hr = D3D12ConfigureVirtualMemoryX(&cfg3);
-    check(hr == S_OK, "updated Xbox config (3 segments) must return S_OK (hr=0x%08lx)", ul(hr));
-    check(std::memcmp(&cfg3, &cfg3_before, sizeof(cfg3)) == 0,
-          "updated Xbox config must not mutate caller memory");
+    /* 3. The page-table sizes observed at title startup, 4 and 3: the maximum is estimated. */
+    for (uint32_t pages : {4u, 3u}) {
+        XboxConfig cfg = make_xbox(pages);
+        const XboxConfig before = cfg;
+        hr = D3D12ConfigureVirtualMemoryX(&cfg);
+        check(hr == S_OK, "Xbox config with %u pages must return S_OK (hr=0x%08lx)", pages, ul(hr));
+        check(inputs_unchanged(cfg, before), "%u-page config input fields must stay unchanged", pages);
+        check(cfg.min_gpu_va == kMinGpuVa, "%u-page config minimum must be 2 GiB", pages);
+        check(cfg.max_gpu_va == kDefaultMaxGpuVa / 5u * pages, "%u-page config maximum must scale from the default",
+              pages);
+        if (have_log) {
+            char needle[96];
+            std::snprintf(needle, sizeof(needle), "page_table_4mb_pages=%u clamped=0", pages);
+            check(log_contains_since(log_path, mark, needle) &&
+                      log_contains_since(log_path, mark, "max_estimated=1 repeat=0"),
+                  "%u-page config must log its size, max_estimated=1 and repeat=0", pages);
+            mark = log_size(log_path);
+        }
+    }
+
+    /* 4. Documented clamps: page table to 33, frame-buffer preserve to 64 MiB; -1 is the legacy size. */
+    XboxConfig big = make_xbox(100u, 128u * 1024u * 1024u);
+    hr = D3D12ConfigureVirtualMemoryX(&big);
+    check(hr == S_OK, "oversized Xbox config must be clamped, not refused (hr=0x%08lx)", ul(hr));
+    check(big.page_table_4mb_pages == 100u, "clamping must not rewrite the caller's page count");
+    check(big.max_gpu_va == kDefaultMaxGpuVa / 5u * 33u, "clamped maximum must use 33 pages");
     if (have_log) {
-        check(log_contains_since(log_path, mark, "decoder=xbox applied=0 recorded_only=1 virtual_segments=3 repeat=0"),
-              "updated Xbox config must log virtual_segments=3 repeat=0");
+        check(log_contains_since(log_path, mark,
+                                 "page_table_4mb_pages=33 clamped=1 frame_buffer_preserve_bytes=67108864"),
+              "oversized config must log the clamped page count and preserve size");
+        mark = log_size(log_path);
+    }
+    XboxConfig legacy = make_xbox(5u, 0xFFFFFFFFu);
+    hr = D3D12ConfigureVirtualMemoryX(&legacy);
+    check(hr == S_OK, "legacy frame-buffer preserve size must be accepted (hr=0x%08lx)", ul(hr));
+    if (have_log) {
+        check(log_contains_since(log_path, mark, "frame_buffer_preserve_bytes=4294967295"),
+              "the legacy preserve size (-1) must be recorded as given");
         mark = log_size(log_path);
     }
 
-    /* No upper bound is inferred: the count is only recorded and never consumed. */
-    XboxConfig large_count = make_xbox(UINT32_MAX);
-    const XboxConfig large_count_before = large_count;
-    hr = D3D12ConfigureVirtualMemoryX(&large_count);
-    check(hr == S_OK, "unbounded recorded count must return S_OK (hr=0x%08lx)", ul(hr));
-    check(std::memcmp(&large_count, &large_count_before, sizeof(large_count)) == 0,
-          "large recorded count must not mutate caller memory");
+    /* 5. Refused configurations write nothing. */
+    XboxConfig zero = make_xbox(0);
+    const XboxConfig zero_before = zero;
+    hr = D3D12ConfigureVirtualMemoryX(&zero);
+    check(hr == E_INVALIDARG, "a page-table size of 0 must fail with E_INVALIDARG (hr=0x%08lx)", ul(hr));
+    check(std::memcmp(&zero, &zero_before, sizeof(zero)) == 0, "a refused config must not be written");
+
+    SYSTEM_INFO ro_sys{};
+    GetSystemInfo(&ro_sys);
+    const SIZE_T ro_bytes = ro_sys.dwPageSize ? ro_sys.dwPageSize : 4096;
+    void* ro_page = VirtualAlloc(nullptr, ro_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    check(ro_page != nullptr, "VirtualAlloc for the read-only Xbox probe must succeed");
+    if (ro_page) {
+        const XboxConfig ro_cfg = make_xbox(5);
+        std::memcpy(ro_page, &ro_cfg, sizeof(ro_cfg));
+        DWORD old_protect = 0;
+        if (VirtualProtect(ro_page, ro_bytes, PAGE_READONLY, &old_protect)) {
+            hr = D3D12ConfigureVirtualMemoryX(ro_page);
+            check(hr == E_INVALIDARG, "read-only Xbox outputs must fail with E_INVALIDARG (hr=0x%08lx)", ul(hr));
+            check(std::memcmp(ro_page, &ro_cfg, sizeof(ro_cfg)) == 0, "read-only Xbox config must stay unchanged");
+            DWORD ignored = 0;
+            VirtualProtect(ro_page, ro_bytes, old_protect, &ignored);
+        } else {
+            check(false, "Xbox config page must become read-only");
+        }
+        VirtualFree(ro_page, 0, MEM_RELEASE);
+    }
+
+    void* edge_mem = VirtualAlloc(nullptr, ro_bytes * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    check(edge_mem != nullptr, "VirtualAlloc for the Xbox page-edge probe must succeed");
+    if (edge_mem) {
+        auto* edge_base = static_cast<uint8_t*>(edge_mem);
+        DWORD old_prot = 0;
+        check(VirtualProtect(edge_base + ro_bytes, ro_bytes, PAGE_NOACCESS, &old_prot) != 0,
+              "second page must be PAGE_NOACCESS");
+        uint8_t* edge = edge_base + ro_bytes - 8;
+        const uint32_t header[2] = {0u, 5u};
+        std::memcpy(edge, header, sizeof(header));
+        hr = D3D12ConfigureVirtualMemoryX(edge);
+        check(hr == E_INVALIDARG, "an Xbox config cut off by an unreadable page must fail (hr=0x%08lx)", ul(hr));
+        VirtualProtect(edge_base + ro_bytes, ro_bytes, PAGE_READWRITE, &old_prot);
+        VirtualFree(edge_mem, 0, MEM_RELEASE);
+    }
     if (have_log) {
-        check(log_contains_since(log_path, mark,
-                                 "decoder=xbox applied=0 recorded_only=1 virtual_segments=4294967295 repeat=0"),
-              "large count must be recorded without imposing an inferred upper bound");
+        for (const char* needle : {"decoder=xbox applied=0 reason=zero_page_table_pages hr=0x80070057",
+                                   "decoder=xbox applied=0 reason=unwritable_output hr=0x80070057",
+                                   "decoder=xbox applied=0 reason=unreadable_config hr=0x80070057"}) {
+            check(log_contains_since(log_path, mark, needle), "missing refused-config log: %s", needle);
+        }
         mark = log_size(log_path);
     }
 
@@ -268,10 +357,19 @@ int main() {
         check(hr == S_OK && query.cpu_pointer != 0,
               "BXVM query after CreateHeap must return non-zero cached cpu_pointer (hr=0x%08lx)", ul(hr));
 
-        /* An Xbox config between two BXVM calls must not evict the cached backing heap. */
+        /* Once a device exists the Xbox call fails, writes nothing and leaves the cached heap alone. */
         XboxConfig switch_cfg = make_xbox(4);
+        const XboxConfig switch_before = switch_cfg;
+        const long switch_mark = have_log ? log_size(log_path) : 0;
         hr = D3D12ConfigureVirtualMemoryX(&switch_cfg);
-        check(hr == S_OK, "Xbox config after BXVM must return S_OK (hr=0x%08lx)", ul(hr));
+        check(hr == E_FAIL, "Xbox config after device creation must fail with E_FAIL (hr=0x%08lx)", ul(hr));
+        check(std::memcmp(&switch_cfg, &switch_before, sizeof(switch_cfg)) == 0,
+              "Xbox config refused after device creation must not be written");
+        if (have_log) {
+            check(log_contains_since(log_path, switch_mark,
+                                     "decoder=xbox applied=0 reason=device_already_created hr=0x80004005"),
+                  "Xbox config after device creation must log device_already_created");
+        }
 
         if (backing_heap) {
             ID3D12Device* still_dev = nullptr;
@@ -293,10 +391,7 @@ int main() {
             backing_heap = nullptr;
         }
 
-        /* Restore Xbox config and verify ordinary D3D12 heap creation still works. */
-        hr = D3D12ConfigureVirtualMemoryX(&switch_cfg);
-        check(hr == S_OK, "restoring Xbox config must return S_OK (hr=0x%08lx)", ul(hr));
-
+        /* Ordinary D3D12 heap creation still works after the refused Xbox call. */
         D3D12_HEAP_DESC ordinary_desc{};
         ordinary_desc.SizeInBytes = k64K;
         ordinary_desc.Alignment = k64K;
@@ -305,7 +400,7 @@ int main() {
         ID3D12Heap* ordinary_heap = nullptr;
         hr = device->CreateHeap(&ordinary_desc, __uuidof(ID3D12Heap), reinterpret_cast<void**>(&ordinary_heap));
         check(hr == S_OK && ordinary_heap != nullptr,
-              "ordinary CreateHeap must succeed after Xbox config (hr=0x%08lx)", ul(hr));
+              "ordinary CreateHeap must succeed after a refused Xbox config (hr=0x%08lx)", ul(hr));
         if (ordinary_heap) {
             ordinary_heap->Release();
         }
@@ -322,7 +417,7 @@ int main() {
         device->Release();
     }
 
-    /* 6. Malformed, unsupported, and page-edge unreadable inputs. */
+    /* 6. Malformed and page-edge unreadable inputs to the shared entry point. */
     if (have_log) {
         mark = log_size(log_path);
     }
@@ -359,19 +454,6 @@ int main() {
         VirtualFree(readonly_page, 0, MEM_RELEASE);
     }
 
-    XboxConfig zero_seg = make_xbox(0);
-    const XboxConfig zero_seg_before = zero_seg;
-    check(D3D12ConfigureVirtualMemoryX(&zero_seg) == S_OK, "zero segment count must fall back with S_OK");
-    check(std::memcmp(&zero_seg, &zero_seg_before, sizeof(zero_seg)) == 0,
-          "zero segment count bytes must stay unchanged");
-
-    XboxConfig bad_fields = make_xbox(4);
-    bad_fields.reserved[2] = 1u;
-    const XboxConfig bad_fields_before = bad_fields;
-    check(D3D12ConfigureVirtualMemoryX(&bad_fields) == S_OK, "non-zero trailing Xbox field must fall back with S_OK");
-    check(std::memcmp(&bad_fields, &bad_fields_before, sizeof(bad_fields)) == 0,
-          "non-zero trailing Xbox field bytes must stay unchanged");
-
     SYSTEM_INFO sys{};
     GetSystemInfo(&sys);
     const SIZE_T page_bytes = sys.dwPageSize ? sys.dwPageSize : 4096;
@@ -387,15 +469,6 @@ int main() {
         check(D3D12ConfigureVirtualMemoryX(base + page_bytes) == S_OK,
               "unreadable header must not fault and must return S_OK");
 
-        /* 8 readable bytes {0, 4} followed immediately by NOACCESS page. */
-        uint8_t* edge = base + page_bytes - 8;
-        const uint32_t zero = 0u;
-        const uint32_t four = 4u;
-        std::memcpy(edge, &zero, 4);
-        std::memcpy(edge + 4, &four, 4);
-        check(D3D12ConfigureVirtualMemoryX(edge) == S_OK,
-              "Xbox header at page edge with unreadable tail must not fault and must return S_OK");
-
         VirtualProtect(base + page_bytes, page_bytes, PAGE_READWRITE, &old_prot);
         VirtualFree(guard_mem, 0, MEM_RELEASE);
     }
@@ -406,9 +479,6 @@ int main() {
             "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=none applied=0 reason=unrecognized_header\"",
             "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=none applied=0 reason=unreadable_header\"",
             "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=bxvm applied=0 reason=unwritable_output\"",
-            "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=xbox applied=0 reason=zero_segment_count\"",
-            "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=xbox applied=0 reason=unsupported_fields\"",
-            "\"event\":\"vmem_config_fallback\",\"detail\":\"decoder=xbox applied=0 reason=unreadable_tail\"",
         };
         for (const char* needle : expected_fallbacks) {
             check(log_contains_since(log_path, mark, needle), "missing expected fallback log: %s", needle);

@@ -90,31 +90,49 @@ static_assert(offsetof(BxD3d12VirtualMemoryConfig, reserved) == 32, "reserved of
 static_assert(offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer) == 40, "cpu_pointer offset");
 
 /*
- * Inferred 32-byte Xbox virtual-memory configuration block.
+ * The Xbox virtual-memory configuration (D3D12XBOX_VIRTUAL_MEMORY_CONFIGURATION, d3d12_xs.h).
  *
- * Source: call-site observation of a project-authorized target build, not a
- * public API contract. Provenance is pending maintainer review (PR #592), so
- * treat every field below as an inference.
+ * Source: the authorized GDK documentation of D3D12ConfigureVirtualMemoryX and the
+ * structure. Call-site observation of a project-authorized target build agrees with it: a
+ * zero-initialized block with 3 or 4 in the page-table field and no flags.
  *
- * Unlike BXVM, this block has no magic or struct_size header: offset +0x00 is 0,
- * offset +0x04 carries a positive virtual-segment count (observed 3 for 16 GiB
- * and 4 for 24 GiB reservations), and offsets +0x08..+0x1f are 0. Because the
- * export takes PVOID with no size parameter, the decoder verifies via
- * VirtualQuery that all 32 bytes are committed and readable before copying past
- * the initial 8-byte probe, and never writes to caller memory.
+ * Documented: flags must be none (0); the GPU page table is sized in 4 MB units, at least 1
+ * and clamped to 33 (default 5, 20 MB); the frame-buffer preserve size is 0 (none), -1 (the
+ * legacy size, about 10 MB) or a byte count clamped to 64 MB; the two addresses are outputs,
+ * the minimum always 2 GB; and the call fails with E_FAIL once a D3D12 device exists.
  *
- * The decoder only records the count. Nothing consumes it yet, so the call
- * still logs BX_STUB_LOG and leaves the BXVM record and backing heap alone.
+ * The host does not size GPU page tables or keep a cross-process frame buffer, so the
+ * decoder records both, writes the outputs and still logs BX_STUB_LOG. The maximum address
+ * is documented only for the default size; for other sizes it is scaled linearly from that
+ * value, an inference the log marks as max_estimated=1. A page count of 0 is refused: the
+ * value of the header's DEFAULT constant is not documented.
  */
 struct BxXboxVirtualMemoryConfig {
-    uint32_t reserved0;
-    uint32_t virtual_segment_count;
-    uint32_t reserved[6];
+    uint32_t flags;
+    uint32_t page_table_memory_4mb_page_count;
+    uint32_t frame_buffer_preserve_memory_size_bytes;
+    uint32_t padding;
+    uint64_t minimum_valid_graphics_address;
+    uint64_t maximum_valid_graphics_address;
 };
 static_assert(sizeof(BxXboxVirtualMemoryConfig) == 32, "Xbox config block is 32 bytes");
-static_assert(offsetof(BxXboxVirtualMemoryConfig, reserved0) == 0, "reserved0 offset");
-static_assert(offsetof(BxXboxVirtualMemoryConfig, virtual_segment_count) == 4, "virtual_segment_count offset");
-static_assert(offsetof(BxXboxVirtualMemoryConfig, reserved) == 8, "reserved offset");
+static_assert(offsetof(BxXboxVirtualMemoryConfig, flags) == 0, "flags offset");
+static_assert(offsetof(BxXboxVirtualMemoryConfig, page_table_memory_4mb_page_count) == 4,
+              "page_table_memory_4mb_page_count offset");
+static_assert(offsetof(BxXboxVirtualMemoryConfig, frame_buffer_preserve_memory_size_bytes) == 8,
+              "frame_buffer_preserve_memory_size_bytes offset");
+static_assert(offsetof(BxXboxVirtualMemoryConfig, minimum_valid_graphics_address) == 16,
+              "minimum_valid_graphics_address offset");
+static_assert(offsetof(BxXboxVirtualMemoryConfig, maximum_valid_graphics_address) == 24,
+              "maximum_valid_graphics_address offset");
+
+constexpr uint32_t BX_D3D12_XBOX_PAGE_TABLE_DEFAULT_4MB_PAGES = 5u;
+constexpr uint32_t BX_D3D12_XBOX_PAGE_TABLE_MAX_4MB_PAGES = 33u;
+constexpr uint32_t BX_D3D12_XBOX_FRAME_BUFFER_PRESERVE_LEGACY = 0xFFFFFFFFu;
+constexpr uint32_t BX_D3D12_XBOX_FRAME_BUFFER_PRESERVE_MAX_BYTES = 64u * 1024u * 1024u;
+constexpr uint64_t BX_D3D12_XBOX_MIN_GRAPHICS_ADDRESS = 2ull * 1024ull * 1024ull * 1024ull;
+/* 159.375 GiB at the default 5 pages (20 MB), so 31.875 GiB per 4 MB page. */
+constexpr uint64_t BX_D3D12_XBOX_GRAPHICS_BYTES_PER_4MB_PAGE = 0x7F8000000ull;
 
 extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config);
 

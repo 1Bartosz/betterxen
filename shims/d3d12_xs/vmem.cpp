@@ -54,7 +54,10 @@ constexpr GUID kPlacedResourceHeap = {0x3a652cbb, 0xb5b3, 0x4e09, {0xb3, 0x6c, 0
 struct Record {
     bool configured = false;
     bool xbox_configured = false;
-    uint32_t xbox_virtual_segment_count = 0;
+    uint32_t xbox_page_table_4mb_pages = 0;
+    uint32_t xbox_frame_buffer_preserve_bytes = 0;
+    /* D3D12ConfigureVirtualMemoryX fails with E_FAIL once a device exists. */
+    bool device_created = false;
     bool backing_opt_in = false;
     bx_hardware_profile_t profile = BX_PROFILE_LOCKHART;
     uint64_t title_limit = 0;
@@ -768,6 +771,17 @@ bool write_cpu_pointer(void* config, uint64_t pointer) {
            bytes_written == sizeof(pointer);
 }
 
+/* Writes `len` bytes at `offset` in caller memory, after checking the range is writable. */
+bool write_config_bytes(void* config, size_t offset, const void* source, size_t len) {
+    auto* destination = static_cast<char*>(config) + offset;
+    if (!can_access_bytes(destination, len, true)) {
+        return false;
+    }
+    SIZE_T bytes_written = 0;
+    return WriteProcessMemory(GetCurrentProcess(), destination, source, len, &bytes_written) != 0 &&
+           bytes_written == len;
+}
+
 void log_vmem_fallback(const char* decoder, const char* reason) {
     char detail[160];
     std::snprintf(detail, sizeof(detail), "decoder=%s applied=0 reason=%s", decoder, reason);
@@ -898,46 +912,68 @@ HRESULT decode_bxvm_config(void* config) {
     return S_OK;
 }
 
-HRESULT decode_xbox_config(const void* config, const ConfigHeader& header) {
+HRESULT decode_xbox_config(void* config) {
+    /* The structure has no size field, so all 32 bytes must be readable and writable. */
     BxXboxVirtualMemoryConfig in{};
-    /* A zero first word alone does not identify this block: check every field before recording anything. */
-    if (header.struct_size == 0u) {
-        log_vmem_fallback("xbox", "zero_segment_count");
-        BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
-        return S_OK;
-    }
     if (!copy_readable_bytes(config, &in, sizeof(in))) {
-        log_vmem_fallback("xbox", "unreadable_tail");
+        log_vmem_failed("xbox", "unreadable_config", E_INVALIDARG);
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
-        return S_OK;
+        return E_INVALIDARG;
     }
-
-    for (uint32_t word : in.reserved) {
-        if (word != 0u) {
-            log_vmem_fallback("xbox", "unsupported_fields");
+    if (in.page_table_memory_4mb_page_count == 0u) {
+        log_vmem_failed("xbox", "zero_page_table_pages", E_INVALIDARG);
+        BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
+        return E_INVALIDARG;
+    }
+    {
+        Guard guard(g_section);
+        if (g_record.device_created) {
+            log_vmem_failed("xbox", "device_already_created", E_FAIL);
             BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
-            return S_OK;
+            return E_FAIL;
         }
     }
+
+    const bool clamped = in.page_table_memory_4mb_page_count > BX_D3D12_XBOX_PAGE_TABLE_MAX_4MB_PAGES;
+    const uint32_t pages = clamped ? BX_D3D12_XBOX_PAGE_TABLE_MAX_4MB_PAGES : in.page_table_memory_4mb_page_count;
+    uint32_t preserve = in.frame_buffer_preserve_memory_size_bytes;
+    if (preserve != BX_D3D12_XBOX_FRAME_BUFFER_PRESERVE_LEGACY &&
+        preserve > BX_D3D12_XBOX_FRAME_BUFFER_PRESERVE_MAX_BYTES) {
+        preserve = BX_D3D12_XBOX_FRAME_BUFFER_PRESERVE_MAX_BYTES;
+    }
+    const uint64_t outputs[2] = {BX_D3D12_XBOX_MIN_GRAPHICS_ADDRESS,
+                                 static_cast<uint64_t>(pages) * BX_D3D12_XBOX_GRAPHICS_BYTES_PER_4MB_PAGE};
+    if (!write_config_bytes(config, offsetof(BxXboxVirtualMemoryConfig, minimum_valid_graphics_address), outputs,
+                            sizeof(outputs))) {
+        log_vmem_failed("xbox", "unwritable_output", E_INVALIDARG);
+        BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
+        return E_INVALIDARG;
+    }
+
     /*
-     * The segment count is recorded but nothing consumes it yet: no GPU VA
-     * layout, reservation or CreateHeap behaviour depends on it. Until it does,
-     * this path leaves the BXVM record and its cached backing heap untouched,
-     * reports applied=0 and keeps BX_STUB_LOG, so `bx-cli trace` still lists
+     * The host sizes no GPU page tables and keeps no cross-process frame buffer, so both
+     * values are only recorded. This path leaves the BXVM record and its cached backing heap
+     * untouched, reports applied=0 and keeps BX_STUB_LOG, so `bx-cli trace` still lists
      * D3D12ConfigureVirtualMemoryX as unimplemented.
      */
     bool repeat = false;
     {
         Guard guard(g_section);
-        repeat = g_record.xbox_configured && g_record.xbox_virtual_segment_count == in.virtual_segment_count;
+        repeat = g_record.xbox_configured && g_record.xbox_page_table_4mb_pages == pages &&
+                 g_record.xbox_frame_buffer_preserve_bytes == preserve;
         g_record.xbox_configured = true;
-        g_record.xbox_virtual_segment_count = in.virtual_segment_count;
+        g_record.xbox_page_table_4mb_pages = pages;
+        g_record.xbox_frame_buffer_preserve_bytes = preserve;
     }
 
-    char detail[192];
+    char detail[320];
     std::snprintf(detail, sizeof(detail),
-                  "decoder=xbox applied=0 recorded_only=1 virtual_segments=%u repeat=%d reason=segment_count_unused",
-                  in.virtual_segment_count, repeat ? 1 : 0);
+                  "decoder=xbox applied=0 recorded_only=1 page_table_4mb_pages=%u clamped=%d "
+                  "frame_buffer_preserve_bytes=%u min_gpu_va=0x%llx max_gpu_va=0x%llx max_estimated=%d "
+                  "repeat=%d reason=host_ignores_page_table_size",
+                  pages, clamped ? 1 : 0, preserve, static_cast<unsigned long long>(outputs[0]),
+                  static_cast<unsigned long long>(outputs[1]),
+                  pages == BX_D3D12_XBOX_PAGE_TABLE_DEFAULT_4MB_PAGES ? 0 : 1, repeat ? 1 : 0);
     bx_log_emit(BX_LOG_WARN, "d3d12_xs", "vmem_config_recorded", detail);
     BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
     return S_OK;
@@ -967,7 +1003,7 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
         return decode_bxvm_config(config);
     }
     if (header.magic == 0u) {
-        return decode_xbox_config(config, header);
+        return decode_xbox_config(config);
     }
 
     log_vmem_fallback("none", "unrecognized_header");
@@ -1012,6 +1048,7 @@ bool bx_vmem_install_device_hooks(void* device) {
     static bool installed = false;
     Guard guard(g_section);
     if (installed) {
+        g_record.device_created = true;
         return true;
     }
     auto* proxy = static_cast<BxDeviceProxy*>(device);
@@ -1027,6 +1064,7 @@ bool bx_vmem_install_device_hooks(void* device) {
     DWORD ignored = 0;
     VirtualProtect(vtable + 28, sizeof(void*) * 2, old, &ignored);
     installed = true;
+    g_record.device_created = true;
     bx_log_emit(BX_LOG_INFO, "d3d12_xs", "vmem_hook", "CreateHeap and CreatePlacedResource installed");
     return true;
 }
