@@ -1,5 +1,6 @@
 #include "task_queue.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -43,7 +44,11 @@ public:
             std::unique_lock lock(mutex);
             if (closed && !is_completion) return false;
             if (mode == DispatchMode::immediate || (closed && mode == DispatchMode::manual)) {
+                // No lane storage on these paths, so the submitting thread waits out
+                // the remainder of the delay and then runs the callback itself.
+                const uint64_t due_ms = task->due_ms;
                 lock.unlock();
+                wait_until(due_ms);
                 task->run(owner->shared_from_this());
                 return true;
             }
@@ -60,6 +65,30 @@ public:
         void schedule() {
             if (workers++ == 0) worker_owner = owner->shared_from_this();
             SubmitThreadpoolWork(worker);
+        }
+
+        bool due() const { return first && (first->due_ms == 0 || GetTickCount64() >= first->due_ms); }
+
+        // Sleep out the remainder of a GetTickCount64 deadline. Saturating: the
+        // deadline can pass between the check and the clock read, and an unsigned
+        // subtraction there would wrap to ~584 million years.
+        static void wait_until(uint64_t due_ms) {
+            for (;;) {
+                const uint64_t now = GetTickCount64();
+                if (due_ms == 0 || now >= due_ms) return;
+                const uint64_t left = due_ms - now;
+                // INFINITE would mean "wait forever", so a `left` of exactly
+                // 0xFFFFFFFF would never wake to re-check the deadline.
+                Sleep(finite_sleep_chunk_ms(left));
+            }
+        }
+
+        // FIFO: the head holds the lane until it is due, so a later task never
+        // overtakes a delayed one. Wait only until that deadline, never spin.
+        std::chrono::steady_clock::time_point head_due() const {
+            const uint64_t now = GetTickCount64();
+            const uint64_t left = first->due_ms > now ? first->due_ms - now : 0;
+            return std::chrono::steady_clock::now() + std::chrono::milliseconds(left);
         }
 
         void schedule_serial() {
@@ -92,11 +121,25 @@ public:
         bool dispatch(uint32_t timeout) {
             if (mode == DispatchMode::immediate) return false;
             std::unique_lock lock(mutex);
-            const auto has_task = [this] { return closed || (first && !serial_running); };
+            const auto has_task = [this] { return closed || (due() && !serial_running); };
             if (timeout == INFINITE) {
-                ready.wait(lock, has_task);
-            } else if (!ready.wait_for(lock, std::chrono::milliseconds(timeout), has_task)) {
-                return false;
+                while (!has_task()) {
+                    if (first && !serial_running) {
+                        ready.wait_until(lock, head_due());
+                    } else {
+                        ready.wait(lock);
+                    }
+                }
+            } else {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+                while (!has_task()) {
+                    if (std::chrono::steady_clock::now() >= deadline) return false;
+                    auto wake = deadline;
+                    if (first && !serial_running) {
+                        wake = std::min(wake, head_due());
+                    }
+                    ready.wait_until(lock, wake);
+                }
             }
             if (closed) return false;
             auto task = pop();
@@ -118,6 +161,14 @@ public:
             std::unique_lock lock(lane.mutex);
             queue = lane.worker_owner;
             while (lane.first && !lane.serial_running) {
+                // A delayed head must not run early. Wait on the condition variable
+                // until its deadline (or a push changes the head) instead of popping
+                // it, so FIFO order holds and nothing is dropped. Close drains what
+                // was already accepted, as it did before delays existed.
+                if (!lane.closed && !lane.due()) {
+                    lane.ready.wait_until(lock, lane.head_due());
+                    continue;
+                }
                 auto task = lane.pop();
                 const bool serial = lane.mode == DispatchMode::serialized;
                 lane.serial_running = serial;
@@ -190,6 +241,7 @@ bool submit(const QueueRef& queue, Port port, std::unique_ptr<Task> task, bool i
     return queue->lanes[static_cast<uint32_t>(port)].push(std::move(task), is_completion);
 }
 
+
 } // namespace bx::gdk
 
 using namespace bx::gdk;
@@ -237,12 +289,23 @@ bool WINAPI XTaskQueueDispatch(void* handle, Port port, uint32_t timeout) {
     return queue && queue->lanes[static_cast<uint32_t>(port)].dispatch(timeout);
 }
 
+HRESULT WINAPI XTaskQueueSubmitDelayedCallback(void* handle, Port port, uint32_t delay_ms, void* context,
+                                               CallbackTask::Callback callback);
+
 HRESULT WINAPI XTaskQueueSubmitCallback(void* handle, Port port, void* context, CallbackTask::Callback callback) {
+    return XTaskQueueSubmitDelayedCallback(handle, port, 0, context, callback);
+}
+
+HRESULT WINAPI XTaskQueueSubmitDelayedCallback(void* handle, Port port, uint32_t delay_ms, void* context,
+                                               CallbackTask::Callback callback) {
     if (!handle || port > Port::completion || !callback) return E_INVALIDARG;
     const auto queue = acquire_queue(handle);
     if (!queue) return E_HANDLE;
     auto task = std::unique_ptr<Task>(new (std::nothrow) CallbackTask(callback, context));
     if (!task) return E_OUTOFMEMORY;
+    // delay_ms == 0 is due now, which is the common case and matches the old
+    // immediate-submit behaviour. A nonzero delay is a GetTickCount64 deadline.
+    task->due_ms = delay_ms == 0 ? 0 : GetTickCount64() + delay_ms;
     return submit(queue, port, std::move(task)) ? S_OK : E_HANDLE;
 }
 

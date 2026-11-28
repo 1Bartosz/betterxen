@@ -9,7 +9,8 @@
  *     with no object and no call reaching the host device;
  *  3. creates PSOs from the #453 [WaveSize(64)] and 64-bit typed-atomic blobs and requires the
  *     gate to log their constraints;
- *  4. checks the structured `shader_gate` JSONL records.
+ *  4. checks the structured `shader_gate` JSONL records, including the field order and
+ *     space-free values bx-telemetry's key=value parser relies on (#535).
  *
  * It then runs a copy of itself with --no-bridge from a directory holding d3d12_xs.dll but not
  * the bridge, which must still run DXIL and refuse ACCC-only with E_NOTIMPL.
@@ -140,6 +141,51 @@ bool log_has(const std::string& log, std::initializer_list<const char*> needles)
     return false;
 }
 
+/* Every JSONL line whose text holds `needle`, so shape checks can loop over
+ * the records the shim actually wrote rather than the lines typed by hand in
+ * the trace-summary fixtures. */
+std::vector<std::string> log_lines_with(const std::string& log, const char* needle) {
+    std::vector<std::string> lines;
+    size_t start = 0;
+    while (start < log.size()) {
+        size_t end = log.find('\n', start);
+        if (end == std::string::npos) end = log.size();
+        const std::string line = log.substr(start, end - start);
+        if (line.find(needle) != std::string::npos) lines.push_back(line);
+        start = end + 1;
+    }
+    return lines;
+}
+
+/* The `detail` value of one JSONL line, or empty when there is none. */
+std::string detail_of(const std::string& line) {
+    const char* key = "\"detail\":\"";
+    const size_t at = line.find(key);
+    if (at == std::string::npos) return {};
+    const size_t begin = at + std::strlen(key);
+    size_t end = begin;
+    while (end < line.size() && !(line[end] == '"' && line[end - 1] != '\\')) ++end;
+    return line.substr(begin, end - begin);
+}
+
+/* The structured part of a `shader_gate` detail: everything before the first
+ * token that has no `=`. The gap record ends in prose, so it stops there. */
+std::vector<std::string> structured_tokens(const std::string& detail, bool stop_at_free_text) {
+    std::vector<std::string> tokens;
+    size_t i = 0;
+    while (i < detail.size()) {
+        while (i < detail.size() && detail[i] == ' ') ++i;
+        if (i >= detail.size()) break;
+        size_t end = detail.find(' ', i);
+        if (end == std::string::npos) end = detail.size();
+        const std::string token = detail.substr(i, end - i);
+        if (token.find('=') == std::string::npos && stop_at_free_text) break;
+        tokens.push_back(token);
+        i = end;
+    }
+    return tokens;
+}
+
 ID3D12RootSignature* make_root(ID3D12Device* device, const D3D12_ROOT_PARAMETER& param) {
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc = {};
     desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
@@ -186,6 +232,49 @@ HRESULT create_compute(ID3D12Device* device, ID3D12RootSignature* root, const vo
     desc.CS.BytecodeLength = size;
     *pso = nullptr;
     return device->CreateComputePipelineState(&desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(pso));
+}
+
+/* Builds a stream PSO using the REAL subobject layout: alignas(void*) on the class, so a
+ * 4-byte-aligned payload sits at offset 4, not 8. Encoding the layout from the compiler,
+ * rather than from the shim's own assumption, is what lets these tests catch a desync in the
+ * shim's walker (#576 review). */
+template<class Payload>
+struct alignas(void*) TestSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    Payload payload;
+};
+
+struct StreamBuilder {
+    std::vector<uint8_t> bytes;
+    template<class Payload>
+    void add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const Payload& payload) {
+        using Record = TestSubobject<Payload>;
+        const size_t at = bytes.size();
+        bytes.resize(at + sizeof(Record), 0);
+        std::memcpy(bytes.data() + at + offsetof(Record, type), &type, sizeof(type));
+        std::memcpy(bytes.data() + at + offsetof(Record, payload), &payload, sizeof(payload));
+    }
+    D3D12_PIPELINE_STATE_STREAM_DESC desc() const {
+        D3D12_PIPELINE_STATE_STREAM_DESC d = {};
+        d.SizeInBytes = bytes.size();
+        d.pPipelineStateSubobjectStream = const_cast<uint8_t*>(bytes.data());
+        return d;
+    }
+};
+
+StreamBuilder compute_stream(const void* code, size_t size, ID3D12RootSignature* root) {
+    StreamBuilder stream;
+    D3D12_SHADER_BYTECODE cs = {code, size};
+    stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, cs);
+    stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root);
+    return stream;
+}
+
+HRESULT create_stream(ID3D12Device* device, const D3D12_PIPELINE_STATE_STREAM_DESC& desc,
+                      ID3D12PipelineState** pso) {
+    *pso = nullptr;
+    auto* device2 = static_cast<ID3D12Device2*>(device);
+    return device2->CreatePipelineState(&desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(pso));
 }
 
 /* Runs fill_cs66 and checks every output word. */
@@ -301,6 +390,12 @@ int no_bridge_main() {
     graphics.SampleDesc.Count = 1;
     hr = device->CreateGraphicsPipelineState(&graphics, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&pso));
     check(hr == E_NOTIMPL && !pso, "no-bridge: ACCC-only graphics VS hr=0x%08lx (want E_NOTIMPL)", ul(hr));
+    if (pso) pso->Release();
+    // The stream form refuses ACCC-only with or without the bridge (#576).
+    StreamBuilder accc_stream = compute_stream(accc.data(), accc.size(), root);
+    const D3D12_PIPELINE_STATE_STREAM_DESC accc_desc = accc_stream.desc();
+    hr = create_stream(device, accc_desc, &pso);
+    check(hr == E_NOTIMPL && !pso, "no-bridge: ACCC-only stream CS hr=0x%08lx (want E_NOTIMPL)", ul(hr));
     if (pso) pso->Release();
     root->Release();
     device->Release();
@@ -425,9 +520,88 @@ int main() {
     check(SUCCEEDED(hr) && pso, "DXIL PSO after a refusal hr=0x%08lx", ul(hr));
     if (pso) pso->Release();
 
+    // 2b. The stream form (ID3D12Device2::CreatePipelineState) is gated too (#576): the same
+    //     ACCC-only container is refused through the stream, and DXIL passes and runs.
+    {
+        StreamBuilder refused = compute_stream(accc.data(), accc.size(), root_uav);
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream = refused.desc();
+        hr = create_stream(device, stream, &pso);
+        check(hr == E_NOTIMPL && !pso,
+              "ACCC-only stream PSO: hr=0x%08lx (want E_NOTIMPL) pso=%p", ul(hr), static_cast<void*>(pso));
+        if (pso) pso->Release();
+
+        StreamBuilder accepted = compute_stream(g_fill_cs66, sizeof(g_fill_cs66), root_uav);
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream_dxil = accepted.desc();
+        hr = create_stream(device, stream_dxil, &pso);
+        check(SUCCEEDED(hr) && pso, "DXIL stream PSO hr=0x%08lx", ul(hr));
+        if (pso) {
+            run_dxil(device, root_uav, pso);
+            pso->Release();
+        }
+
+        // A truncated stream, and an unknown subobject type, are rejected before the host.
+        StreamBuilder truncated = compute_stream(g_fill_cs66, sizeof(g_fill_cs66), root_uav);
+        D3D12_PIPELINE_STATE_STREAM_DESC short_desc = truncated.desc();
+        short_desc.SizeInBytes -= 8;
+        hr = create_stream(device, short_desc, &pso);
+        check(hr == E_INVALIDARG && !pso, "truncated stream hr=0x%08lx (want E_INVALIDARG)", ul(hr));
+        if (pso) pso->Release();
+
+        StreamBuilder unknown = compute_stream(g_fill_cs66, sizeof(g_fill_cs66), root_uav);
+        /* Append a record whose type tag is not a known subobject. */
+        const size_t at = unknown.bytes.size();
+        const uint32_t bogus = 0x7f;
+        unknown.bytes.resize(at + 8, 0);
+        std::memcpy(unknown.bytes.data() + at, &bogus, sizeof(bogus));
+        const D3D12_PIPELINE_STATE_STREAM_DESC bogus_desc = unknown.desc();
+        hr = create_stream(device, bogus_desc, &pso);
+        check(hr == E_INVALIDARG && !pso, "unknown-subobject stream hr=0x%08lx (want E_INVALIDARG)", ul(hr));
+        if (pso) pso->Release();
+
+        // A graphics stream whose non-shader payloads are 4-byte aligned (SAMPLE_MASK,
+        // RENDER_TARGET_FORMATS, RASTERIZER, BLEND, FLAGS) must still reach the host. The
+        // first version of this change assumed every payload sat at offset 8 and desynced
+        // here, rejecting a valid stream with E_INVALIDARG (#576 review).
+        {
+            // A *compute* stream carrying 4-byte-aligned payloads. The first version used
+            // `g_fill_cs66` as a VS, which is a compute execution model and not a valid
+            // vertex shader, so the host could reject it for a reason unrelated to payload
+            // alignment (review on #577). NODE_MASK and FLAGS are UINT payloads at offset 4
+            // and are legal subobjects for a compute PSO, so this exercises the layout
+            // without depending on a vertex-stage fixture.
+            StreamBuilder aligned_stream;
+            aligned_stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root_uav);
+            D3D12_SHADER_BYTECODE cs = {g_fill_cs66, sizeof(g_fill_cs66)};
+            aligned_stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, cs);
+            UINT node_mask = 0;
+            aligned_stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, node_mask);
+            UINT stream_flags = 0;
+            aligned_stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, stream_flags);
+            const D3D12_PIPELINE_STATE_STREAM_DESC aligned_desc = aligned_stream.desc();
+            hr = create_stream(device, aligned_desc, &pso);
+            check(SUCCEEDED(hr) && pso, "compute stream with 4-byte-aligned payloads hr=0x%08lx", ul(hr));
+            if (pso) pso->Release();
+        }
+
+        // A duplicated subobject type is rejected by ID3D12Device2's own rules.
+        StreamBuilder duplicate = compute_stream(g_fill_cs66, sizeof(g_fill_cs66), root_uav);
+        D3D12_SHADER_BYTECODE again = {g_fill_cs66, sizeof(g_fill_cs66)};
+        duplicate.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, again);
+        const D3D12_PIPELINE_STATE_STREAM_DESC dup_desc = duplicate.desc();
+        hr = create_stream(device, dup_desc, &pso);
+        check(hr == E_INVALIDARG && !pso, "duplicate-CS stream hr=0x%08lx (want E_INVALIDARG)", ul(hr));
+        if (pso) pso->Release();
+    }
+
     // 3. Constraint-carrying DXIL still passes; its constraints are logged (results not dispatched).
+    // A wave wider than 32 lanes is refused at creation (#591): D3DMetal creates the PSO
+    // and never runs it, so an S_OK here would be a silent no-op. The fixture asserts the
+    // failure rather than only reading the log, because the log alone cannot tell a caller
+    // what happened.
     hr = create_compute(device, root_uav, g_wave64_lanes_cs, sizeof(g_wave64_lanes_cs), &pso);
-    std::printf("wave64 PSO hr=0x%08lx\n", ul(hr));
+    check(hr == E_NOTIMPL && !pso,
+          "wave64 PSO is refused at creation: hr=0x%08lx (want E_NOTIMPL) pso=%p", ul(hr),
+          static_cast<void*>(pso));
     if (pso) pso->Release();
     hr = create_compute(device, root_table, g_atomic64_image_cs, sizeof(g_atomic64_image_cs), &pso);
     std::printf("atomic64 typed PSO hr=0x%08lx\n", ul(hr));
@@ -438,6 +612,81 @@ int main() {
 
     // 5. The JSONL records.
     const std::string log = read_log();
+    // The trace-summary fixtures in bx-telemetry/bx-cli are typed by hand from
+    // reading shader_gate.cpp. These checks pin the shape the parser assumes,
+    // against the log this fixture actually wrote, so the two cannot drift
+    // apart silently (#535).
+    {
+        const std::vector<std::string> gate_lines = log_lines_with(log, "\"event\":\"shader_gate\"");
+        check(!gate_lines.empty(), "the fixture wrote at least one shader_gate record");
+
+        bool order_ok = true;
+        bool classified_has_kind = true;
+        bool unclassified_lacks_kind = true;
+        bool values_have_no_space = true;
+        for (const std::string& line : gate_lines) {
+            const std::string detail = detail_of(line);
+            const size_t pso = detail.find("pso=");
+            const size_t stage = detail.find("stage=");
+            const size_t decision = detail.find("decision=");
+            const size_t hr = detail.find("hr=");
+            // The summarizer extracts these by key, so the order the emitter
+            // writes them is the order it relies on. Every key must be present:
+            // a missing one is npos, the largest value, which would satisfy `<`.
+            const bool all_present = pso != std::string::npos && stage != std::string::npos &&
+                                     decision != std::string::npos && hr != std::string::npos;
+            if (!(all_present && pso < stage && stage < decision && decision < hr)) {
+                order_ok = false;
+            }
+            const bool unclassified = detail.find("unclassified") != std::string::npos;
+            const bool has_kind = detail.find("kind=") != std::string::npos;
+            /* A record with an inspection always logs a kind; the no-bridge records
+             * (`*_unclassified`) and `pass_uninspected` have none. */
+            const bool classified = !unclassified &&
+                                    (detail.find("decision=pass_dxil") != std::string::npos ||
+                                     detail.find("decision=reject_accc_only") != std::string::npos ||
+                                     detail.find("decision=pass_original") != std::string::npos ||
+                                     detail.find("decision=prepare_failed") != std::string::npos ||
+                                     detail.find("decision=copy_limit") != std::string::npos);
+            if (unclassified && has_kind) unclassified_lacks_kind = false;
+            if (classified && !has_kind) classified_has_kind = false;
+            for (const std::string& token : structured_tokens(detail, false)) {
+                if (token.find('=') == std::string::npos) values_have_no_space = false;
+            }
+        }
+        check(order_ok, "every shader_gate record writes pso, stage, decision, hr in that order");
+        check(classified_has_kind, "a classified shader_gate record carries kind=");
+        check(unclassified_lacks_kind, "an unclassified record carries no kind=");
+        check(values_have_no_space,
+              "no key=value in a shader_gate record is split by a space, which is what "
+              "parse_key_values(..., false) assumes");
+
+        const std::vector<std::string> gap_lines = log_lines_with(log, "\"event\":\"shader_d3dmetal_gap\"");
+        check(!gap_lines.empty(), "the fixture wrote at least one gap record");
+        bool gap_ok = true;
+        bool gap_values_have_no_space = true;
+        for (const std::string& line : gap_lines) {
+            const std::string detail = detail_of(line);
+            if (detail.find("pso=") == std::string::npos ||
+                detail.find("stage=") == std::string::npos ||
+                detail.find("wave_lanes_min=") == std::string::npos ||
+                detail.find(':') == std::string::npos) {
+                gap_ok = false;
+            }
+            // parse_key_values(..., true) stops at the first token without
+            // '=', so every structured token must be a key=value pair.
+            for (const std::string& token : structured_tokens(detail, true)) {
+                if (token.find('=') == std::string::npos) gap_values_have_no_space = false;
+            }
+        }
+        check(gap_ok,
+              "every gap record carries pso=, stage=, wave_lanes_min= and the colon "
+              "that ends its structured part");
+        check(gap_values_have_no_space,
+              "no key=value in a gap record's structured part is split by a space, which is "
+              "what parse_key_values(..., true) assumes");
+    }
+
     char fill_bytes[32];
     std::snprintf(fill_bytes, sizeof(fill_bytes), "bytes=%u ", static_cast<unsigned>(sizeof(g_fill_cs66)));
     check(log_has(log, {"\"event\":\"shader_gate\"", "pso=compute", "decision=pass_dxil", "kind=dxil", "sm=6.6",
@@ -448,8 +697,19 @@ int main() {
           "shader_gate record rejecting the ACCC-only compute shader");
     check(log_has(log, {"\"event\":\"shader_gate\"", "pso=graphics", "stage=VS", "decision=reject_accc_only"}),
           "shader_gate record rejecting the ACCC-only vertex shader");
-    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=pass_dxil", "wave_ops=1", "wave_lanes=64-64"}),
-          "shader_gate record with WaveSize(64)");
+    check(log_has(log, {"\"event\":\"shader_gate\"", "pso=stream", "stage=CS", "decision=reject_accc_only"}),
+          "shader_gate record rejecting the ACCC-only stream compute shader");
+    check(log_has(log, {"\"event\":\"shader_gate\"", "pso=stream", "stage=CS", "decision=pass_dxil"}),
+          "shader_gate record passing the DXIL stream compute shader");
+    check(log_has(log, {"\"event\":\"pso_stream\"", "shaders_not_parsed=0"}),
+          "pso_stream record says the stream's shaders were parsed");
+    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=reject_wave_wide", "hr=0x80004001"}),
+          "shader_gate record refusing the wave64 stage");
+    // The wave64 stage is now refused before `pass_dxil` is logged (#591), so the record to
+    // assert is the rejection, carrying the same wave constraints the gap was measured on.
+    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=reject_wave_wide", "wave_ops=1",
+                        "wave_lanes=64-64"}),
+          "shader_gate record with WaveSize(64), refused");
     check(log_has(log, {"\"event\":\"shader_d3dmetal_gap\"", "wave_lanes_min=64"}),
           "shader_d3dmetal_gap record for WaveSize(64)");
     check(log_has(log, {"\"event\":\"shader_gate\"", "decision=pass_dxil", "int64_ops=1", "atomic64=typed,"}),

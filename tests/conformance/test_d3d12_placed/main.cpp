@@ -26,10 +26,21 @@
 extern "C" {
 __declspec(dllimport) HRESULT WINAPI D3D12ConfigureVirtualMemoryX(void* config);
 __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(void* params, REFIID riid, void** ppv);
+__declspec(dllimport) PVOID WINAPI XMemAlloc(SIZE_T size, uint64_t attributes);
+__declspec(dllimport) VOID WINAPI XMemFree(PVOID address, uint64_t attributes);
 __declspec(dllimport) BOOL WINAPI XMemAllocatePhysicalPages(SIZE_T* count, PULONG_PTR pages, uint64_t flags);
 __declspec(dllimport) BOOL WINAPI XMemFreePhysicalPages(SIZE_T* count, PULONG_PTR pages, uint64_t flags);
 __declspec(dllimport) PVOID WINAPI XMemMapPhysicalPages(PVOID base, SIZE_T count, uint64_t flags, PULONG_PTR pages);
+__declspec(dllimport) BOOL WINAPI XMemGetWorkingSetStatistics(PVOID out_stats, SIZE_T stats_size);
 }
+
+struct bx_xmem_stats_t {
+    uint64_t title_limit_bytes;
+    uint64_t committed_virtual_bytes;
+    uint64_t allocated_physical_bytes;
+    uint64_t peak_committed_bytes;
+};
+static_assert(sizeof(bx_xmem_stats_t) == 32, "xmem stats struct is 32 bytes");
 
 struct BxD3d12VirtualMemoryConfig {
     uint32_t magic;
@@ -77,6 +88,7 @@ static_assert(kFootprint <= kAlign, "texture footprint fits in one 64 KiB page")
 static_assert(kRegionBytes == 128ull * 1024ull, "configured region is 128 KiB");
 
 int g_checks = 0;
+int g_skipped = 0;
 int g_failures = 0;
 
 __attribute__((format(gnu_printf, 2, 3)))
@@ -414,6 +426,51 @@ void check_placed_heap_charge(ID3D12Device* device, const char* log_path, uint64
     }
 }
 
+/* #552: graphics-first / xmem-first pairing through the public exports.
+ * With a 512 MiB cap, a 300 MiB D3D12 heap registers an external charge in
+ * xmem. A 300 MiB XMemAlloc must then fail (300+300 > 512), and a 200 MiB
+ * XMemAlloc must succeed (300+200 <= 512). After releasing the heap the
+ * 300 MiB XMemAlloc must succeed. This is the graphics-first overcommit
+ * that the private-ledger version allowed. */
+void check_graphics_xmem_pairing(ID3D12Device* device, uint64_t cap) {
+    if (cap != (512ull << 20)) {
+        /* The pairing sizes are fixed against a 512 MiB cap, so at any other cap the
+         * cross-DLL budget check does not run. Say so rather than pass silently. */
+        ++g_skipped;
+        std::printf("SKIP: graphics/xmem pairing needs a 512 MiB cap "
+                    "(BX_MEM_LIMIT_MB=512 bx-cli run --inherit-env ...); this run's cap is %llu MiB\n",
+                    static_cast<unsigned long long>(cap >> 20));
+        return;
+    }
+    const uint64_t heap_bytes = 300ull << 20;
+    const auto heap_desc = heap_of(D3D12_HEAP_TYPE_UPLOAD, heap_bytes, D3D12_HEAP_FLAG_NONE);
+    ID3D12Heap* heap = nullptr;
+    HRESULT hr = device->CreateHeap(&heap_desc, __uuidof(ID3D12Heap), reinterpret_cast<void**>(&heap));
+    if (!check(hr == S_OK && heap, "pairing: 300 MiB graphics heap hr=0x%08lx", ul(hr))) {
+        return;
+    }
+
+    bx_xmem_stats_t stats{};
+    check(XMemGetWorkingSetStatistics(&stats, sizeof(stats)) != 0, "pairing: xmem stats readable");
+
+    /* 300 MiB heap + 300 MiB xmem = 600 MiB > 512 MiB cap. */
+    void* too_much = XMemAlloc(300ull << 20, 0);
+    check(too_much == nullptr, "pairing: 300 MiB XMemAlloc on top of 300 MiB heap exceeds the 512 MiB cap");
+    if (too_much) XMemFree(too_much, 0);
+
+    /* 300 MiB heap + 200 MiB xmem = 500 MiB <= 512 MiB cap. */
+    void* fits = XMemAlloc(200ull << 20, 0);
+    check(fits != nullptr, "pairing: 200 MiB XMemAlloc fits beside the 300 MiB heap");
+    if (fits) XMemFree(fits, 0);
+
+    heap->Release();
+
+    /* After the heap charge is released the 300 MiB allocation must fit. */
+    void* after = XMemAlloc(300ull << 20, 0);
+    check(after != nullptr, "pairing: 300 MiB XMemAlloc fits after releasing the graphics heap");
+    if (after) XMemFree(after, 0);
+}
+
 /* CreatePlacedResource1 must accept a heap from CreateHeap. CreatePlacedResource2
    is checked only when the host device implements ID3D12Device10. */
 void check_newer_placement(ID3D12Device* device) {
@@ -571,6 +628,9 @@ int main() {
         return 1;
     }
     const char* profile = cfg->profile == BX_PROFILE_ANACONDA ? "anaconda" : "lockhart";
+    char log_path[MAX_PATH];
+    DWORD log_len = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
+    const bool have_log = log_len > 0 && log_len < sizeof(log_path);
 
     check(D3D12ConfigureVirtualMemoryX(nullptr) == S_OK, "null configuration is a logged stub that returns S_OK");
 
@@ -1239,9 +1299,6 @@ int main() {
         }
     }
 
-    char log_path[MAX_PATH];
-    DWORD log_len = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
-    const bool have_log = log_len > 0 && log_len < sizeof(log_path);
     std::printf("RESULT: cpu_va=0x%llx map=0x%llx buffer_gpu_va=0x%llx flush=%d copy_buffer=%u/%u copy_texture=%u/%u "
                 "texture_path=%s cpu_after_gpu=%u/%u small_align=%llu upload_100000=%llu\n",
                 static_cast<unsigned long long>(cpu_va), static_cast<unsigned long long>(map_pointer),
@@ -1294,6 +1351,10 @@ int main() {
         check_placed_heap_charge(device, log_path, region_base, cfg->title_memory_limit_bytes);
     }
 
+    if (device) {
+        check_graphics_xmem_pairing(device, cfg->title_memory_limit_bytes);
+    }
+
     /*
      * An ordinary heap AddRefs its device, matching BxChildProxy. Releasing the
      * caller's device reference must leave the proxy alive for GetDevice.
@@ -1339,6 +1400,9 @@ int main() {
      */
     check_newer_placement(device);
 
+    uint64_t host_before = 0;
+    uint64_t host_ignored = 0;
+    int host_before_count = 0;
     if (backing) {
         BxD3d12VirtualMemoryConfig detached = make_block(0, 0, kFlagBacking);
         const HRESULT away = D3D12ConfigureVirtualMemoryX(&detached);
@@ -1370,6 +1434,10 @@ int main() {
         SetEnvironmentVariableA("BX_D3D12_FORCE_BACKING_REPLACE", nullptr);
         check(hr == S_OK && replaced && !same_object(replaced, backing),
               "forced host replacement publishes a different backing heap hr=0x%08lx", ul(hr));
+        if (have_log) {
+            /* Capture the device whose forced replacement heap remains in the cache. */
+            log_u64_ends(log_path, "host_device=", &host_ignored, &host_before, &host_before_count);
+        }
         check(get_device_closed(backing), "GetDevice on the heap replaced by another host device fails closed");
         const ULONG left = device->Release();
         check(left == 0, "proxy released to zero while the replaced heap is still held (refs=%lu)", left);
@@ -1405,11 +1473,9 @@ int main() {
         if (dead) dead->Release();
     }
 
-    uint64_t host_before = 0;
-    uint64_t host_ignored = 0;
-    int host_before_count = 0;
+    uint64_t latest_host_before_b = 0;
     if (have_log) {
-        log_u64_ends(log_path, "host_device=", &host_ignored, &host_before, &host_before_count);
+        log_u64_ends(log_path, "host_device=", &host_ignored, &latest_host_before_b, &host_before_count);
     }
     check(SetEnvironmentVariableA("BX_D3D12_REUSE_BACKING_HOST", "1") != 0,
           "test hook BX_D3D12_REUSE_BACKING_HOST=1 is set");
@@ -1468,9 +1534,9 @@ int main() {
         std::fprintf(stderr, "FAIL: test_d3d12_placed (%d of %d checks failed)\n", g_failures, g_checks);
         return 1;
     }
-    std::printf("PASS: test_d3d12_placed (%d checks passed, buffer %u/%u bytes, texture %u/%u bytes, "
+    std::printf("PASS: test_d3d12_placed (%d checks passed, %d skipped, buffer %u/%u bytes, texture %u/%u bytes, "
                 "texture_path=%s, cpu_after_gpu %u/%u, small_align=%llu, upload_100000=%llu)\n",
-                g_checks, buf_match, kBufBytes, tex_match, kFootprint, texture_path, reverse_match, kBufBytes,
+                g_checks, g_skipped, buf_match, kBufBytes, tex_match, kFootprint, texture_path, reverse_match, kBufBytes,
                 static_cast<unsigned long long>(small_align), static_cast<unsigned long long>(odd_size));
     return 0;
 }

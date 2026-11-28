@@ -1,5 +1,6 @@
 //! Track A (M1-A1): Native ARM64 macOS CLI for BetterXen hybrid execution.
 
+mod drives;
 mod stage;
 mod supervise;
 
@@ -13,7 +14,7 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
 use bx_probe::{ShimTrack, classify_dll, probe_pe32_plus};
-use bx_telemetry::{TrapCount, summarize_jsonl};
+use bx_telemetry::{ShaderGap, ShaderGapGroup, TraceSummary, TrapCount, summarize_jsonl};
 use dxbc_accc::inspect_dxbc;
 use supervise::{Outcome, Stop};
 
@@ -40,18 +41,16 @@ const HOST_ENV_ALLOWLIST: &[&str] = &[
     "XPC_SERVICE_NAME",
 ];
 
-fn print_usage() {
-    eprintln!(
-        "BetterXen Hybrid CLI (bx-cli)\n\
-         \n\
-         Usage:\n\
-           bx-cli doctor                         Inspect Apple Silicon host, Rosetta 2, CrossOver & mingw-w64\n\
-           bx-cli probe <pe32+_path>             Classify PE32+ imports by BetterXen track (A-E)\n\
-           bx-cli shader <dxbc_blob_path>        Classify a DXBC shader container (DXIL vs ACCC/FSPX)\n\
-           bx-cli trace <log.jsonl>              Summarize bx_runtime_veh JSONL diagnostics\n\
-           bx-cli run --exe <path> [--shims <dir>] [--bottle <name> | --prefix <dir>] [--profile lockhart|anaconda] [--log <path>] [--inherit-env] [--timeout <secs>] [--backend d3dmetal|dxmt|dxvk|wined3d (needs --bottle)]\n\
-           (shims default to build-shims/bin; a timeout or signal stops the whole bottle or prefix)\n"
-    );
+fn usage_text() -> &'static str {
+    "BetterXen Hybrid CLI (bx-cli)\n\
+     \n\
+     Usage:\n\
+       bx-cli doctor                         Inspect Apple Silicon host, Rosetta 2, CrossOver & mingw-w64\n\
+       bx-cli probe <pe32+_path>             Classify PE32+ imports by BetterXen track (A-E)\n\
+       bx-cli shader <dxbc_blob_path>        Classify a DXBC shader container (DXIL vs ACCC/FSPX)\n\
+       bx-cli trace <log.jsonl>              Summarize bx_runtime_veh JSONL diagnostics\n\
+       bx-cli run --exe <path> [--shims <dir>] [--bottle <name> | --prefix <dir>] [--profile lockhart|anaconda] [--log <path>] [--inherit-env] [--timeout <secs>] [--backend d3dmetal|dxmt|dxvk|wined3d (needs --bottle)]\n\
+       (shims default to build-shims/bin; a timeout or signal stops the whole bottle or prefix)\n"
 }
 
 fn run_capture(program: &str, args: &[&str]) -> Option<String> {
@@ -182,6 +181,158 @@ fn format_amd_trap_line(name: &str, count: &TrapCount) -> String {
     }
 }
 
+/// True when the log carried any shader-gate evidence. A log without it must render exactly as
+/// it did before the gate summary existed.
+fn has_shader_gate(summary: &TraceSummary) -> bool {
+    summary.shader_gate.total > 0
+        || !summary.shader_gaps.is_empty()
+        || !summary.shader_bridge_missing.is_empty()
+}
+
+/// One `label : value` line in the same column as the other trace lines.
+fn format_shader_line(label: &str, value: impl std::fmt::Display) -> String {
+    format!("{label:<19} : {value}\n")
+}
+
+/// A titled block of `{count:5}x  {name}` lines, or nothing when there is nothing to count.
+fn format_count_list(title: &str, counts: &BTreeMap<String, usize>) -> String {
+    if counts.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\n{title}:\n");
+    for (name, count) in counts {
+        let _ = writeln!(out, "  {count:5}x  {name}");
+    }
+    out
+}
+
+/// One `shader_d3dmetal_gap` record: the pipeline, stage, wave width it needs, and the 64-bit
+/// atomic feature flags that made it a gap. Missing fields say `unknown` rather than being lost.
+fn format_shader_gap_line(gap: &ShaderGap) -> String {
+    format!(
+        "  pso={} stage={} wave_lanes_min={} atomic64_flags={}\n",
+        gap.pso.as_deref().unwrap_or("unknown"),
+        gap.stage.as_deref().unwrap_or("unknown"),
+        gap.wave_lanes_min.as_deref().unwrap_or("unknown"),
+        gap.atomic64_flags.as_deref().unwrap_or("unknown"),
+    )
+}
+
+/// One `(pso, stage)` group of gap records, with its count and every distinct constraint set
+/// (#590). Missing fields say `unknown` rather than being lost.
+fn format_shader_gap_group(group: &ShaderGapGroup) -> String {
+    let mut out = format!(
+        "  {:5}x  pso={} stage={}\n",
+        group.count,
+        group.pso.as_deref().unwrap_or("unknown"),
+        group.stage.as_deref().unwrap_or("unknown"),
+    );
+    for variant in &group.variants {
+        let _ = writeln!(
+            out,
+            "          wave_lanes_min={} atomic64_flags={} ({}x)",
+            variant.wave_lanes_min.as_deref().unwrap_or("unknown"),
+            variant.atomic64_flags.as_deref().unwrap_or("unknown"),
+            variant.count,
+        );
+    }
+    out
+}
+
+/// One line per gate record whose decision is not a pass, naming the pipeline,
+/// stage, decision and HRESULT. These are the records a reader needs to find a
+/// blocker; the counted breakdown alone does not say which pipeline failed
+/// (#497 review point 5).
+fn format_non_pass_decisions(gate: &bx_telemetry::ShaderGateSummary) -> String {
+    let failing: Vec<&bx_telemetry::ShaderGateRecord> = gate
+        .records
+        .iter()
+        .filter(|record| {
+            record
+                .decision
+                .as_deref()
+                .is_some_and(|decision| !decision.starts_with("pass_"))
+        })
+        .collect();
+    if failing.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\nNon-pass pipeline decisions ({}):\n", failing.len());
+    for record in failing {
+        let _ = writeln!(
+            out,
+            "  pso={} stage={} decision={} hr={}",
+            record.pso.as_deref().unwrap_or("unknown"),
+            record.stage.as_deref().unwrap_or("unknown"),
+            record.decision.as_deref().unwrap_or("unknown"),
+            record.hr.as_deref().unwrap_or("unknown"),
+        );
+    }
+    out
+}
+
+/// The shader-gate section, or an empty string for a log with no gate evidence.
+fn format_shader_gate_section(summary: &TraceSummary) -> String {
+    if !has_shader_gate(summary) {
+        return String::new();
+    }
+    let gate = &summary.shader_gate;
+    let mut out = String::from("\nShader gate:\n");
+    out.push_str(&format_shader_line("shader_gate records", gate.total));
+    if gate.unparsed > 0 {
+        out.push_str(&format_shader_line("unparsed details", gate.unparsed));
+    }
+    if gate.missing_decision > 0 {
+        out.push_str(&format_shader_line(
+            "records w/o decision",
+            gate.missing_decision,
+        ));
+    }
+    out.push_str(&format_count_list("decisions", &gate.decisions));
+    out.push_str(&format_count_list("kinds", &gate.kinds));
+    out.push_str(&format_count_list("stages", &gate.stages));
+    out.push_str(&format_non_pass_decisions(gate));
+    if !summary.shader_gaps.is_empty() {
+        let _ = writeln!(out, "\nD3DMetal gaps ({}):", summary.shader_gaps.len());
+        for gap in &summary.shader_gaps {
+            out.push_str(&format_shader_gap_line(gap));
+        }
+        // #590: the same records grouped by pipeline and stage, so a reader can tell which
+        // pipelines are created-but-not-run. Additive: the per-record list above is unchanged.
+        let _ = writeln!(
+            out,
+            "\nD3DMetal gaps by kind/stage ({}):",
+            summary.shader_gap_groups.len()
+        );
+        for group in &summary.shader_gap_groups {
+            out.push_str(&format_shader_gap_group(group));
+        }
+        if summary.shader_gaps_missing_identity > 0 {
+            out.push_str(&format_shader_line(
+                "gaps w/o pso/stage",
+                summary.shader_gaps_missing_identity,
+            ));
+        }
+        if summary.shader_gaps_missing_constraints > 0 {
+            out.push_str(&format_shader_line(
+                "gaps w/o constraints",
+                summary.shader_gaps_missing_constraints,
+            ));
+        }
+    }
+    if !summary.shader_bridge_missing.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nShader bridge missing ({}):",
+            summary.shader_bridge_missing.len()
+        );
+        for message in &summary.shader_bridge_missing {
+            let _ = writeln!(out, "  {message}");
+        }
+    }
+    out
+}
+
 fn cmd_trace(path: &str) -> ExitCode {
     let text = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -213,7 +364,7 @@ fn render_trace(text: &str) -> String {
             "\nUnhandled exceptions ({}):",
             summary.unhandled_exceptions.len()
         );
-        for crash in summary.unhandled_exceptions {
+        for crash in &summary.unhandled_exceptions {
             let _ = writeln!(
                 out,
                 "  code={} module_base={} + RVA={} RIP={}",
@@ -226,16 +377,17 @@ fn render_trace(text: &str) -> String {
     }
     if !summary.unimpl_apis.is_empty() {
         let _ = writeln!(out, "\nUnimplemented APIs:");
-        for (api, count) in summary.unimpl_apis {
+        for (api, count) in &summary.unimpl_apis {
             let _ = writeln!(out, "  {count:5}x  {api}");
         }
     }
     if !summary.unimpl_vtables.is_empty() {
         let _ = writeln!(out, "\nUnimplemented COM vtable slots:");
-        for (slot, count) in summary.unimpl_vtables {
+        for (slot, count) in &summary.unimpl_vtables {
             let _ = writeln!(out, "  {count:5}x  {slot}");
         }
     }
+    out.push_str(&format_shader_gate_section(&summary));
     out
 }
 
@@ -590,12 +742,28 @@ struct LogMark {
     tail: Vec<u8>,
 }
 
-/// The mark of the log at `path`, or `None` if there is no readable log yet.
+/// Opens `path` for reading only if it is a regular file.
+///
+/// `--log` can name anything. Opening a FIFO nobody writes to, or reading a terminal to its end,
+/// would block the run before the guest starts or after it has finished, so the open never
+/// waits and anything that is not a regular file is treated as having no log to summarize.
+fn open_regular_log(path: &Path) -> Option<(fs::File, fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    // Checked on the open handle, so the file cannot be swapped between the check and the read.
+    let meta = file.metadata().ok()?;
+    meta.is_file().then_some((file, meta))
+}
+
+/// The mark of the log at `path`, or `None` if there is no readable regular-file log yet.
 fn log_mark(path: &Path) -> Option<LogMark> {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::MetadataExt;
-    let mut file = fs::File::open(path).ok()?;
-    let meta = file.metadata().ok()?;
+    let (mut file, meta) = open_regular_log(path)?;
     let len = meta.len();
     let tail_len = len.min(LOG_MARK_TAIL);
     file.seek(SeekFrom::Start(len - tail_len)).ok()?;
@@ -612,8 +780,7 @@ fn log_mark(path: &Path) -> Option<LogMark> {
 fn read_log(path: &Path) -> Option<((u64, u64), Vec<u8>)> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
-    let mut file = fs::File::open(path).ok()?;
-    let meta = file.metadata().ok()?;
+    let (mut file, meta) = open_regular_log(path)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
     Some(((meta.dev(), meta.ino()), bytes))
@@ -692,6 +859,18 @@ fn cmd_run(args: &[String]) -> ExitCode {
     supervise::install_signal_handlers();
     let started = Instant::now();
 
+    // Drive links are prefix-global. Keep them stable until this guest exits so another bx-cli
+    // process cannot retarget G: underneath a running title. Taken before system32 staging, so
+    // a run refused here has not touched the shared prefix. Runs sharing a prefix are therefore
+    // serial: a second launcher on the same prefix is refused while the first is running.
+    let _drive_lock = match drives::lock_drive_mappings(&environment_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            diag(format_args!("error: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
     // #457: shims loaded with LOAD_LIBRARY_SEARCH_SYSTEM32 never see WINEPATH, so they are
     // copied into the environment's system32 first. A bare prefix is initialized for that.
     let system32 = stage::system32_dir(&environment_dir);
@@ -751,6 +930,25 @@ fn cmd_run(args: &[String]) -> ExitCode {
             ));
             return ExitCode::FAILURE;
         }
+    }
+
+    // An Xbox title opens its package on G: and writes temporary files to T:. A missing drive
+    // only matters to such a title, so it is reported and the run goes on.
+    match abs_exe.parent() {
+        Some(package_dir) => match drives::map_xbox_drives(&environment_dir, package_dir) {
+            Ok(mappings) => {
+                for mapping in &mappings {
+                    match mapping {
+                        drives::Mapping::Foreign { .. } => diag(mapping.describe()),
+                        _ => diag(format_args!("bx-cli: {}", mapping.describe())),
+                    }
+                }
+            }
+            Err(e) => diag(format_args!(
+                "warning: Xbox drives G: and T: not mapped: {e}"
+            )),
+        },
+        None => diag("warning: Xbox drive G: not mapped: the executable has no parent directory"),
     }
 
     let mut cmd = if let Some(ref bname) = bottle {
@@ -923,22 +1121,66 @@ fn cmd_shader(path: &str) -> ExitCode {
     }
 }
 
+/// What a bare invocation of `bx-cli` should do. Split out from `main` so the
+/// choice is testable without spawning a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dispatch<'a> {
+    /// An explicit `--help` / `-h` / `help`: usage on stdout, succeed.
+    Help,
+    /// Nothing was asked for: usage on stderr, fail as a usage error.
+    NoArgs,
+    /// An unrecognised subcommand: usage on stderr, fail.
+    Unknown(&'a str),
+    /// A real subcommand.
+    Sub(&'a str),
+}
+
+impl<'a> Dispatch<'a> {
+    fn classify(args: &'a [String]) -> Self {
+        let Some(sub) = args.first() else {
+            return Dispatch::NoArgs;
+        };
+        match sub.as_str() {
+            "--help" | "-h" | "help" => Dispatch::Help,
+            "doctor" | "probe" | "shader" | "trace" | "run" => Dispatch::Sub(sub.as_str()),
+            _ => Dispatch::Unknown(sub.as_str()),
+        }
+    }
+
+    /// True when the usage text goes to stdout rather than stderr.
+    fn usage_on_stdout(self) -> bool {
+        matches!(self, Dispatch::Help)
+    }
+
+    /// True when the invocation must not report success.
+    fn is_usage_error(self) -> bool {
+        matches!(self, Dispatch::NoArgs | Dispatch::Unknown(_))
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let Some(sub) = args.first() else {
-        print_usage();
-        return ExitCode::SUCCESS;
-    };
-    match sub.as_str() {
-        "doctor" => cmd_doctor(),
-        "probe" if args.len() >= 2 => cmd_probe(&args[1]),
-        "shader" if args.len() >= 2 => cmd_shader(&args[1]),
-        "trace" if args.len() >= 2 => cmd_trace(&args[1]),
-        "run" => cmd_run(&args[1..]),
-        _ => {
-            print_usage();
-            ExitCode::FAILURE
-        }
+    let dispatch = Dispatch::classify(&args);
+    if dispatch.usage_on_stdout() {
+        print!("{}", usage_text());
+    } else if dispatch.is_usage_error() {
+        eprint!("{}", usage_text());
+    }
+    match dispatch {
+        Dispatch::Help => ExitCode::SUCCESS,
+        Dispatch::NoArgs | Dispatch::Unknown(_) => ExitCode::FAILURE,
+        Dispatch::Sub(sub) => match sub {
+            "doctor" => cmd_doctor(),
+            "probe" if args.len() >= 2 => cmd_probe(&args[1]),
+            "shader" if args.len() >= 2 => cmd_shader(&args[1]),
+            "trace" if args.len() >= 2 => cmd_trace(&args[1]),
+            "run" => cmd_run(&args[1..]),
+            // Only reachable when a subcommand that needs an argument got none.
+            _ => {
+                eprint!("{}", usage_text());
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
@@ -1056,6 +1298,54 @@ mod tests {
             summarize_jsonl(&String::from_utf8_lossy(fresh)).total_lines,
             3
         );
+    }
+
+    #[test]
+    fn a_different_file_is_new_in_full_even_when_it_starts_with_the_old_bytes() {
+        // Only the file identity can tell these apart: the replacement begins with exactly the
+        // old log's bytes and then has more, so the bytes before the old end still match.
+        let old = "{\"event\":\"unimpl_api\",\"detail\":\"old.dll!Earlier\"}\n";
+        let more = "{\"event\":\"unimpl_api\",\"detail\":\"new.dll!ThisRun\"}\n";
+        let replacement = format!("{old}{more}");
+        let before = mark((1, 100), old);
+        let fresh = appended_since(replacement.as_bytes(), (1, 200), Some(&before));
+        assert_eq!(fresh, replacement.as_bytes());
+        // Control: the same bytes in the same file are an append, and only the rest is new.
+        let appended = appended_since(replacement.as_bytes(), (1, 100), Some(&before));
+        assert_eq!(appended, more.as_bytes());
+    }
+
+    #[test]
+    fn a_log_path_that_is_not_a_regular_file_never_blocks_the_run() {
+        let dir = env::temp_dir().join(format!("bx-cli-lognonfile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("trace.fifo");
+        let made = Command::new("/usr/bin/mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        // A FIFO with no writer: a plain open for reading would wait here forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((log_mark(&probe), read_log(&probe)));
+        });
+        let (mark_of_fifo, contents_of_fifo) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reading a FIFO log path blocked");
+        assert_eq!(mark_of_fifo, None);
+        assert_eq!(contents_of_fifo, None);
+        // A directory and a missing path are not logs either; a regular file still is.
+        assert_eq!(log_mark(&dir), None);
+        assert_eq!(read_log(&dir), None);
+        assert_eq!(log_mark(&dir.join("absent")), None);
+        let real = dir.join("trace.jsonl");
+        fs::write(&real, "{}\n").unwrap();
+        assert_eq!(log_mark(&real).map(|m| m.len), Some(3));
+        assert_eq!(
+            read_log(&real).map(|(_, bytes)| bytes),
+            Some(b"{}\n".to_vec())
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1407,5 +1697,198 @@ sub setup_bottle_wineprefix {
             format_clwb_line(3, Some(4)),
             "clwb VEH traps     : at least 4 (sampled)"
         );
+    }
+
+    #[test]
+    fn a_log_without_shader_gate_records_renders_as_before() {
+        let log = r#"{"ts_ms":10,"tid":1,"level":"INFO","sub":"runtime_veh","event":"clwb_trapped","detail":"rip=0x1000 len=4 total_traps=1"}
+{"ts_ms":12,"tid":1,"level":"WARN","sub":"stub","event":"unimpl_api","detail":"d3d12_xs.dll!D3D12XboxCreateDevice"}
+{"ts_ms":16,"tid":1,"level":"WARN","sub":"com_vtable","event":"unimpl_vtable","detail":"ID3D12Device11[44]::CreatePlacedResourceX"}
+"#;
+        let rendered = render_trace(log);
+        assert!(!rendered.contains("Shader"), "{rendered}");
+        assert!(!rendered.contains("shader_gate"), "{rendered}");
+        assert_eq!(
+            rendered,
+            "Trace events       : 3\n\
+             clwb VEH traps     : at least 1 (sampled)\n\
+             ADX illegal ops    : 0\n\
+             \n\
+             Unimplemented APIs:\n\
+             \x20     1x  d3d12_xs.dll!D3D12XboxCreateDevice\n\
+             \n\
+             Unimplemented COM vtable slots:\n\
+             \x20     1x  ID3D12Device11[44]::CreatePlacedResourceX\n"
+        );
+        assert_eq!(format_shader_gate_section(&summarize_jsonl(log)), "");
+    }
+
+    #[test]
+    fn renders_decisions_kinds_stages_gaps_and_missing_bridge() {
+        // Realistic records, matching the emitter in shims/d3d12_xs/shader_gate.cpp.
+        let log = r#"{"ts_ms":10,"tid":1,"level":"INFO","sub":"d3d12_xs","event":"shader_gate","detail":"pso=compute stage=CS decision=pass_dxil hr=0x00000000 kind=dxil shader_stage=5 sm=6.6 bytes=1234 dxil=800 accc=0 sfi0=0x4000 wave_ops=1 int64_ops=0 atomic64=typed, wave_lanes=64-64"}
+{"ts_ms":12,"tid":1,"level":"WARN","sub":"d3d12_xs","event":"shader_gate","detail":"pso=graphics stage=VS decision=reject_accc_only hr=0x80004001 kind=accc_only shader_stage=0 sm=6.0 bytes=2048 dxil=0 accc=512 sfi0=0x0 wave_ops=0 int64_ops=0 atomic64= wave_lanes=none"}
+{"ts_ms":16,"tid":1,"level":"WARN","sub":"d3d12_xs","event":"shader_d3dmetal_gap","detail":"pso=compute stage=CS wave_lanes_min=64 atomic64_flags=0x400000: D3DMetal creates such pipelines but does not run them (#453)"}
+{"ts_ms":18,"tid":1,"level":"WARN","sub":"d3d12_xs","event":"shader_bridge_missing","detail":"bx_shader_bridge.dll not found beside d3d12_xs.dll; shaders pass unclassified, ACCC-only refused"}
+"#;
+        let rendered = render_trace(log);
+        assert!(rendered.contains("Shader gate:"), "{rendered}");
+        assert!(rendered.contains("shader_gate records : 2"), "{rendered}");
+        assert!(rendered.contains("decisions:"), "{rendered}");
+        assert!(rendered.contains("    1x  pass_dxil"), "{rendered}");
+        assert!(rendered.contains("    1x  reject_accc_only"), "{rendered}");
+        assert!(rendered.contains("kinds:"), "{rendered}");
+        assert!(rendered.contains("    1x  dxil"), "{rendered}");
+        assert!(rendered.contains("    1x  accc_only"), "{rendered}");
+        assert!(rendered.contains("stages:"), "{rendered}");
+        assert!(rendered.contains("    1x  CS"), "{rendered}");
+        assert!(rendered.contains("    1x  VS"), "{rendered}");
+        assert!(rendered.contains("D3DMetal gaps (1):"), "{rendered}");
+        assert!(
+            rendered.contains("  pso=compute stage=CS wave_lanes_min=64 atomic64_flags=0x400000"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Shader bridge missing (1):"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("bx_shader_bridge.dll not found beside d3d12_xs.dll"),
+            "{rendered}"
+        );
+        // #497 review point 5: name the rejected pipeline and its HRESULT, not just a count.
+        assert!(
+            rendered.contains("Non-pass pipeline decisions (1):"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("pso=graphics stage=VS decision=reject_accc_only hr=0x80004001"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("decision=pass_dxil hr="), "{rendered}");
+        assert!(!rendered.contains("unparsed"), "{rendered}");
+    }
+
+    #[test]
+    fn an_unparsable_shader_gate_detail_shows_the_unparsed_count() {
+        let log = r#"{"ts_ms":20,"tid":1,"level":"INFO","sub":"d3d12_xs","event":"shader_gate","detail":"garbage"}
+{"ts_ms":22,"tid":1,"level":"INFO","sub":"d3d12_xs","event":"shader_gate","detail":"pso=compute stage=CS decision=pass_dxil hr=0x00000000 kind=dxil shader_stage=5 sm=6.6 bytes=100 dxil=64 accc=0 sfi0=0x0 wave_ops=0 int64_ops=0 atomic64= wave_lanes=0-4294967295"}
+"#;
+        let rendered = render_trace(log);
+        assert!(rendered.contains("shader_gate records : 2"), "{rendered}");
+        assert!(rendered.contains("unparsed details    : 1"), "{rendered}");
+        assert!(rendered.contains("    1x  pass_dxil"), "{rendered}");
+    }
+
+    /// The usage paths must not be inverted: an explicit `--help` succeeded,
+    /// a bare invocation did nothing, and an unknown subcommand is an error.
+    #[test]
+    fn help_succeeds_on_stdout_and_a_bare_invocation_is_a_usage_error() {
+        for flag in ["--help", "-h", "help"] {
+            let argv = args(&[flag]);
+            let dispatch = Dispatch::classify(&argv);
+            assert_eq!(
+                dispatch,
+                Dispatch::Help,
+                "{flag} is an explicit help request"
+            );
+            assert!(dispatch.usage_on_stdout(), "{flag} prints usage on stdout");
+            assert!(!dispatch.is_usage_error(), "{flag} must exit 0");
+        }
+
+        let empty: Vec<String> = Vec::new();
+        let none = Dispatch::classify(&empty);
+        assert_eq!(none, Dispatch::NoArgs);
+        assert!(!none.usage_on_stdout(), "a bare invocation writes stderr");
+        assert!(
+            none.is_usage_error(),
+            "a bare invocation did nothing, so it must not report success"
+        );
+
+        let bogus_argv = args(&["definitely-not-a-subcommand"]);
+        let bogus = Dispatch::classify(&bogus_argv);
+        assert_eq!(bogus, Dispatch::Unknown("definitely-not-a-subcommand"));
+        assert!(
+            !bogus.usage_on_stdout(),
+            "an unknown subcommand writes stderr"
+        );
+        assert!(bogus.is_usage_error(), "an unknown subcommand is an error");
+
+        for real in ["doctor", "probe", "shader", "trace", "run"] {
+            let argv = args(&[real]);
+            let dispatch = Dispatch::classify(&argv);
+            assert_eq!(dispatch, Dispatch::Sub(real), "{real} is a real subcommand");
+            assert!(!dispatch.usage_on_stdout(), "{real} prints no usage");
+            assert!(!dispatch.is_usage_error(), "{real} is not a usage error");
+        }
+    }
+
+    /// The usage text must name every subcommand, so the classifier above is
+    /// not testing a table that nothing prints.
+    #[test]
+    fn the_usage_text_names_every_subcommand() {
+        let text = usage_text();
+        assert!(
+            text.contains("BetterXen Hybrid CLI"),
+            "usage carries the banner"
+        );
+        for sub in ["doctor", "probe", "shader", "trace", "run"] {
+            assert!(text.contains(sub), "usage documents {sub}");
+        }
+    }
+
+    /// #590: the grouped view names each `(pso, stage)` pair with its count, wave width and
+    /// 64-bit-atomic flags, in first-seen order, and says when a record lost its identity.
+    #[test]
+    fn renders_gaps_grouped_by_pipeline_and_stage() {
+        let log = r#"{"event":"shader_d3dmetal_gap","detail":"pso=graphics stage=VS wave_lanes_min=64 atomic64_flags=0x0: D3DMetal creates such pipelines but does not run them (#453)"}
+{"event":"shader_d3dmetal_gap","detail":"pso=compute stage=CS wave_lanes_min=64 atomic64_flags=0x400000: D3DMetal creates such pipelines but does not run them (#453)"}
+{"event":"shader_d3dmetal_gap","detail":"pso=compute stage=CS wave_lanes_min=64 atomic64_flags=0x400000: D3DMetal creates such pipelines but does not run them (#453)"}
+{"event":"shader_d3dmetal_gap","detail":"garbage"}
+"#;
+        let rendered = render_trace(log);
+        // The #496 per-record list is unchanged.
+        assert!(rendered.contains("D3DMetal gaps (4):"), "{rendered}");
+        assert!(
+            rendered.contains("  pso=compute stage=CS wave_lanes_min=64 atomic64_flags=0x400000"),
+            "{rendered}"
+        );
+        // The additive grouped view.
+        assert!(
+            rendered.contains("D3DMetal gaps by kind/stage (3):"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("      1x  pso=graphics stage=VS"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("      2x  pso=compute stage=CS"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("          wave_lanes_min=64 atomic64_flags=0x400000 (2x)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("      1x  pso=unknown stage=unknown"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("gaps w/o pso/stage  : 1"), "{rendered}");
+        assert!(rendered.contains("gaps w/o constraints : 1"), "{rendered}");
+        // First-seen order: the graphics/VS group comes before the compute/CS one.
+        let vs = rendered.find("pso=graphics stage=VS").unwrap();
+        let cs = rendered.find("      2x  pso=compute stage=CS").unwrap();
+        assert!(vs < cs, "{rendered}");
+    }
+
+    /// #590: a run with no gap records renders no grouped section at all.
+    #[test]
+    fn a_run_with_no_gaps_renders_no_grouped_section() {
+        let log = r#"{"ts_ms":10,"tid":1,"level":"INFO","sub":"d3d12_xs","event":"shader_gate","detail":"pso=compute stage=CS decision=pass_dxil hr=0x00000000 kind=dxil shader_stage=5 sm=6.6 bytes=1234 dxil=800 accc=0 sfi0=0x4000 wave_ops=1 int64_ops=0 atomic64=typed, wave_lanes=64-64"}"#;
+        let rendered = render_trace(log);
+        assert!(rendered.contains("Shader gate:"), "{rendered}");
+        assert!(!rendered.contains("D3DMetal gaps"), "{rendered}");
+        assert!(!rendered.contains("gaps w/o"), "{rendered}");
     }
 }

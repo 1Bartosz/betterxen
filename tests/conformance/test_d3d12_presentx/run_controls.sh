@@ -54,7 +54,7 @@ expect wrong-removed-hr out "post-present device reset must return DXGI_ERROR_DE
 
 run zero-timeout-overrun zero-timeout-overrun
 must_fail zero-timeout-overrun sync
-expect zero-timeout-overrun out "WaitForIdle(0) must time out without signaling:"
+expect zero-timeout-overrun out "WaitForIdle(0) must reject zero without signaling:"
 
 if [ "$bad" -ne 0 ]; then
     echo "FAIL: run_controls (output kept in $dir)"

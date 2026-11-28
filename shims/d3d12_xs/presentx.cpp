@@ -250,19 +250,23 @@ HRESULT BxPresentSwapChain::post_present_failure(const char* event, const char* 
         log_hr(BX_LOG_ERROR, "present_device_removed", what, removed);
         return removed;
     }
-    if (is_device_removed_hr(hr)) {
-        return hr;
-    }
+    needs_idle_ = true;
     if (event) {
         log_hr(BX_LOG_ERROR, event, what, hr);
     }
-    needs_idle_ = true;
+    if (is_device_removed_hr(hr)) {
+        log_hr(BX_LOG_ERROR, "present_device_removed", what, hr);
+        return hr;
+    }
     return live_device_result;
 }
 
 HRESULT BxPresentSwapChain::idle_locked(ULONGLONG start, DWORD timeout_ms) {
     if (GetTickCount64() - start >= timeout_ms) {
-        bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "present_wait_timeout", "wait budget expired before fence signal");
+        char detail[96];
+        std::snprintf(detail, sizeof(detail), "timeout_ms=%lu wanted=%llu completed=unknown; expired before Signal",
+                      static_cast<unsigned long>(timeout_ms), static_cast<unsigned long long>(last_signaled_ + 1));
+        bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "present_wait_timeout", detail);
         return kWaitTimedOut;
     }
     UINT64 value = 0;
@@ -419,7 +423,7 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
 }
 
 HRESULT STDMETHODCALLTYPE BxPresentSwapChain::WaitForIdle(DWORD timeout_ms) {
-    if (timeout_ms == INFINITE) {
+    if (timeout_ms == 0 || timeout_ms == INFINITE) {
         return E_INVALIDARG;
     }
     if (owner_ == GetCurrentThreadId()) {

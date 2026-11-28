@@ -467,6 +467,7 @@ constexpr unsigned kSlotQueueGetDevice = 7;   /* ID3D12DeviceChild::GetDevice */
 constexpr unsigned kSlotQueueSignal = 14;     /* ID3D12CommandQueue::Signal */
 constexpr unsigned kQueueSlots = 19;          /* IUnknown through ID3D12CommandQueue::GetDesc */
 constexpr unsigned kSlotDeviceCreateFence = 36; /* ID3D12Device::CreateFence */
+constexpr unsigned kSlotDeviceRemovedReason = 37; /* ID3D12Device::GetDeviceRemovedReason */
 constexpr unsigned kDeviceSlots = 44;         /* IUnknown through ID3D12Device::GetAdapterLuid */
 constexpr unsigned kSlotFenceCompleted = 8;   /* ID3D12Fence::GetCompletedValue */
 constexpr unsigned kSlotFenceSetEvent = 9;    /* ID3D12Fence::SetEventOnCompletion */
@@ -479,6 +480,7 @@ using HostPresentFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT, UINT);
 using QueueGetDeviceFn = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
 using QueueSignalFn = HRESULT(STDMETHODCALLTYPE*)(void*, ID3D12Fence*, UINT64);
 using DeviceCreateFenceFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT64, D3D12_FENCE_FLAGS, REFIID, void**);
+using DeviceRemovedReasonFn = HRESULT(STDMETHODCALLTYPE*)(void*);
 using FenceCompletedFn = UINT64(STDMETHODCALLTYPE*)(void*);
 using FenceSetEventFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT64, HANDLE);
 
@@ -487,6 +489,7 @@ struct Faults {
     QueueGetDeviceFn get_device = nullptr;
     QueueSignalFn signal = nullptr;
     DeviceCreateFenceFn create_fence = nullptr;
+    DeviceRemovedReasonFn removed_reason = nullptr;
     FenceCompletedFn fence_completed = nullptr;
     FenceSetEventFn set_event = nullptr;
     void* target = nullptr;             /* the swapchain the Present hook acts on */
@@ -506,6 +509,7 @@ struct Faults {
     volatile LONG signals_seen = 0;
     volatile LONG signals_failed = 0;
     volatile LONG capture_fence = 0;
+    volatile LONG device_removed_reason = 0; /* one-shot device status override */
     volatile LONG fail_completed_after_signal = 0;
     volatile LONG fail_completed_removed = 0;
     volatile LONG fail_set_event = 0;    /* one-shot: fail SetEventOnCompletion with E_OUTOFMEMORY */
@@ -561,6 +565,11 @@ HRESULT STDMETHODCALLTYPE hooked_create_fence(void* self, UINT64 initial_value, 
     return hr;
 }
 
+HRESULT STDMETHODCALLTYPE hooked_removed_reason(void* self) {
+    const LONG hr = InterlockedExchange(&g_faults.device_removed_reason, 0);
+    return hr != 0 ? static_cast<HRESULT>(hr) : g_faults.removed_reason(self);
+}
+
 HRESULT STDMETHODCALLTYPE hooked_get_device(void* self, REFIID riid, void** ppv) {
     const HRESULT hr = g_faults.get_device(self, riid, ppv);
     if (g_faults.capture_fence && SUCCEEDED(hr) && ppv && *ppv && IsEqualGUID(riid, __uuidof(ID3D12Device))) {
@@ -577,6 +586,9 @@ HRESULT STDMETHODCALLTYPE hooked_get_device(void* self, REFIID riid, void** ppv)
                         sizeof(g_faults.hooked_device_vtable));
             g_faults.create_fence =
                 reinterpret_cast<DeviceCreateFenceFn>(g_faults.real_device_vtable[kSlotDeviceCreateFence]);
+            g_faults.removed_reason =
+                reinterpret_cast<DeviceRemovedReasonFn>(g_faults.real_device_vtable[kSlotDeviceRemovedReason]);
+            g_faults.hooked_device_vtable[kSlotDeviceRemovedReason] = reinterpret_cast<void*>(&hooked_removed_reason);
             g_faults.hooked_device_vtable[kSlotDeviceCreateFence] = reinterpret_cast<void*>(&hooked_create_fence);
             *reinterpret_cast<void***>(*ppv) = g_faults.hooked_device_vtable;
         }
@@ -1036,11 +1048,6 @@ int main(int argc, char** argv) {
 
     auto finish_fence_capture = [&]() {
         InterlockedExchange(&g_faults.capture_fence, 0);
-        if (g_faults.captured_device) {
-            *reinterpret_cast<void***>(g_faults.captured_device) = g_faults.real_device_vtable;
-            static_cast<IUnknown*>(g_faults.captured_device)->Release();
-            g_faults.captured_device = nullptr;
-        }
         REQUIRE(g_faults.target_fence != nullptr, "swapchain fence was not captured");
         g_faults.real_fence_vtable = *reinterpret_cast<void***>(g_faults.target_fence);
         std::memcpy(g_faults.hooked_fence_vtable, g_faults.real_fence_vtable, sizeof(g_faults.hooked_fence_vtable));
@@ -1051,6 +1058,11 @@ int main(int argc, char** argv) {
         *reinterpret_cast<void***>(g_faults.target_fence) = g_faults.hooked_fence_vtable;
     };
     auto detach_fence_hook = [&]() {
+        if (g_faults.captured_device) {
+            *reinterpret_cast<void***>(g_faults.captured_device) = g_faults.real_device_vtable;
+            static_cast<IUnknown*>(g_faults.captured_device)->Release();
+            g_faults.captured_device = nullptr;
+        }
         if (g_faults.target_fence && g_faults.real_fence_vtable) {
             *reinterpret_cast<void***>(g_faults.target_fence) = g_faults.real_fence_vtable;
         }
@@ -1140,9 +1152,15 @@ int main(int argc, char** argv) {
         if (log_path(log_file)) {
             check(log_has("present_device_removed", "fence"),
                   "post-present completed=UINT64_MAX must log present_device_removed");
+        } else {
+            std::puts("SKIP: post-present fence removal log (BX_LOG_FILE unset)");
+            ++g_skipped;
         }
+        check(paced->Present(0, 0) == BX_PRESENT_E_NEEDS_IDLE && host_present_count(paced) == count + 1,
+              "post-present removal result on a live device must block reuse");
+        check(paced->WaitForIdle(5000) == S_OK, "idle after the completed-value failure");
         check(paced->Present(0, 0) == S_OK && host_present_count(paced) == count + 2,
-              "post-present device removal must not enter needs_idle");
+              "present after completed-value recovery");
         pump(1);
 
         detach_fence_hook();
@@ -1262,6 +1280,9 @@ int main(int argc, char** argv) {
                   "expected 2 logged SetEventOnCompletion E_OUTOFMEMORY failures");
             check(log_count("present_next_buffer_wait_failed", "hr=0x8007000e") == 1,
                   "expected 1 logged present_next_buffer_wait_failed record");
+        } else {
+            std::puts("SKIP: post-present wait failure logs (BX_LOG_FILE unset)");
+            ++g_skipped;
         }
         before = host_present_count(cycle);
         for (UINT i = 0; i < kBuffers; ++i) {
@@ -1285,15 +1306,15 @@ int main(int argc, char** argv) {
               ul(hr));
         check(cycle->WaitForIdle(5000) == S_OK, "idle after wait-failure recovery");
 
-        /* WaitForIdle(0) has zero budget once the lock is taken, so it must time out without signaling. */
+        /* Zero is an invalid timeout and must be rejected before calling the host. */
         const LONG signals_before_zero = g_faults.signals_seen;
         InterlockedExchange(&g_faults.signal_delay_ms, 1300);
         const ULONGLONG zero_start = GetTickCount64();
         hr = cycle->WaitForIdle(zero_timeout_overrun ? 5000 : 0);
         const ULONGLONG zero_elapsed = GetTickCount64() - zero_start;
         InterlockedExchange(&g_faults.signal_delay_ms, 0);
-        check(hr == kTimedOut && zero_elapsed < 500 && g_faults.signals_seen == signals_before_zero,
-              "WaitForIdle(0) must time out without signaling: hr=0x%08lx elapsed=%llu ms signals +%ld",
+        check(hr == E_INVALIDARG && zero_elapsed < 500 && g_faults.signals_seen == signals_before_zero,
+              "WaitForIdle(0) must reject zero without signaling: hr=0x%08lx elapsed=%llu ms signals +%ld",
               ul(hr), static_cast<unsigned long long>(zero_elapsed), g_faults.signals_seen - signals_before_zero);
 
         /* Post-present SetEventOnCompletion returning DXGI_ERROR_DEVICE_RESET must pass through unchanged. */
@@ -1309,9 +1330,11 @@ int main(int argc, char** argv) {
         check(hr == DXGI_ERROR_DEVICE_RESET && host_present_count(cycle) == before + 1,
               "post-present device reset must return DXGI_ERROR_DEVICE_RESET: hr=0x%08lx", ul(hr));
         REQUIRE(SUCCEEDED(wait_gate->Signal(2)), "open the device-reset gate");
-        check(cycle->Present(0, 0) == S_OK && host_present_count(cycle) == before + 2,
-              "post-present device reset must not enter needs_idle");
+        check(cycle->Present(0, 0) == BX_PRESENT_E_NEEDS_IDLE && host_present_count(cycle) == before + 1,
+              "post-present device reset on a live device must block reuse");
         check(cycle->WaitForIdle(5000) == S_OK, "idle after device-reset check");
+        check(cycle->Present(0, 0) == S_OK && host_present_count(cycle) == before + 2,
+              "present after device-reset recovery");
         release(wait_gate);
 
         /* Post-present Signal failing with DXGI_ERROR_DEVICE_REMOVED must pass through unchanged. */
@@ -1321,9 +1344,37 @@ int main(int argc, char** argv) {
         check(g_faults.signals_failed == 2 && hr == DXGI_ERROR_DEVICE_REMOVED && host_present_count(cycle) == before + 1,
               "post-present Signal device removal: hr=0x%08lx host_presents=%u signals_failed=%ld",
               ul(hr), host_present_count(cycle) - before, g_faults.signals_failed);
-        check(cycle->Present(0, 0) == S_OK && host_present_count(cycle) == before + 2,
-              "post-present Signal device removal must not enter needs_idle");
+        check(cycle->Present(0, 0) == BX_PRESENT_E_NEEDS_IDLE && host_present_count(cycle) == before + 1,
+              "post-present Signal removal result on a live device must block reuse");
         check(cycle->WaitForIdle(5000) == S_OK, "idle after post-present Signal device removal");
+        check(cycle->Present(0, 0) == S_OK && host_present_count(cycle) == before + 2,
+              "present after Signal removal recovery");
+        if (log_path(path)) {
+            check(log_has("present_next_buffer_wait_failed", "hr=0x887a0007"),
+                  "post-present device reset must log the next-buffer wait failure");
+            check(log_has("present_device_removed", "signal after Present hr=0x887a0005"),
+                  "post-present Signal device removal must log the original HRESULT");
+        } else {
+            std::puts("SKIP: post-present removal HRESULT logs (BX_LOG_FILE unset)");
+            ++g_skipped;
+        }
+
+        /* A failed GetDeviceRemovedReason takes precedence over the fence failure. */
+        REQUIRE(SUCCEEDED(cycle->WaitForIdle(5000)), "idle before injecting device status");
+        before = host_present_count(cycle);
+        InterlockedExchange(&g_faults.device_removed_reason, DXGI_ERROR_DEVICE_HUNG);
+        InterlockedExchange(&g_faults.fail_after_hr, E_OUTOFMEMORY);
+        hr = cycle->Present(0, 0);
+        check(hr == DXGI_ERROR_DEVICE_HUNG && g_faults.device_removed_reason == 0 &&
+                  host_present_count(cycle) == before + 1,
+              "post-present Signal failure must return the device's removal reason: hr=0x%08lx", ul(hr));
+        if (log_path(path)) {
+            check(log_has("present_device_removed", "signal after Present hr=0x887a0006"),
+                  "post-present Signal failure must log the device's removal reason");
+        } else {
+            std::puts("SKIP: device removal reason log (BX_LOG_FILE unset)");
+            ++g_skipped;
+        }
 
         detach_fence_hook();
         patch_slot(host_cycle, kSlotSwapChainPresent, reinterpret_cast<void*>(g_faults.present));

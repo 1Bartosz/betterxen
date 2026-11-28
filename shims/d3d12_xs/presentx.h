@@ -96,8 +96,8 @@ struct IBxPresentSwapChain : public IUnknown {
      *   - BX_PRESENT_E_NEEDS_IDLE: NOT presented, WaitForIdle must succeed first;
      *   - another failure: the host's Present failure, a pre-Present fence wait or device failure
      *     (nothing was presented), or a device-removal HRESULT (such as DXGI_ERROR_DEVICE_REMOVED
-     *     or DXGI_ERROR_DEVICE_RESET) observed after host Present, returned unchanged without
-     *     entering BX_PRESENT_E_NEEDS_IDLE.
+     *     or DXGI_ERROR_DEVICE_RESET) observed after host Present, returned unchanged. If the
+     *     device still reports itself as live, WaitForIdle must succeed before the next Present.
      * The bounds cover BetterXen's own waits, not time spent inside the host's Present.
      *
      * The bridge itself returns DXGI_ERROR_INVALID_CALL, without calling the host, for a
@@ -108,9 +108,9 @@ struct IBxPresentSwapChain : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE Present(UINT sync_interval, UINT flags) = 0;
     /*
      * Waits until everything submitted to the queue before this call has finished. S_OK also ends
-     * the state left by BX_PRESENT_E_COMPLETION_UNCONFIRMED or
-     * BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED.
-     * INFINITE is rejected with E_INVALIDARG; a timeout returns HRESULT_FROM_WIN32(ERROR_TIMEOUT).
+     * the recovery state left by a post-Present synchronization failure on a live device.
+     * Only positive, finite timeouts are supported. Zero and INFINITE return E_INVALIDARG
+     * without signaling. A timeout returns HRESULT_FROM_WIN32(ERROR_TIMEOUT).
      * Lock acquisition, fence signaling, and fence waiting share timeout_ms; if lock acquisition
      * uses the whole budget, WaitForIdle times out without signaling. Time spent inside host calls
      * reduces the remaining wait, but the bridge cannot interrupt those calls.

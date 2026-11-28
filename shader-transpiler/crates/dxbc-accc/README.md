@@ -2,6 +2,15 @@
 
 Classifies D3D shader containers (`DXBC` with `DXIL`, legacy `SHDR`/`SHEX`, and `ACCC` chunks carrying BetterXen's synthetic `FSPX` table) and exposes the C ABI in [`abi/include/bx_shader_bridge.h`](../../../abi/include/bx_shader_bridge.h): `bx_shader_inspect`, `bx_shader_prepare_for_d3dmetal` and `bx_shader_free_buffer`.
 
+## `FSPX` errors
+
+A malformed `FSPX` table fails inspection with a `ParseError`; it never panics. Two bounds errors are kept apart (#599):
+
+- **`FspxLayoutMismatch`:** a descriptor's offset lands inside the 16-byte header or the descriptor table, the region the synthetic layout reserves. The table does not follow BetterXen's clean-room layout. The error carries the section id, the offset and the table length.
+- **`FspxSectionOutOfBounds`:** a section starts after the table but runs past the end of the payload.
+
+Both are still errors. Over the C ABI, both are `BX_SHADER_ERR_INVALID_BLOB`, so a caller of `bx_shader_inspect` cannot tell them apart yet; that would need an `[ABI]` change to `abi/include/bx_shader_bridge.h`.
+
 ## Guest access: `bx_shader_bridge.dll` (#445)
 
 The shims that see shader bytecode (`d3d12_xs.dll`) are x86-64 Windows PE32+ DLLs running inside CrossOver. They cannot load the arm64 macOS library that `cargo build` produces on the host. The bridge reaches guests as a **Windows build of this same crate**, with no second implementation:
@@ -52,8 +61,13 @@ This is a synthetic, single-host result. It is not a measurement of any title's 
 
 Each of these faults compiled into the DLL fails the check: `dxil_chunk_size` clamped to 1, `accc_chunk_size` multiplied, the digest zeroed, `has_root_signature` set to 7, and the DXIL and ACCC kind numbers swapped. The last one also fails when it is rebuilt with `CARGO_TARGET_DIR` set elsewhere.
 
-### Not done here (other owners)
+### Related work, owned elsewhere
 
-- **`abi/defs/bx_shader_bridge.def` (`[ABI]`):** the frozen export list for the DLL. Linking with it would also set the export directory's internal name, which is `dxbc_accc.dll` today. Wine loads by file name, so this does not affect loading.
-- **Staging in `scripts/build-shims.sh` (Track A):** building the DLL there and verifying it with the other shims, so `build-shims/bin` ships it. That would also make CI build it; today nothing does, and `rustup target add x86_64-pc-windows-gnu` is a manual step.
-- **Calling it from `d3d12_xs` at PSO creation, and JSONL telemetry (#466):** today `bx_shader_prepare_for_d3dmetal` reports an ACCC-only container on the guest's stderr (`bx-shader event=prepare status=unsupported …`), not through `bx_log_emit`.
+Three of these pieces around this crate were recorded here as outstanding when this section was written and have since landed. The fourth is the trace summary of the records the shim emits.
+
+- **`abi/defs/bx_shader_bridge.def` (`[ABI]`, #445, #484):** present and in use. Its `LIBRARY` directive is `bx_shader_bridge.dll`, and `scripts/build-shims.sh` passes it to `cargo rustc` as `-C link-arg=…/abi/defs/bx_shader_bridge.def`, so the built DLL's export directory holds exactly the three header entry points and its internal name is `bx_shader_bridge.dll`, not `dxbc_accc.dll`. Cargo still names the built file `dxbc_accc.dll`; the script copies it to `build-shims/bin/bx_shader_bridge.dll`, and the verifier requires the export-directory name to match the `.def`.
+- **Staging in `scripts/build-shims.sh` (Track A, #484):** done. The script builds this crate for `x86_64-pc-windows-gnu`, copies the result to `build-shims/bin/bx_shader_bridge.dll`, and verifies its export directory with the same exact-export, ordinal, forwarder and MinGW-import rules as the other shims. CI's hybrid job installs that target with its pinned toolchain, so `rustup target add x86_64-pc-windows-gnu` is only a one-off step for a local build, and the script stops with that hint when the target's `std` is missing.
+- **Calling it from `d3d12_xs` at PSO creation, and JSONL telemetry (Track C, #466):** done. `CreateGraphicsPipelineState` and `CreateComputePipelineState` in `shims/d3d12_xs/proxy.cpp` run every stage through `BxShaderGate::admit` (`shims/d3d12_xs/shader_gate.cpp`), which calls `bx_shader_inspect` and `bx_shader_prepare_for_d3dmetal` and emits `shader_gate`, `shader_d3dmetal_gap` and `shader_bridge_missing` records through `bx_log_emit`. The bridge itself still writes its ACCC-only inspection line to the guest's stderr (`bx-shader event=prepare status=unsupported …`), because this crate does not link `bx_log_emit`; the JSONL records come from the shim.
+- **Trace summary of those records (`bx-cli trace`, Track A, #496):** the work to parse `shader_gate`, `shader_d3dmetal_gap` and `shader_bridge_missing` into `bx-telemetry` and render them in `bx-cli trace` is tracked in #496. This bullet describes the split of responsibility only — it does not depend on that issue's status, and the crate's own behaviour is unaffected either way.
+
+This change does not touch the crate's code or tests; the tests above still describe its own behavior.
