@@ -913,6 +913,17 @@ bool reserved_fields_clear(const DSTORAGE_REQUEST_OPTIONS& options) {
 // (the header: an empty queue reports capacity - 1 empty slots), and requests
 // are submitted automatically once N / 2 are waiting (the header: "until the
 // queue is half full").
+// Maps the engine's command kind onto the header's DSTORAGE_COMMAND_TYPE for
+// RetrieveErrorRecord. Shared by the public and Xbox queues.
+DSTORAGE_COMMAND_TYPE command_type(Kind kind) {
+    switch (kind) {
+        case Kind::status: return DSTORAGE_COMMAND_TYPE_STATUS;
+        case Kind::signal: return DSTORAGE_COMMAND_TYPE_SIGNAL;
+        case Kind::event: return DSTORAGE_COMMAND_TYPE_EVENT;
+        default: return DSTORAGE_COMMAND_TYPE_REQUEST;
+    }
+}
+
 class PublicQueue final : public PublicObject<IDStorageQueue4> {
 public:
     PublicQueue(WorkQueue* queue, const DSTORAGE_QUEUE_DESC1& desc) : queue_(queue), desc_(desc) {
@@ -1043,15 +1054,6 @@ private:
         return IsEqualIID(riid, __uuidof(IDStorageQueue)) || IsEqualIID(riid, __uuidof(IDStorageQueue1))
             || IsEqualIID(riid, __uuidof(IDStorageQueue2)) || IsEqualIID(riid, __uuidof(IDStorageQueue3))
             || IsEqualIID(riid, __uuidof(IDStorageQueue4));
-    }
-
-    static DSTORAGE_COMMAND_TYPE command_type(Kind kind) {
-        switch (kind) {
-            case Kind::status: return DSTORAGE_COMMAND_TYPE_STATUS;
-            case Kind::signal: return DSTORAGE_COMMAND_TYPE_SIGNAL;
-            case Kind::event: return DSTORAGE_COMMAND_TYPE_EVENT;
-            default: return DSTORAGE_COMMAND_TYPE_REQUEST;
-        }
     }
 
     // Maps a DSTORAGE_REQUEST onto the engine's Request. Only uncompressed
@@ -1495,6 +1497,10 @@ public:
         record->FailureCount = errors.failure_count > 0xffffffffull ? 0xffffffffu
                                                                     : static_cast<UINT32>(errors.failure_count);
         record->FirstFailure.HResult = errors.failure_count ? errors.first_error : S_OK;
+        /* Same record type and command-kind mapping as the public queue. That the
+         * Xbox queue reports the public DSTORAGE_COMMAND_TYPE values is an inference
+         * from call-site observation, like the rest of this interface. */
+        record->FirstFailure.CommandType = errors.failure_count ? command_type(first) : DSTORAGE_COMMAND_TYPE_NONE;
     }
 
     void STDMETHODCALLTYPE Query(void*) override { BX_VTABLE_STUB_LOG("IDStorageQueueX", 11u, "Query"); }

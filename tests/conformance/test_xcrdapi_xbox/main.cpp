@@ -12,6 +12,9 @@
 #include <string>
 
 #include "bx_log.h"
+/* Public DirectStorage header (SDK 1.4.0, MIT): used here only for the
+ * DSTORAGE_ERROR_RECORD layout and DSTORAGE_COMMAND_TYPE values. */
+#include "dstorage.h"
 
 extern "C" __declspec(dllimport) HRESULT WINAPI DStorageGetFactory(REFIID riid, void** ppv);
 
@@ -215,6 +218,21 @@ int main() {
         check(wait_complete(status, 1), "compressed request status must complete");
         check(status->GetHResult(1) == E_NOTIMPL, "compressed request must report E_NOTIMPL (hr=0x%08lx)",
               static_cast<unsigned long>(status->GetHResult(1)));
+
+        /* Slot 10: RetrieveErrorRecord. The rejected compressed request is the
+         * only failure on this queue, so the record must name it: one failure,
+         * its E_NOTIMPL, and the request command kind. Expected values come from
+         * the public header and the request above, not from the shim. */
+        DSTORAGE_ERROR_RECORD record{};
+        record.FirstFailure.CommandType = DSTORAGE_COMMAND_TYPE_NONE;
+        file_q->RetrieveErrorRecord(&record);
+        check(record.FailureCount == 1, "error record must count the one rejected request (count=%u)",
+              static_cast<unsigned>(record.FailureCount));
+        check(record.FirstFailure.HResult == E_NOTIMPL, "error record HResult must be E_NOTIMPL (hr=0x%08lx)",
+              static_cast<unsigned long>(record.FirstFailure.HResult));
+        check(record.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST,
+              "error record CommandType must be DSTORAGE_COMMAND_TYPE_REQUEST (got %d)",
+              static_cast<int>(record.FirstFailure.CommandType));
         file_q->Close();
         file_q->Release();
     }
@@ -246,6 +264,31 @@ int main() {
         check(status->GetHResult(0) == S_OK, "memory copy status must be S_OK (hr=0x%08lx)",
               static_cast<unsigned long>(status->GetHResult(0)));
         check(std::memcmp(dest, payload + 32, sizeof(dest)) == 0, "memory copy bytes must match payload[32..96]");
+
+        /* A rejected signal: CommandType must name the signal, not just read as
+         * zero. DSTORAGE_COMMAND_TYPE_REQUEST is 0, so a zeroed record passes the
+         * request case above by accident; only a non-request failure tells a
+         * filled-in command kind from a zeroed one. A null fence is rejected
+         * (dstorage.h: EnqueueSignal requires a fence). This is the only failure
+         * on this queue. */
+        mem_q->EnqueueSignal(nullptr, 1);
+        /* Rejections are reported in queue order, so the record is filled once the
+         * queue reaches the rejected command: submit, then wait on the error event. */
+        mem_q->Submit();
+        const HANDLE error_event = mem_q->GetErrorEvent();
+        check(error_event != nullptr && WaitForSingleObject(error_event, 5000) == WAIT_OBJECT_0,
+              "the error event must signal after the rejected signal is processed");
+        DSTORAGE_ERROR_RECORD signal_record{};
+        signal_record.FirstFailure.CommandType = DSTORAGE_COMMAND_TYPE_NONE;
+        mem_q->RetrieveErrorRecord(&signal_record);
+        check(signal_record.FailureCount == 1, "error record must count the one rejected signal (count=%u)",
+              static_cast<unsigned>(signal_record.FailureCount));
+        check(signal_record.FirstFailure.HResult == E_DSTORAGE_INVALID_FENCE,
+              "error record HResult must be E_DSTORAGE_INVALID_FENCE (hr=0x%08lx)",
+              static_cast<unsigned long>(signal_record.FirstFailure.HResult));
+        check(signal_record.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_SIGNAL,
+              "error record CommandType must be DSTORAGE_COMMAND_TYPE_SIGNAL (got %d)",
+              static_cast<int>(signal_record.FirstFailure.CommandType));
         mem_q->Close();
         mem_q->Release();
     }
