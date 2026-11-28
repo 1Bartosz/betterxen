@@ -48,9 +48,17 @@ run skip-wait-fault skip-wait-fault
 must_fail skip-wait-fault sync
 expect skip-wait-fault out "SetEventOnCompletion fault was not injected"
 
+run wrong-removed-hr wrong-removed-hr
+must_fail wrong-removed-hr sync
+expect wrong-removed-hr out "post-present device reset must return DXGI_ERROR_DEVICE_RESET: hr=0x80040205"
+
+run zero-timeout-overrun zero-timeout-overrun
+must_fail zero-timeout-overrun sync
+expect zero-timeout-overrun out "WaitForIdle(0) must reject zero without signaling:"
+
 if [ "$bad" -ne 0 ]; then
     echo "FAIL: run_controls (output kept in $dir)"
     exit 1
 fi
 rm -rf "$dir"
-echo "PASS: run_controls (1 normal run, 4 negative controls)"
+echo "PASS: run_controls (1 normal run, 6 negative controls)"

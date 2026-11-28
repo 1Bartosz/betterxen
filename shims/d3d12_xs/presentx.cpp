@@ -15,6 +15,11 @@ namespace {
 
 constexpr HRESULT kWaitTimedOut = static_cast<HRESULT>(0x800705B4u); /* HRESULT_FROM_WIN32(ERROR_TIMEOUT) */
 
+bool is_device_removed_hr(HRESULT hr) {
+    return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_HUNG ||
+           hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+}
+
 void log_hr(bx_log_level_t level, const char* event, const char* what, HRESULT hr) {
     char detail[160];
     std::snprintf(detail, sizeof(detail), "%s hr=0x%08lx", what, static_cast<unsigned long>(hr));
@@ -59,8 +64,9 @@ private:
 
     HRESULT init(HWND window, const BxPresentDesc& desc);
     HRESULT signal_locked(UINT64* value);
-    HRESULT wait_locked(UINT64 value, DWORD timeout_ms);
-    HRESULT idle_locked(DWORD timeout_ms);
+    HRESULT wait_locked(UINT64 value, ULONGLONG start, DWORD timeout_ms);
+    HRESULT idle_locked(ULONGLONG start, DWORD timeout_ms);
+    HRESULT post_present_failure(const char* event, const char* what, HRESULT hr, HRESULT live_device_result);
     HRESULT removed_reason();
     void destroy();
 
@@ -198,8 +204,7 @@ HRESULT BxPresentSwapChain::signal_locked(UINT64* value) {
     return S_OK;
 }
 
-HRESULT BxPresentSwapChain::wait_locked(UINT64 value, DWORD timeout_ms) {
-    const ULONGLONG start = GetTickCount64();
+HRESULT BxPresentSwapChain::wait_locked(UINT64 value, ULONGLONG start, DWORD timeout_ms) {
     for (;;) {
         const UINT64 completed = fence_->GetCompletedValue();
         if (completed == UINT64_MAX) { /* the documented value after device removal */
@@ -219,8 +224,12 @@ HRESULT BxPresentSwapChain::wait_locked(UINT64 value, DWORD timeout_ms) {
             log_hr(BX_LOG_ERROR, "present_wait_failed", "SetEventOnCompletion", hr);
             return hr;
         }
+        const ULONGLONG elapsed_after_registration = GetTickCount64() - start;
+        if (elapsed_after_registration >= timeout_ms) {
+            continue; /* Recheck the fence before reporting a timeout. */
+        }
         /* The event can be left over from an earlier timed-out wait, so the loop re-reads the fence. */
-        DWORD waited = WaitForSingleObject(event_, static_cast<DWORD>(timeout_ms - elapsed));
+        DWORD waited = WaitForSingleObject(event_, static_cast<DWORD>(timeout_ms - elapsed_after_registration));
         if (waited == WAIT_FAILED) {
             hr = HRESULT_FROM_WIN32(GetLastError());
             log_hr(BX_LOG_ERROR, "present_wait_failed", "WaitForSingleObject", hr);
@@ -234,15 +243,40 @@ HRESULT BxPresentSwapChain::wait_locked(UINT64 value, DWORD timeout_ms) {
     return kWaitTimedOut;
 }
 
-HRESULT BxPresentSwapChain::idle_locked(DWORD timeout_ms) {
+HRESULT BxPresentSwapChain::post_present_failure(const char* event, const char* what, HRESULT hr,
+                                                 HRESULT live_device_result) {
+    const HRESULT removed = removed_reason();
+    if (FAILED(removed)) {
+        log_hr(BX_LOG_ERROR, "present_device_removed", what, removed);
+        return removed;
+    }
+    needs_idle_ = true;
+    if (event) {
+        log_hr(BX_LOG_ERROR, event, what, hr);
+    }
+    if (is_device_removed_hr(hr)) {
+        log_hr(BX_LOG_ERROR, "present_device_removed", what, hr);
+        return hr;
+    }
+    return live_device_result;
+}
+
+HRESULT BxPresentSwapChain::idle_locked(ULONGLONG start, DWORD timeout_ms) {
+    if (GetTickCount64() - start >= timeout_ms) {
+        char detail[96];
+        std::snprintf(detail, sizeof(detail), "timeout_ms=%lu wanted=%llu completed=unknown; expired before Signal",
+                      static_cast<unsigned long>(timeout_ms), static_cast<unsigned long long>(last_signaled_ + 1));
+        bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "present_wait_timeout", detail);
+        return kWaitTimedOut;
+    }
     UINT64 value = 0;
     HRESULT hr = signal_locked(&value);
-    return FAILED(hr) ? hr : wait_locked(value, timeout_ms);
+    return FAILED(hr) ? hr : wait_locked(value, start, timeout_ms);
 }
 
 void BxPresentSwapChain::destroy() {
     if (swap_ && fence_ && event_) {
-        HRESULT idle = idle_locked(BX_PRESENT_WAIT_MS);
+        HRESULT idle = idle_locked(GetTickCount64(), BX_PRESENT_WAIT_MS);
         if (FAILED(idle) && SUCCEEDED(removed_reason())) {
             /* The device is alive and the GPU may still be using the back buffers. */
             log_hr(BX_LOG_ERROR, "present_chain_leaked", "queue not idle; GPU-visible objects deliberately not released", idle);
@@ -350,7 +384,7 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
     const UINT presented_index = swap_->GetCurrentBackBufferIndex();
     if (presented_index < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
         /* Busy only after an earlier BX_PRESENT_E_NEXT_BUFFER_BUSY. Nothing is presented then. */
-        const HRESULT ready = wait_locked(buffer_value_[presented_index], BX_PRESENT_WAIT_MS);
+        const HRESULT ready = wait_locked(buffer_value_[presented_index], GetTickCount64(), BX_PRESENT_WAIT_MS);
         if (FAILED(ready)) {
             return ready;
         }
@@ -368,37 +402,28 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
     UINT64 value = 0;
     HRESULT sync_hr = signal_locked(&value);
     if (FAILED(sync_hr)) {
-        /*
-         * The host has the frame, but no fence value follows it, so buffer_value_ would still name
-         * older work. signal_locked logged the host HRESULT.
-         */
-        needs_idle_ = true;
-        return BX_PRESENT_E_COMPLETION_UNCONFIRMED;
+        /* signal_locked already logged present_signal_failed when the device stays live. */
+        return post_present_failure(nullptr, "signal after Present", sync_hr, BX_PRESENT_E_COMPLETION_UNCONFIRMED);
     }
     if (presented_index < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
         buffer_value_[presented_index] = value;
     }
     const UINT next = swap_->GetCurrentBackBufferIndex();
     if (next < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
-        sync_hr = wait_locked(buffer_value_[next], BX_PRESENT_WAIT_MS);
+        sync_hr = wait_locked(buffer_value_[next], GetTickCount64(), BX_PRESENT_WAIT_MS);
+        if (sync_hr == kWaitTimedOut) {
+            return BX_PRESENT_E_NEXT_BUFFER_BUSY;
+        }
         if (FAILED(sync_hr)) {
-            if (sync_hr == kWaitTimedOut) {
-                return BX_PRESENT_E_NEXT_BUFFER_BUSY;
-            }
-            /*
-             * The host has the frame, and the wait on the next buffer failed; keep the swapchain
-             * gated behind WaitForIdle so buffers are not reused without confirmed completion.
-             */
-            log_hr(BX_LOG_ERROR, "present_next_buffer_wait_failed", "wait_locked", sync_hr);
-            needs_idle_ = true;
-            return BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED;
+            return post_present_failure("present_next_buffer_wait_failed", "wait_locked", sync_hr,
+                                      BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED);
         }
     }
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE BxPresentSwapChain::WaitForIdle(DWORD timeout_ms) {
-    if (timeout_ms == INFINITE) {
+    if (timeout_ms == 0 || timeout_ms == INFINITE) {
         return E_INVALIDARG;
     }
     if (owner_ == GetCurrentThreadId()) {
@@ -413,8 +438,7 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::WaitForIdle(DWORD timeout_ms) {
         Sleep(1);
     }
     SrwOwner guard(lock_, owner_);
-    const ULONGLONG spent = GetTickCount64() - start;
-    const HRESULT hr = idle_locked(spent < timeout_ms ? static_cast<DWORD>(timeout_ms - spent) : 0);
+    const HRESULT hr = idle_locked(start, timeout_ms);
     if (hr == S_OK) {
         /* A signal queued after every presented frame has completed. */
         needs_idle_ = false;

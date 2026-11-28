@@ -43,9 +43,10 @@ inline constexpr HRESULT BX_PRESENT_E_NEXT_BUFFER_BUSY = static_cast<HRESULT>(0x
  */
 inline constexpr HRESULT BX_PRESENT_E_BUSY = static_cast<HRESULT>(0x80040202u);
 /*
- * Present() result: the frame WAS handed to the host, but the fence signal that tracks it failed,
- * so its completion is unknown. Do not present that frame again. Call WaitForIdle until it returns
- * S_OK before recording to any back buffer or presenting again.
+ * Present() result: the frame WAS handed to the host, but the following fence signal failed on
+ * a live device, so its completion is unknown. Do not present that frame again. Call WaitForIdle
+ * until it returns S_OK before recording to any back buffer or presenting again. Device removal
+ * returns the removal HRESULT unchanged instead.
  */
 inline constexpr HRESULT BX_PRESENT_E_COMPLETION_UNCONFIRMED = static_cast<HRESULT>(0x80040203u);
 /*
@@ -56,9 +57,9 @@ inline constexpr HRESULT BX_PRESENT_E_COMPLETION_UNCONFIRMED = static_cast<HRESU
 inline constexpr HRESULT BX_PRESENT_E_NEEDS_IDLE = static_cast<HRESULT>(0x80040204u);
 /*
  * Present() result: the frame WAS handed to the host and signaled, but waiting on the next back
- * buffer failed (for example SetEventOnCompletion, WaitForSingleObject, or device removal). Do not
+ * buffer failed on a live device (for example SetEventOnCompletion or WaitForSingleObject). Do not
  * present that frame again. Call WaitForIdle until it returns S_OK before reusing any back buffer
- * or presenting again.
+ * or presenting again. Device removal returns the removal HRESULT unchanged instead.
  */
 inline constexpr HRESULT BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED = static_cast<HRESULT>(0x80040205u);
 
@@ -89,11 +90,14 @@ struct IBxPresentSwapChain : public IUnknown {
      *   - HRESULT_FROM_WIN32(ERROR_TIMEOUT): NOT presented (the current buffer is still busy);
      *   - BX_PRESENT_E_NEXT_BUFFER_BUSY: presented, see its definition;
      *   - BX_PRESENT_E_BUSY: NOT presented, another call holds the swapchain;
-     *   - BX_PRESENT_E_COMPLETION_UNCONFIRMED: presented, the fence signal failed;
-     *   - BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED: presented, waiting on the next back buffer failed;
+     *   - BX_PRESENT_E_COMPLETION_UNCONFIRMED: presented, the fence signal failed on a live device;
+     *   - BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED: presented, waiting on the next back buffer failed
+     *     on a live device;
      *   - BX_PRESENT_E_NEEDS_IDLE: NOT presented, WaitForIdle must succeed first;
-     *   - another failure: the host's Present failure, or a pre-Present fence wait or device
-     *     failure (nothing was presented).
+     *   - another failure: the host's Present failure, a pre-Present fence wait or device failure
+     *     (nothing was presented), or a device-removal HRESULT (such as DXGI_ERROR_DEVICE_REMOVED
+     *     or DXGI_ERROR_DEVICE_RESET) observed after host Present, returned unchanged. If the
+     *     device still reports itself as live, WaitForIdle must succeed before the next Present.
      * The bounds cover BetterXen's own waits, not time spent inside the host's Present.
      *
      * The bridge itself returns DXGI_ERROR_INVALID_CALL, without calling the host, for a
@@ -104,10 +108,12 @@ struct IBxPresentSwapChain : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE Present(UINT sync_interval, UINT flags) = 0;
     /*
      * Waits until everything submitted to the queue before this call has finished. S_OK also ends
-     * the state left by BX_PRESENT_E_COMPLETION_UNCONFIRMED or
-     * BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED.
-     * INFINITE is rejected with E_INVALIDARG; a timeout returns HRESULT_FROM_WIN32(ERROR_TIMEOUT).
-     * timeout_ms includes any time spent waiting for a Present on another thread.
+     * the recovery state left by a post-Present synchronization failure on a live device.
+     * Only positive, finite timeouts are supported. Zero and INFINITE return E_INVALIDARG
+     * without signaling. A timeout returns HRESULT_FROM_WIN32(ERROR_TIMEOUT).
+     * Lock acquisition, fence signaling, and fence waiting share timeout_ms; if lock acquisition
+     * uses the whole budget, WaitForIdle times out without signaling. Time spent inside host calls
+     * reduces the remaining wait, but the bridge cannot interrupt those calls.
      */
     virtual HRESULT STDMETHODCALLTYPE WaitForIdle(DWORD timeout_ms) = 0;
     /*
