@@ -6,8 +6,9 @@
  * frame, read back from the back buffer before it was presented, with values computed on the CPU
  * from the pixel coordinates and the frame number alone.
  *
- * It also injects two faults from the test side: a host Present that cannot finish until a second
- * caller returns, and a fence signal that fails after a successful host Present.
+ * It also injects three faults from the test side: a host Present that cannot finish until a
+ * second caller returns, a fence signal that fails after a successful host Present, and a fence
+ * SetEventOnCompletion failure on both sides of host Present.
  *
  * What this shows: the content handed to Present. It does not capture the window, so it does not
  * show what reached the screen. The bridge interfaces are BetterXen's own (presentx.h); nothing
@@ -19,7 +20,7 @@
  *   --inject bad-window            the main swapchain gets a destroyed window      -> create  (12)
  *   --inject skip-draw             the shader draw is left out of one frame        -> pixels  (15)
  *   --inject wrong-expectation     the CPU expects a blue value that is off by 1   -> pixels  (15)
- *   --inject unblocked-post-wait   the post-present wait fault runs without blocking -> sync  (16)
+ *   --inject skip-wait-fault       omits the post-present SetEventOnCompletion fault -> sync  (16)
  *   --inject wrong-removed-hr      post-present device removal injects E_OUTOFMEMORY -> sync  (16)
  *   --inject zero-timeout-overrun  WaitForIdle(0) budget test passes 5000 ms       -> sync  (16)
  * run_controls.sh runs all six and checks the failing stage and log records of each.
@@ -462,34 +463,39 @@ void* patch_slot(void* object, unsigned slot, void* replacement) {
 }
 
 constexpr unsigned kSlotSwapChainPresent = 8; /* IDXGISwapChain::Present */
+constexpr unsigned kSlotQueueGetDevice = 7;   /* ID3D12DeviceChild::GetDevice */
 constexpr unsigned kSlotQueueSignal = 14;     /* ID3D12CommandQueue::Signal */
-constexpr unsigned kSlotFenceCompleted = 8;   /* ID3D12Fence::GetCompletedValue */
-constexpr unsigned kSlotFenceEvent = 9;       /* ID3D12Fence::SetEventOnCompletion */
 constexpr unsigned kQueueSlots = 19;          /* IUnknown through ID3D12CommandQueue::GetDesc */
+constexpr unsigned kSlotDeviceCreateFence = 36; /* ID3D12Device::CreateFence */
+constexpr unsigned kDeviceSlots = 44;         /* IUnknown through ID3D12Device::GetAdapterLuid */
+constexpr unsigned kSlotFenceCompleted = 8;   /* ID3D12Fence::GetCompletedValue */
+constexpr unsigned kSlotFenceSetEvent = 9;    /* ID3D12Fence::SetEventOnCompletion */
 constexpr unsigned kFenceSlots = 11;          /* IUnknown through ID3D12Fence::Signal */
 
 /* d3d12_xs's private "give me the host object" IID (proxy.cpp). No reference is added. */
 const GUID kIidProxyHost = {0x6b1d5c0e, 0x2f4a, 0x4e0b, {0x9a, 0x57, 0x3c, 0x0e, 0x5d, 0x7b, 0x1a, 0x42}};
 
 using HostPresentFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT, UINT);
+using QueueGetDeviceFn = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
 using QueueSignalFn = HRESULT(STDMETHODCALLTYPE*)(void*, ID3D12Fence*, UINT64);
-using FenceCompletedFn = UINT64(STDMETHODCALLTYPE*)(ID3D12Fence*);
-using FenceEventFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Fence*, UINT64, HANDLE);
+using DeviceCreateFenceFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT64, D3D12_FENCE_FLAGS, REFIID, void**);
+using FenceCompletedFn = UINT64(STDMETHODCALLTYPE*)(void*);
+using FenceSetEventFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT64, HANDLE);
 
 struct Faults {
     HostPresentFn present = nullptr;
+    QueueGetDeviceFn get_device = nullptr;
     QueueSignalFn signal = nullptr;
+    DeviceCreateFenceFn create_fence = nullptr;
     FenceCompletedFn fence_completed = nullptr;
-    FenceEventFn fence_event = nullptr;
-    void** real_fence_vtable = nullptr;
-    ID3D12Fence* captured_fence = nullptr;
-    void* capture_queue = nullptr;
-    DWORD capture_thread = 0;
-    bool capture_fence = false;
-    volatile LONG fail_completed_after_signal = 0;
-    volatile LONG fail_completed_removed = 0;
-    volatile LONG fail_wait_hr = 0;
+    FenceSetEventFn set_event = nullptr;
     void* target = nullptr;             /* the swapchain the Present hook acts on */
+    void* captured_device = nullptr;
+    void** real_device_vtable = nullptr;
+    void* hooked_device_vtable[kDeviceSlots] = {};
+    void* target_fence = nullptr;
+    void** real_fence_vtable = nullptr;
+    void* hooked_fence_vtable[kFenceSlots] = {};
     HANDLE entered = nullptr;           /* set once the hooked host Present is running */
     HANDLE resume = nullptr;            /* the hooked host Present waits for this */
     volatile LONG hold_present = 0;     /* one-shot: wait inside the host Present */
@@ -499,6 +505,12 @@ struct Faults {
     ULONGLONG delayed_signal_finished = 0;
     volatile LONG signals_seen = 0;
     volatile LONG signals_failed = 0;
+    volatile LONG capture_fence = 0;
+    volatile LONG fail_completed_after_signal = 0;
+    volatile LONG fail_completed_removed = 0;
+    volatile LONG fail_set_event = 0;    /* one-shot: fail SetEventOnCompletion with E_OUTOFMEMORY */
+    volatile LONG fail_set_event_hr = 0; /* one-shot: fail SetEventOnCompletion with custom HRESULT */
+    volatile LONG set_events_failed = 0;
     volatile LONG hold_timed_out = 0;
 } g_faults;
 
@@ -516,39 +528,15 @@ HRESULT STDMETHODCALLTYPE hooked_present(void* self, UINT sync, UINT flags) {
     return hr;
 }
 
-UINT64 STDMETHODCALLTYPE hooked_fence_completed(ID3D12Fence* fence) {
-    if (fence == g_faults.captured_fence && InterlockedExchange(&g_faults.fail_completed_removed, 0)) {
+UINT64 STDMETHODCALLTYPE hooked_fence_completed(void* self) {
+    if (self == g_faults.target_fence && InterlockedExchange(&g_faults.fail_completed_removed, 0)) {
         return UINT64_MAX;
     }
-    return g_faults.fence_completed(fence);
-}
-
-HRESULT STDMETHODCALLTYPE hooked_fence_event(ID3D12Fence* fence, UINT64 value, HANDLE event) {
-    if (fence == g_faults.captured_fence) {
-        const LONG hr = InterlockedExchange(&g_faults.fail_wait_hr, 0);
-        if (hr != 0) return static_cast<HRESULT>(hr);
-    }
-    return g_faults.fence_event(fence, value, event);
+    return g_faults.fence_completed(self);
 }
 
 HRESULT STDMETHODCALLTYPE hooked_signal(void* self, ID3D12Fence* fence, UINT64 value) {
     InterlockedIncrement(&g_faults.signals_seen);
-    if (g_faults.capture_fence && self == g_faults.capture_queue &&
-        GetCurrentThreadId() == g_faults.capture_thread && value == 1) {
-        /* `paced` was just created with last_signaled_ == 0, so its first WaitForIdle signals value 1. */
-        g_faults.capture_fence = false;
-        static void* hooked_fence_vtable[kFenceSlots];
-        void** const real_fence_vtable = *reinterpret_cast<void***>(fence);
-        g_faults.real_fence_vtable = real_fence_vtable;
-        std::memcpy(hooked_fence_vtable, real_fence_vtable, sizeof(hooked_fence_vtable));
-        g_faults.fence_completed = reinterpret_cast<FenceCompletedFn>(real_fence_vtable[kSlotFenceCompleted]);
-        g_faults.fence_event = reinterpret_cast<FenceEventFn>(real_fence_vtable[kSlotFenceEvent]);
-        hooked_fence_vtable[kSlotFenceCompleted] = reinterpret_cast<void*>(&hooked_fence_completed);
-        hooked_fence_vtable[kSlotFenceEvent] = reinterpret_cast<void*>(&hooked_fence_event);
-        g_faults.captured_fence = fence;
-        MemoryBarrier();
-        *reinterpret_cast<void***>(fence) = hooked_fence_vtable;
-    }
     if (InterlockedExchange(&g_faults.fail_completed_after_signal, 0)) {
         InterlockedExchange(&g_faults.fail_completed_removed, 1);
     }
@@ -562,6 +550,53 @@ HRESULT STDMETHODCALLTYPE hooked_signal(void* self, ID3D12Fence* fence, UINT64 v
     const HRESULT hr = g_faults.signal(self, fence, value);
     if (delay_ms > 0) g_faults.delayed_signal_finished = GetTickCount64();
     return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hooked_create_fence(void* self, UINT64 initial_value, D3D12_FENCE_FLAGS flags,
+                                              REFIID riid, void** ppv) {
+    const HRESULT hr = g_faults.create_fence(self, initial_value, flags, riid, ppv);
+    if (g_faults.capture_fence && SUCCEEDED(hr) && ppv && *ppv && IsEqualGUID(riid, __uuidof(ID3D12Fence))) {
+        g_faults.target_fence = *ppv;
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hooked_get_device(void* self, REFIID riid, void** ppv) {
+    const HRESULT hr = g_faults.get_device(self, riid, ppv);
+    if (g_faults.capture_fence && SUCCEEDED(hr) && ppv && *ppv && IsEqualGUID(riid, __uuidof(ID3D12Device))) {
+        if (*reinterpret_cast<void***>(*ppv) != g_faults.hooked_device_vtable) {
+            if (g_faults.captured_device) {
+                *reinterpret_cast<void***>(g_faults.captured_device) = g_faults.real_device_vtable;
+                static_cast<IUnknown*>(g_faults.captured_device)->Release();
+                g_faults.captured_device = nullptr;
+            }
+            static_cast<IUnknown*>(*ppv)->AddRef();
+            g_faults.captured_device = *ppv;
+            g_faults.real_device_vtable = *reinterpret_cast<void***>(*ppv);
+            std::memcpy(g_faults.hooked_device_vtable, g_faults.real_device_vtable,
+                        sizeof(g_faults.hooked_device_vtable));
+            g_faults.create_fence =
+                reinterpret_cast<DeviceCreateFenceFn>(g_faults.real_device_vtable[kSlotDeviceCreateFence]);
+            g_faults.hooked_device_vtable[kSlotDeviceCreateFence] = reinterpret_cast<void*>(&hooked_create_fence);
+            *reinterpret_cast<void***>(*ppv) = g_faults.hooked_device_vtable;
+        }
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hooked_set_event(void* self, UINT64 value, HANDLE event) {
+    if (self == g_faults.target_fence) {
+        const LONG hr = InterlockedExchange(&g_faults.fail_set_event_hr, 0);
+        if (hr != 0) {
+            InterlockedIncrement(&g_faults.set_events_failed);
+            return static_cast<HRESULT>(hr);
+        }
+        if (InterlockedExchange(&g_faults.fail_set_event, 0)) {
+            InterlockedIncrement(&g_faults.set_events_failed);
+            return E_OUTOFMEMORY;
+        }
+    }
+    return g_faults.set_event(self, value, event);
 }
 
 /* Waits for a thread while still dispatching this thread's window messages. */
@@ -588,14 +623,14 @@ int main(int argc, char** argv) {
     const bool bad_window = !std::strcmp(inject, "bad-window");
     const bool skip_draw = !std::strcmp(inject, "skip-draw");
     const bool wrong_expectation = !std::strcmp(inject, "wrong-expectation");
-    const bool unblocked_post_wait = !std::strcmp(inject, "unblocked-post-wait");
+    const bool skip_wait_fault = !std::strcmp(inject, "skip-wait-fault");
     const bool wrong_removed_hr = !std::strcmp(inject, "wrong-removed-hr");
     const bool zero_timeout_overrun = !std::strcmp(inject, "zero-timeout-overrun");
     const bool valid_inject = !inject[0] || bad_window || skip_draw || wrong_expectation ||
-                              unblocked_post_wait || wrong_removed_hr || zero_timeout_overrun;
+                              skip_wait_fault || wrong_removed_hr || zero_timeout_overrun;
     if ((argc != 1 && (argc != 3 || std::strcmp(argv[1], "--inject"))) || !valid_inject) {
         std::printf("usage: test_d3d12_presentx [--inject bad-window|skip-draw|wrong-expectation|"
-                    "unblocked-post-wait|wrong-removed-hr|zero-timeout-overrun]\n");
+                    "skip-wait-fault|wrong-removed-hr|zero-timeout-overrun]\n");
         return 2;
     }
     if (inject[0]) std::printf("NEGATIVE CONTROL: %s (this run must fail)\n", inject);
@@ -987,6 +1022,42 @@ int main(int argc, char** argv) {
         check(hr == S_OK, "after the gate opened: hr=0x%08lx", ul(hr));
         release(gate);
     }
+    /* The host queue behind the proxy: hooked so the sync stage can capture swapchain fences and inject faults. */
+    void* host_queue = nullptr;
+    REQUIRE(queue->QueryInterface(kIidProxyHost, &host_queue) == S_OK && host_queue, "host queue behind the proxy");
+    void** const real_queue_vtable = *reinterpret_cast<void***>(host_queue);
+    static void* hooked_queue_vtable[kQueueSlots];
+    std::memcpy(hooked_queue_vtable, real_queue_vtable, sizeof(hooked_queue_vtable));
+    g_faults.get_device = reinterpret_cast<QueueGetDeviceFn>(real_queue_vtable[kSlotQueueGetDevice]);
+    g_faults.signal = reinterpret_cast<QueueSignalFn>(real_queue_vtable[kSlotQueueSignal]);
+    hooked_queue_vtable[kSlotQueueGetDevice] = reinterpret_cast<void*>(&hooked_get_device);
+    hooked_queue_vtable[kSlotQueueSignal] = reinterpret_cast<void*>(&hooked_signal);
+    *reinterpret_cast<void***>(host_queue) = hooked_queue_vtable;
+
+    auto finish_fence_capture = [&]() {
+        InterlockedExchange(&g_faults.capture_fence, 0);
+        if (g_faults.captured_device) {
+            *reinterpret_cast<void***>(g_faults.captured_device) = g_faults.real_device_vtable;
+            static_cast<IUnknown*>(g_faults.captured_device)->Release();
+            g_faults.captured_device = nullptr;
+        }
+        REQUIRE(g_faults.target_fence != nullptr, "swapchain fence was not captured");
+        g_faults.real_fence_vtable = *reinterpret_cast<void***>(g_faults.target_fence);
+        std::memcpy(g_faults.hooked_fence_vtable, g_faults.real_fence_vtable, sizeof(g_faults.hooked_fence_vtable));
+        g_faults.fence_completed = reinterpret_cast<FenceCompletedFn>(g_faults.real_fence_vtable[kSlotFenceCompleted]);
+        g_faults.set_event = reinterpret_cast<FenceSetEventFn>(g_faults.real_fence_vtable[kSlotFenceSetEvent]);
+        g_faults.hooked_fence_vtable[kSlotFenceCompleted] = reinterpret_cast<void*>(&hooked_fence_completed);
+        g_faults.hooked_fence_vtable[kSlotFenceSetEvent] = reinterpret_cast<void*>(&hooked_set_event);
+        *reinterpret_cast<void***>(g_faults.target_fence) = g_faults.hooked_fence_vtable;
+    };
+    auto detach_fence_hook = [&]() {
+        if (g_faults.target_fence && g_faults.real_fence_vtable) {
+            *reinterpret_cast<void***>(g_faults.target_fence) = g_faults.real_fence_vtable;
+        }
+        g_faults.target_fence = nullptr;
+        g_faults.real_fence_vtable = nullptr;
+    };
+
     {
         /*
          * Frame pacing. With the queue blocked, no frame can finish. Presents 1 and 2 move on to
@@ -996,21 +1067,10 @@ int main(int argc, char** argv) {
         HWND paced_window = make_window();
         IBxPresentSwapChain* paced = nullptr;
         ID3D12Fence* gate = nullptr;
+        g_faults.target_fence = nullptr;
+        InterlockedExchange(&g_faults.capture_fence, 1);
         REQUIRE(SUCCEEDED(bridge->CreateSwapChain(paced_window, &kDesc, &paced)), "pacing swapchain");
-        void* host_queue = nullptr;
-        REQUIRE(queue->QueryInterface(kIidProxyHost, &host_queue) == S_OK && host_queue, "host queue behind the proxy");
-        void** const real_vtable = *reinterpret_cast<void***>(host_queue);
-        static void* hooked_vtable[kQueueSlots];
-        std::memcpy(hooked_vtable, real_vtable, sizeof(hooked_vtable));
-        g_faults.signal = reinterpret_cast<QueueSignalFn>(real_vtable[kSlotQueueSignal]);
-        hooked_vtable[kSlotQueueSignal] = reinterpret_cast<void*>(&hooked_signal);
-        *reinterpret_cast<void***>(host_queue) = hooked_vtable;
-        g_faults.capture_queue = host_queue;
-        g_faults.capture_thread = GetCurrentThreadId();
-        g_faults.capture_fence = true;
-        REQUIRE(paced->WaitForIdle(5000) == S_OK && g_faults.captured_fence && g_faults.fence_event && g_faults.fence_completed,
-                "capture and patch the bridge fence before any host Present");
-        g_faults.capture_fence = false;
+        finish_fence_capture();
         hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&gate));
         REQUIRE(SUCCEEDED(hr) && gate && SUCCEEDED(queue->Wait(gate, 1)), "gate fence hr=0x%08lx", ul(hr));
         for (UINT i = 0; i + 1 < kBuffers; ++i) {
@@ -1026,12 +1086,6 @@ int main(int argc, char** argv) {
               "present onto a busy buffer: hr=0x%08lx after %llu ms", ul(hr), static_cast<unsigned long long>(waited));
         std::printf("observed: present_pacing_wait_ms=%llu\n", static_cast<unsigned long long>(waited));
         check(host_present_count(paced) == count + 1, "a busy-next-buffer result must mean the frame was presented");
-        InterlockedExchange(&g_faults.fail_wait_hr, E_OUTOFMEMORY);
-        hr = paced->Present(0, 0);
-        std::printf("observed: wait_failure_before_present hr=0x%08lx host_presents=%u\n",
-                    ul(hr), host_present_count(paced) - count - 1);
-        check(hr == E_OUTOFMEMORY && host_present_count(paced) == count + 1,
-              "pre-present fence wait failure: hr=0x%08lx", ul(hr));
         /*
          * A retry while still blocked presents nothing. It runs on another thread and holds the
          * swapchain for the whole wait, so WaitForIdle here must honour its own, shorter timeout.
@@ -1051,37 +1105,27 @@ int main(int argc, char** argv) {
         CloseHandle(thread);
         check(retry.result == kTimedOut && host_present_count(paced) == count + 1, "retry while blocked: hr=0x%08lx",
               ul(retry.result));
+
+        /*
+         * Pre-Present fence wait failure: the current back buffer is still blocked, so wait_locked
+         * before host Present calls SetEventOnCompletion and fails with E_OUTOFMEMORY. Nothing must
+         * reach the host swapchain.
+         */
+        const UINT pre_count = host_present_count(paced);
+        InterlockedExchange(&g_faults.fail_set_event, 1);
+        hr = paced->Present(0, 0);
+        REQUIRE(g_faults.set_events_failed == 1, "pre-Present SetEventOnCompletion fault was not injected (%ld)",
+                g_faults.set_events_failed);
+        check(hr == E_OUTOFMEMORY && host_present_count(paced) == pre_count,
+              "pre-Present wait failure: hr=0x%08lx, host count advanced by %u", ul(hr),
+              host_present_count(paced) - pre_count);
+        std::printf("observed: pre_present_wait_failed hr=0x%08lx host_presents=%u\n", ul(hr),
+                    host_present_count(paced) - pre_count);
+
         REQUIRE(SUCCEEDED(gate->Signal(1)), "release the gate");
         check(paced->WaitForIdle(5000) == S_OK, "queue did not drain after the gate opened");
         hr = paced->Present(0, 0);
         check(hr == S_OK, "present after recovery: hr=0x%08lx", ul(hr));
-        check(paced->WaitForIdle(5000) == S_OK, "idle before the post-present wait fault");
-        if (!unblocked_post_wait) {
-            REQUIRE(SUCCEEDED(queue->Wait(gate, 2)), "block the queue again");
-        }
-        for (UINT i = 0; i + 1 < kBuffers; ++i) {
-            check(paced->Present(0, 0) == S_OK, "post-wait fault setup, present %u", i + 1);
-        }
-        count = host_present_count(paced);
-        InterlockedExchange(&g_faults.fail_wait_hr, E_OUTOFMEMORY);
-        hr = paced->Present(0, 0);
-        std::printf("observed: wait_failure_after_present hr=0x%08lx host_presents=%u\n",
-                    ul(hr), host_present_count(paced) - count);
-        check(hr == BX_PRESENT_E_COMPLETION_UNCONFIRMED && host_present_count(paced) == count + 1,
-              "post-present fence wait failure: hr=0x%08lx", ul(hr));
-        check(paced->Present(0, 0) == BX_PRESENT_E_NEEDS_IDLE && host_present_count(paced) == count + 1,
-              "unconfirmed post-present wait must prevent another host Present");
-        if (!unblocked_post_wait) {
-            REQUIRE(SUCCEEDED(gate->Signal(2)), "open the post-wait gate");
-        }
-        check(paced->WaitForIdle(5000) == S_OK, "recover after the post-present wait fault");
-        check(paced->Present(0, 0) == S_OK && host_present_count(paced) == count + 2,
-              "Present must resume after the queue is idle");
-        char log_file[MAX_PATH];
-        if (log_path(log_file)) {
-            check(log_has("present_post_wait_failed", "hr=0x8007000e"),
-                  "post-present fence wait failure must log the underlying HRESULT");
-        }
 
         /* Post-present GetCompletedValue()==UINT64_MAX must pass DXGI_ERROR_DEVICE_REMOVED through. */
         check(paced->WaitForIdle(5000) == S_OK, "idle before post-present completed=MAX check");
@@ -1092,36 +1136,16 @@ int main(int argc, char** argv) {
                     ul(hr), host_present_count(paced) - count);
         check(hr == DXGI_ERROR_DEVICE_REMOVED && host_present_count(paced) == count + 1,
               "post-present completed=UINT64_MAX must return DXGI_ERROR_DEVICE_REMOVED: hr=0x%08lx", ul(hr));
+        char log_file[MAX_PATH];
         if (log_path(log_file)) {
             check(log_has("present_device_removed", "fence"),
                   "post-present completed=UINT64_MAX must log present_device_removed");
         }
         check(paced->Present(0, 0) == S_OK && host_present_count(paced) == count + 2,
               "post-present device removal must not enter needs_idle");
-
-        /* Post-present SetEventOnCompletion returning DXGI_ERROR_DEVICE_RESET must pass through unchanged. */
-        check(paced->WaitForIdle(5000) == S_OK, "idle before post-present device-reset wait check");
-        REQUIRE(SUCCEEDED(queue->Wait(gate, 3)), "block the queue for device-reset wait check");
-        for (UINT i = 0; i + 1 < kBuffers; ++i) {
-            check(paced->Present(0, 0) == S_OK, "device-reset setup, present %u", i + 1);
-        }
-        count = host_present_count(paced);
-        InterlockedExchange(&g_faults.fail_wait_hr, wrong_removed_hr ? E_OUTOFMEMORY : DXGI_ERROR_DEVICE_RESET);
-        hr = paced->Present(0, 0);
-        std::printf("observed: post_present_device_reset hr=0x%08lx host_presents=%u\n",
-                    ul(hr), host_present_count(paced) - count);
-        check(hr == DXGI_ERROR_DEVICE_RESET && host_present_count(paced) == count + 1,
-              "post-present device reset must return DXGI_ERROR_DEVICE_RESET: hr=0x%08lx", ul(hr));
-        REQUIRE(SUCCEEDED(gate->Signal(3)), "open the device-reset gate");
-        check(paced->Present(0, 0) == S_OK && host_present_count(paced) == count + 2,
-              "post-present device reset must not enter needs_idle");
-        check(paced->WaitForIdle(5000) == S_OK, "drain after device-reset check");
         pump(1);
 
-        *reinterpret_cast<void***>(g_faults.captured_fence) = g_faults.real_fence_vtable;
-        g_faults.captured_fence = nullptr;
-        g_faults.real_fence_vtable = nullptr;
-        *reinterpret_cast<void***>(host_queue) = real_vtable;
+        detach_fence_hook();
         check(paced->Release() == 0, "pacing swapchain still referenced");
         release(gate);
         DestroyWindow(paced_window);
@@ -1134,9 +1158,12 @@ int main(int argc, char** argv) {
         HWND w = make_window();
         IBxPresentSwapChain* cycle = nullptr;
         IDXGISwapChain3* host_cycle = nullptr;
+        g_faults.target_fence = nullptr;
+        InterlockedExchange(&g_faults.capture_fence, 1);
         REQUIRE(SUCCEEDED(bridge->CreateSwapChain(w, &kDesc, &cycle)) &&
                     SUCCEEDED(cycle->GetHostSwapChain(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&host_cycle))),
                 "concurrent-Present swapchain");
+        finish_fence_capture();
         g_faults.target = host_cycle;
         g_faults.entered = CreateEventA(nullptr, TRUE, FALSE, nullptr);
         g_faults.resume = CreateEventA(nullptr, TRUE, FALSE, nullptr);
@@ -1169,18 +1196,9 @@ int main(int argc, char** argv) {
          * queue's completion has been confirmed.
          */
         check(cycle->WaitForIdle(5000) == S_OK, "idle before the signal fault");
-        /* The host queue behind the proxy: the object whose Signal the bridge calls. */
-        void* host_queue = nullptr;
-        REQUIRE(queue->QueryInterface(kIidProxyHost, &host_queue) == S_OK && host_queue, "host queue behind the proxy");
         ID3D12Fence* gate = nullptr;
         hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&gate));
         REQUIRE(SUCCEEDED(hr) && gate && SUCCEEDED(queue->Wait(gate, 1)), "gate fence hr=0x%08lx", ul(hr));
-        void** const real_vtable = *reinterpret_cast<void***>(host_queue);
-        static void* hooked_vtable[kQueueSlots];
-        std::memcpy(hooked_vtable, real_vtable, sizeof(hooked_vtable));
-        g_faults.signal = reinterpret_cast<QueueSignalFn>(real_vtable[kSlotQueueSignal]);
-        hooked_vtable[kSlotQueueSignal] = reinterpret_cast<void*>(&hooked_signal);
-        *reinterpret_cast<void***>(host_queue) = hooked_vtable;
         UINT before = host_present_count(cycle);
         InterlockedExchange(&g_faults.fail_after_hr, E_FAIL);
         hr = cycle->Present(0, 0);
@@ -1211,6 +1229,61 @@ int main(int argc, char** argv) {
         hr = cycle->Present(0, 0);
         check(SUCCEEDED(hr) && host_present_count(cycle) == before + 1, "present after recovery: hr=0x%08lx", ul(hr));
         check(cycle->WaitForIdle(5000) == S_OK, "idle after recovery");
+        release(gate);
+
+        /*
+         * Post-Present fence wait failure: host Present and Signal succeed, then SetEventOnCompletion
+         * fails with E_OUTOFMEMORY while waiting for the next back buffer. Present must return a
+         * distinct post-present result (not raw E_OUTOFMEMORY), log the wait HRESULT, and require
+         * WaitForIdle to succeed before any further Present / back-buffer reuse.
+         */
+        ID3D12Fence* wait_gate = nullptr;
+        hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&wait_gate));
+        REQUIRE(SUCCEEDED(hr) && wait_gate && SUCCEEDED(queue->Wait(wait_gate, 1)), "wait gate fence hr=0x%08lx", ul(hr));
+        for (UINT i = 0; i + 1 < kBuffers; ++i) {
+            hr = cycle->Present(0, 0);
+            check(hr == S_OK, "wait-fault setup present %u: hr=0x%08lx", i + 1, ul(hr));
+        }
+        before = host_present_count(cycle);
+        if (!skip_wait_fault) {
+            InterlockedExchange(&g_faults.fail_set_event, 1);
+        }
+        hr = cycle->Present(0, 0);
+        REQUIRE(g_faults.set_events_failed == 2, "the SetEventOnCompletion fault was not injected (%ld)",
+                g_faults.set_events_failed);
+        std::printf("observed: post_present_wait_failed hr=0x%08lx host_presents=%u\n", ul(hr),
+                    host_present_count(cycle) - before);
+        check(hr == BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED && hr != E_OUTOFMEMORY && host_present_count(cycle) == before + 1,
+              "post-Present wait failure: hr=0x%08lx, host count advanced by %u", ul(hr),
+              host_present_count(cycle) - before);
+        char path[MAX_PATH];
+        if (log_path(path)) {
+            check(log_count("present_wait_failed", "SetEventOnCompletion hr=0x8007000e") == 2,
+                  "expected 2 logged SetEventOnCompletion E_OUTOFMEMORY failures");
+            check(log_count("present_next_buffer_wait_failed", "hr=0x8007000e") == 1,
+                  "expected 1 logged present_next_buffer_wait_failed record");
+        }
+        before = host_present_count(cycle);
+        for (UINT i = 0; i < kBuffers; ++i) {
+            hr = cycle->Present(0, 0);
+            check(hr == BX_PRESENT_E_NEEDS_IDLE, "present %u after post-present wait failure: hr=0x%08lx", i + 1, ul(hr));
+        }
+        check(host_present_count(cycle) == before, "%u frames reached host before WaitForIdle recovery",
+              host_present_count(cycle) - before);
+        hr = cycle->WaitForIdle(300);
+        check(hr == kTimedOut, "WaitForIdle blocked after wait failure: hr=0x%08lx", ul(hr));
+        check(cycle->Present(0, 0) == BX_PRESENT_E_NEEDS_IDLE,
+              "unsuccessful WaitForIdle must not clear wait-failure recovery");
+        REQUIRE(SUCCEEDED(wait_gate->Signal(1)), "release the wait gate");
+        pump(20);
+        check(cycle->Present(0, 0) == BX_PRESENT_E_NEEDS_IDLE && host_present_count(cycle) == before,
+              "back-buffer reuse must still require WaitForIdle after gate opens");
+        check(cycle->WaitForIdle(5000) == S_OK, "WaitForIdle did not succeed after wait gate opened");
+        before = host_present_count(cycle);
+        hr = cycle->Present(0, 0);
+        check(SUCCEEDED(hr) && host_present_count(cycle) == before + 1, "present after wait-failure recovery: hr=0x%08lx",
+              ul(hr));
+        check(cycle->WaitForIdle(5000) == S_OK, "idle after wait-failure recovery");
 
         /* WaitForIdle(0) has zero budget once the lock is taken, so it must time out without signaling. */
         const LONG signals_before_zero = g_faults.signals_seen;
@@ -1223,6 +1296,24 @@ int main(int argc, char** argv) {
               "WaitForIdle(0) must time out without signaling: hr=0x%08lx elapsed=%llu ms signals +%ld",
               ul(hr), static_cast<unsigned long long>(zero_elapsed), g_faults.signals_seen - signals_before_zero);
 
+        /* Post-present SetEventOnCompletion returning DXGI_ERROR_DEVICE_RESET must pass through unchanged. */
+        REQUIRE(SUCCEEDED(queue->Wait(wait_gate, 2)), "block the queue for device-reset wait check");
+        for (UINT i = 0; i + 1 < kBuffers; ++i) {
+            check(cycle->Present(0, 0) == S_OK, "device-reset setup, present %u", i + 1);
+        }
+        before = host_present_count(cycle);
+        InterlockedExchange(&g_faults.fail_set_event_hr, wrong_removed_hr ? E_OUTOFMEMORY : DXGI_ERROR_DEVICE_RESET);
+        hr = cycle->Present(0, 0);
+        std::printf("observed: post_present_device_reset hr=0x%08lx host_presents=%u\n",
+                    ul(hr), host_present_count(cycle) - before);
+        check(hr == DXGI_ERROR_DEVICE_RESET && host_present_count(cycle) == before + 1,
+              "post-present device reset must return DXGI_ERROR_DEVICE_RESET: hr=0x%08lx", ul(hr));
+        REQUIRE(SUCCEEDED(wait_gate->Signal(2)), "open the device-reset gate");
+        check(cycle->Present(0, 0) == S_OK && host_present_count(cycle) == before + 2,
+              "post-present device reset must not enter needs_idle");
+        check(cycle->WaitForIdle(5000) == S_OK, "idle after device-reset check");
+        release(wait_gate);
+
         /* Post-present Signal failing with DXGI_ERROR_DEVICE_REMOVED must pass through unchanged. */
         before = host_present_count(cycle);
         InterlockedExchange(&g_faults.fail_after_hr, DXGI_ERROR_DEVICE_REMOVED);
@@ -1234,15 +1325,15 @@ int main(int argc, char** argv) {
               "post-present Signal device removal must not enter needs_idle");
         check(cycle->WaitForIdle(5000) == S_OK, "idle after post-present Signal device removal");
 
-        *reinterpret_cast<void***>(host_queue) = real_vtable;
+        detach_fence_hook();
         patch_slot(host_cycle, kSlotSwapChainPresent, reinterpret_cast<void*>(g_faults.present));
         release(host_cycle);
         check(cycle->Release() == 0, "fault-injection swapchain still referenced");
-        release(gate);
         CloseHandle(g_faults.entered);
         CloseHandle(g_faults.resume);
         DestroyWindow(w);
     }
+    *reinterpret_cast<void***>(host_queue) = real_queue_vtable;
     {
         /* Final Release with the queue blocked: the leak branch must still return the proxy reference. */
         HWND w = make_window();

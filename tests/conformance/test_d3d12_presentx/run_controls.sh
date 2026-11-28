@@ -44,13 +44,13 @@ run wrong-expectation wrong-expectation
 must_fail wrong-expectation pixels
 expect wrong-expectation out "pixels_wrong=29184 "
 
-run unblocked-post-wait unblocked-post-wait
-must_fail unblocked-post-wait sync
-expect unblocked-post-wait out "post-present fence wait failure: hr=0x00000000"
+run skip-wait-fault skip-wait-fault
+must_fail skip-wait-fault sync
+expect skip-wait-fault out "SetEventOnCompletion fault was not injected"
 
 run wrong-removed-hr wrong-removed-hr
 must_fail wrong-removed-hr sync
-expect wrong-removed-hr out "post-present device reset must return DXGI_ERROR_DEVICE_RESET: hr=0x80040203"
+expect wrong-removed-hr out "post-present device reset must return DXGI_ERROR_DEVICE_RESET: hr=0x80040205"
 
 run zero-timeout-overrun zero-timeout-overrun
 must_fail zero-timeout-overrun sync

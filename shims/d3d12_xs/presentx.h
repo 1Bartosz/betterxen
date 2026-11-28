@@ -43,17 +43,25 @@ inline constexpr HRESULT BX_PRESENT_E_NEXT_BUFFER_BUSY = static_cast<HRESULT>(0x
  */
 inline constexpr HRESULT BX_PRESENT_E_BUSY = static_cast<HRESULT>(0x80040202u);
 /*
- * Present() result: the frame WAS handed to the host, but the following fence signal or
- * back-buffer wait failed on a live device. Do not present that frame again. Call WaitForIdle
+ * Present() result: the frame WAS handed to the host, but the following fence signal failed on
+ * a live device, so its completion is unknown. Do not present that frame again. Call WaitForIdle
  * until it returns S_OK before recording to any back buffer or presenting again. Device removal
  * returns the removal HRESULT unchanged instead.
  */
 inline constexpr HRESULT BX_PRESENT_E_COMPLETION_UNCONFIRMED = static_cast<HRESULT>(0x80040203u);
 /*
  * Present() result: the frame was NOT handed to the host, because an earlier Present returned
- * BX_PRESENT_E_COMPLETION_UNCONFIRMED and no WaitForIdle has succeeded since.
+ * BX_PRESENT_E_COMPLETION_UNCONFIRMED or BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED and no WaitForIdle
+ * has succeeded since.
  */
 inline constexpr HRESULT BX_PRESENT_E_NEEDS_IDLE = static_cast<HRESULT>(0x80040204u);
+/*
+ * Present() result: the frame WAS handed to the host and signaled, but waiting on the next back
+ * buffer failed on a live device (for example SetEventOnCompletion or WaitForSingleObject). Do not
+ * present that frame again. Call WaitForIdle until it returns S_OK before reusing any back buffer
+ * or presenting again. Device removal returns the removal HRESULT unchanged instead.
+ */
+inline constexpr HRESULT BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED = static_cast<HRESULT>(0x80040205u);
 
 struct BxPresentDesc {
     UINT width;          /* 1..16384; 0 ("use the window size") is not accepted */
@@ -82,12 +90,14 @@ struct IBxPresentSwapChain : public IUnknown {
      *   - HRESULT_FROM_WIN32(ERROR_TIMEOUT): NOT presented (the current buffer is still busy);
      *   - BX_PRESENT_E_NEXT_BUFFER_BUSY: presented, see its definition;
      *   - BX_PRESENT_E_BUSY: NOT presented, another call holds the swapchain;
-     *   - BX_PRESENT_E_COMPLETION_UNCONFIRMED: presented, the fence signal or next-buffer wait failed
+     *   - BX_PRESENT_E_COMPLETION_UNCONFIRMED: presented, the fence signal failed on a live device;
+     *   - BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED: presented, waiting on the next back buffer failed
      *     on a live device;
      *   - BX_PRESENT_E_NEEDS_IDLE: NOT presented, WaitForIdle must succeed first;
-     *   - another failure: the host's Present failure, a failure before calling host Present, or a
-     *     device-removal HRESULT (such as DXGI_ERROR_DEVICE_REMOVED or DXGI_ERROR_DEVICE_RESET)
-     *     observed after host Present, returned unchanged without entering BX_PRESENT_E_NEEDS_IDLE.
+     *   - another failure: the host's Present failure, a pre-Present fence wait or device failure
+     *     (nothing was presented), or a device-removal HRESULT (such as DXGI_ERROR_DEVICE_REMOVED
+     *     or DXGI_ERROR_DEVICE_RESET) observed after host Present, returned unchanged without
+     *     entering BX_PRESENT_E_NEEDS_IDLE.
      * The bounds cover BetterXen's own waits, not time spent inside the host's Present.
      *
      * The bridge itself returns DXGI_ERROR_INVALID_CALL, without calling the host, for a
@@ -98,7 +108,8 @@ struct IBxPresentSwapChain : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE Present(UINT sync_interval, UINT flags) = 0;
     /*
      * Waits until everything submitted to the queue before this call has finished. S_OK also ends
-     * the state left by BX_PRESENT_E_COMPLETION_UNCONFIRMED.
+     * the state left by BX_PRESENT_E_COMPLETION_UNCONFIRMED or
+     * BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED.
      * INFINITE is rejected with E_INVALIDARG; a timeout returns HRESULT_FROM_WIN32(ERROR_TIMEOUT).
      * Lock acquisition, fence signaling, and fence waiting share timeout_ms; if lock acquisition
      * uses the whole budget, WaitForIdle times out without signaling. Time spent inside host calls

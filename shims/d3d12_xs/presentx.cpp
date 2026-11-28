@@ -66,7 +66,7 @@ private:
     HRESULT signal_locked(UINT64* value);
     HRESULT wait_locked(UINT64 value, ULONGLONG start, DWORD timeout_ms);
     HRESULT idle_locked(ULONGLONG start, DWORD timeout_ms);
-    HRESULT post_present_failure(const char* event, const char* what, HRESULT hr);
+    HRESULT post_present_failure(const char* event, const char* what, HRESULT hr, HRESULT live_device_result);
     HRESULT removed_reason();
     void destroy();
 
@@ -81,7 +81,7 @@ private:
     std::atomic<DWORD> owner_{0}; /* thread holding lock_ */
     UINT64 last_signaled_ = 0;
     UINT64 presented_ = 0;
-    bool needs_idle_ = false; /* completion after Present is unconfirmed until the queue is idle */
+    bool needs_idle_ = false; /* post-present signal or wait failed; only an idle queue clears this */
     UINT64 buffer_value_[DXGI_MAX_SWAP_CHAIN_BUFFERS] = {};
 };
 
@@ -243,7 +243,8 @@ HRESULT BxPresentSwapChain::wait_locked(UINT64 value, ULONGLONG start, DWORD tim
     return kWaitTimedOut;
 }
 
-HRESULT BxPresentSwapChain::post_present_failure(const char* event, const char* what, HRESULT hr) {
+HRESULT BxPresentSwapChain::post_present_failure(const char* event, const char* what, HRESULT hr,
+                                                 HRESULT live_device_result) {
     const HRESULT removed = removed_reason();
     if (FAILED(removed)) {
         log_hr(BX_LOG_ERROR, "present_device_removed", what, removed);
@@ -256,7 +257,7 @@ HRESULT BxPresentSwapChain::post_present_failure(const char* event, const char* 
         log_hr(BX_LOG_ERROR, event, what, hr);
     }
     needs_idle_ = true;
-    return BX_PRESENT_E_COMPLETION_UNCONFIRMED;
+    return live_device_result;
 }
 
 HRESULT BxPresentSwapChain::idle_locked(ULONGLONG start, DWORD timeout_ms) {
@@ -398,7 +399,7 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
     HRESULT sync_hr = signal_locked(&value);
     if (FAILED(sync_hr)) {
         /* signal_locked already logged present_signal_failed when the device stays live. */
-        return post_present_failure(nullptr, "signal after Present", sync_hr);
+        return post_present_failure(nullptr, "signal after Present", sync_hr, BX_PRESENT_E_COMPLETION_UNCONFIRMED);
     }
     if (presented_index < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
         buffer_value_[presented_index] = value;
@@ -410,7 +411,8 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
             return BX_PRESENT_E_NEXT_BUFFER_BUSY;
         }
         if (FAILED(sync_hr)) {
-            return post_present_failure("present_post_wait_failed", "wait for next back buffer", sync_hr);
+            return post_present_failure("present_next_buffer_wait_failed", "wait_locked", sync_hr,
+                                      BX_PRESENT_E_NEXT_BUFFER_WAIT_FAILED);
         }
     }
     return hr;
