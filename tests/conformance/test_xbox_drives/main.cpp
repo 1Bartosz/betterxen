@@ -1,8 +1,9 @@
 /*
  * Xbox title drives: G: is the executable's directory and T: is writable temporary storage.
  *
- * An Xbox title opens its package on G: and writes crash logs to T:, and stops at startup when
- * either is missing. The expected contents of G: come from this program's own path
+ * The project-authorized target title we traced opens its package on G: and writes crash logs
+ * to T:, and stops at startup when either is missing; that these roles hold for Xbox titles in
+ * general is an inference. This fixture checks the resulting layout, not who created the links. The expected contents of G: come from this program's own path
  * (GetModuleFileNameW), not from how bx-cli maps the drive.
  */
 #include <windows.h>

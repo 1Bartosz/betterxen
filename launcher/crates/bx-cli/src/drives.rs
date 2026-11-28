@@ -1,8 +1,9 @@
 //! Xbox title drive letters, linked in the prefix's `dosdevices` before launch.
 //!
-//! An Xbox title reads its package from `G:` and writes temporary files such as crash logs to
-//! `T:` (observed at title startup; inferred to be the package root and temporary storage). A
-//! Wine prefix has neither drive, so the title's first `G:\...` open fails with
+//! The project-authorized target title we traced reads its package from `G:` and writes
+//! temporary files such as crash logs to `T:`. That is an observation of one title at startup;
+//! that `G:` is the package root and `T:` temporary storage for Xbox titles in general is an
+//! inference. A Wine prefix has neither drive, so that title's first `G:\...` open fails with
 //! `STATUS_OBJECT_PATH_NOT_FOUND`. `bx-cli run` links `g:` to the executable's directory and
 //! `t:` to `drive_c/bx_temp`.
 //!
@@ -153,7 +154,14 @@ fn write_manifest(dosdevices: &Path, owned: &BTreeMap<char, PathBuf>) -> Result<
     for (letter, target) in owned {
         text.push_str(&format!("{letter}\t@{}\n", encode_path(target)));
     }
-    fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    // Written to a temporary file and renamed over the manifest, like `relink`, so an
+    // interrupted write can never leave a truncated manifest that later runs refuse to parse.
+    let tmp = dosdevices.join(format!("{MANIFEST}.tmp.{}", std::process::id()));
+    let written = fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, &path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 fn encode_path(path: &Path) -> String {
@@ -404,20 +412,56 @@ mod tests {
     #[test]
     fn a_failed_manifest_write_leaves_no_unrecorded_link() {
         let t = TempDir::new("orphan");
-        let manifest = t.prefix().join("dosdevices").join(MANIFEST);
-        symlink(t.0.join("missing-dir/x"), &manifest).unwrap();
+        // A directory where the manifest's temporary file goes makes the write fail.
+        let tmp = t
+            .prefix()
+            .join("dosdevices")
+            .join(format!("{MANIFEST}.tmp.{}", std::process::id()));
+        fs::create_dir(&tmp).unwrap();
         assert!(map_xbox_drives(&t.prefix(), &t.game()).is_err());
         assert!(
             fs::symlink_metadata(t.link('g')).is_err(),
             "g: must not be created before ownership is recorded"
         );
 
-        fs::remove_file(&manifest).unwrap();
+        fs::remove_dir(&tmp).unwrap();
         map_xbox_drives(&t.prefix(), &t.game()).unwrap();
         let other = t.0.join("other-game");
         fs::create_dir_all(&other).unwrap();
         let again = map_xbox_drives(&t.prefix(), &other).unwrap();
         assert!(matches!(&again[0], Mapping::Retargeted('g', _)));
+    }
+
+    #[test]
+    fn an_interrupted_manifest_write_keeps_the_previous_manifest() {
+        let t = TempDir::new("atomic");
+        map_xbox_drives(&t.prefix(), &t.game()).unwrap();
+        let manifest = t.prefix().join("dosdevices").join(MANIFEST);
+        let before = fs::read(&manifest).unwrap();
+        // Fail the next write after the new contents would have been produced: the old
+        // manifest must survive whole, never truncated or half written.
+        let tmp = t
+            .prefix()
+            .join("dosdevices")
+            .join(format!("{MANIFEST}.tmp.{}", std::process::id()));
+        fs::create_dir(&tmp).unwrap();
+        let other = t.0.join("other-game");
+        fs::create_dir_all(&other).unwrap();
+        assert!(map_xbox_drives(&t.prefix(), &other).is_err());
+        assert_eq!(
+            fs::read(&manifest).unwrap(),
+            before,
+            "previous manifest kept intact"
+        );
+        fs::remove_dir(&tmp).unwrap();
+        // The intact manifest still proves ownership, so the retry re-points g:.
+        let again = map_xbox_drives(&t.prefix(), &other).unwrap();
+        assert!(matches!(&again[0], Mapping::Retargeted('g', _)));
+        assert!(
+            fs::read_dir(t.prefix().join("dosdevices"))
+                .unwrap()
+                .all(|e| !e.unwrap().file_name().to_string_lossy().contains(".tmp."))
+        );
     }
 
     #[test]

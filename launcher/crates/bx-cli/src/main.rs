@@ -861,6 +861,18 @@ fn cmd_run(args: &[String]) -> ExitCode {
     supervise::install_signal_handlers();
     let started = Instant::now();
 
+    // Drive links are prefix-global. Keep them stable until this guest exits so another bx-cli
+    // process cannot retarget G: underneath a running title. Taken before system32 staging, so
+    // a run refused here has not touched the shared prefix. Runs sharing a prefix are therefore
+    // serial: a second launcher on the same prefix is refused while the first is running.
+    let _drive_lock = match drives::lock_drive_mappings(&environment_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            diag(format_args!("error: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
     // #457: shims loaded with LOAD_LIBRARY_SEARCH_SYSTEM32 never see WINEPATH, so they are
     // copied into the environment's system32 first. A bare prefix is initialized for that.
     let system32 = stage::system32_dir(&environment_dir);
@@ -921,16 +933,6 @@ fn cmd_run(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-
-    // Drive links are prefix-global. Keep them stable until this guest exits so another bx-cli
-    // process cannot retarget G: underneath a running title.
-    let _drive_lock = match drives::lock_drive_mappings(&environment_dir) {
-        Ok(lock) => lock,
-        Err(e) => {
-            diag(format_args!("error: {e}"));
-            return ExitCode::FAILURE;
-        }
-    };
 
     // An Xbox title opens its package on G: and writes temporary files to T:. A missing drive
     // only matters to such a title, so it is reported and the run goes on.
