@@ -80,6 +80,26 @@ class SlugTests(unittest.TestCase):
         slugs = docs_hygiene.markdown_slugs(body)
         self.assertEqual(slugs, {"see-adr-notes", "see-adr-notes-1"})
 
+    def test_heading_link_inside_a_code_span_stays_literal(self):
+        # GitHub keeps `[x](y)` literal inside a code span, so its URL stays in
+        # the slug. Substituting links first made this `code-x-span`.
+        slugs = docs_hygiene.markdown_slugs("## Code `[x](y)` span\n")
+        self.assertEqual(slugs, {"code-xy-span"})
+
+    def test_heading_mixes_a_code_span_and_a_link(self):
+        # Only the real link loses its URL; the code span keeps its text.
+        slugs = docs_hygiene.markdown_slugs("## See `a` and [b](c.md)\n")
+        self.assertEqual(slugs, {"see-a-and-b"})
+
+    def test_heading_double_backtick_code_span(self):
+        # GitHub's own renderer gives `#use-a-b-cdmd-here` for this heading:
+        # the inner single-backtick run closes the outer span early, so the
+        # `[c](d.md)` after it is a real link and loses its URL. Asserting the
+        # observed GitHub anchor keeps this honest rather than assuming the
+        # "obvious" answer.
+        slugs = docs_hygiene.markdown_slugs("## Use ``a `b` [c](d.md)`` here\n")
+        self.assertEqual(slugs, {"use-a-b-cdmd-here"})
+
     def test_heading_image_is_not_treated_as_a_link(self):
         # An image contributes its alt text through GitHub's rendering, but
         # the `(?<!\!)` guard must keep this path unchanged for now.
