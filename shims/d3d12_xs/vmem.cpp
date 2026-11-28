@@ -810,13 +810,6 @@ HRESULT decode_bxvm_config(void* config) {
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
         return S_OK;
     }
-    if (!can_access_bytes(static_cast<char*>(config) + offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer),
-                          sizeof(in.cpu_pointer), true)) {
-        log_vmem_fallback("bxvm", "unwritable_output");
-        BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
-        return S_OK;
-    }
-
     const bx_runtime_config_t* cfg = bx_get_runtime_config();
     const uint64_t cap = title_limit();
     const auto profile = (cfg && cfg->profile == BX_PROFILE_ANACONDA) ? BX_PROFILE_ANACONDA : BX_PROFILE_LOCKHART;
@@ -857,6 +850,13 @@ HRESULT decode_bxvm_config(void* config) {
         region = first;
         region.size_bytes = span;
         have_region = true;
+    }
+
+    if (!can_access_bytes(static_cast<char*>(config) + offsetof(BxD3d12VirtualMemoryConfig, cpu_pointer),
+                          sizeof(in.cpu_pointer), true)) {
+        log_vmem_fallback("bxvm", "unwritable_output");
+        BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
+        return S_OK;
     }
 
     const uint64_t new_base = have_region ? region.base_va : in.base_va;

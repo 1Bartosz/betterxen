@@ -21,6 +21,7 @@
 #include <d3d12.h>
 #include <windows.h>
 
+#include <cstddef>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -66,7 +67,22 @@ struct XboxConfig {
     uint64_t min_gpu_va;
     uint64_t max_gpu_va;
 };
-static_assert(sizeof(XboxConfig) == 32, "XboxConfig must be 32 bytes");
+static_assert(sizeof(BxvmConfig) == 48);
+static_assert(offsetof(BxvmConfig, magic) == 0);
+static_assert(offsetof(BxvmConfig, struct_size) == 4);
+static_assert(offsetof(BxvmConfig, version) == 8);
+static_assert(offsetof(BxvmConfig, flags) == 12);
+static_assert(offsetof(BxvmConfig, base_va) == 16);
+static_assert(offsetof(BxvmConfig, size_bytes) == 24);
+static_assert(offsetof(BxvmConfig, reserved) == 32);
+static_assert(offsetof(BxvmConfig, cpu_pointer) == 40);
+static_assert(sizeof(XboxConfig) == 32);
+static_assert(offsetof(XboxConfig, flags) == 0);
+static_assert(offsetof(XboxConfig, page_table_4mb_pages) == 4);
+static_assert(offsetof(XboxConfig, frame_buffer_preserve_bytes) == 8);
+static_assert(offsetof(XboxConfig, padding) == 12);
+static_assert(offsetof(XboxConfig, min_gpu_va) == 16);
+static_assert(offsetof(XboxConfig, max_gpu_va) == 24);
 
 /* From the documentation: 2 GB minimum, about 159.375 GB maximum at the default size. */
 constexpr uint64_t kMinGpuVa = 0x80000000ull;
@@ -311,12 +327,12 @@ int main() {
     PVOID reserved_va = XMemVirtualAlloc(nullptr, 2ull * 1024ull * 1024ull, 0x20402000u, 0x21u);
     check(reserved_va != nullptr, "XMemVirtualAlloc reservation after Xbox config must succeed");
     if (reserved_va) {
-        VirtualFree(reserved_va, 0, MEM_RELEASE);
+        check(VirtualFree(reserved_va, 0, MEM_RELEASE) != 0, "release the XMemVirtualAlloc reservation");
     }
 
     /*
      * 5. Configure a BXVM backing heap, create and cache it, then apply an Xbox
-     *    configuration. The Xbox path only records its segment count, so the
+     *    configuration. The Xbox path does not apply a backing configuration, so the
      *    cached BXVM backing heap, its cpu_pointer and its device link must
      *    survive.
      */
@@ -449,7 +465,22 @@ int main() {
             check(std::memcmp(readonly_page, &readonly_bxvm, sizeof(readonly_bxvm)) == 0,
                   "read-only BXVM config bytes must stay unchanged");
             DWORD ignored_protect = 0;
-            VirtualProtect(readonly_page, readonly_page_bytes, old_protect, &ignored_protect);
+            const bool writable =
+                VirtualProtect(readonly_page, readonly_page_bytes, old_protect, &ignored_protect) != 0;
+            check(writable, "make the BXVM page writable for the invalid-size case");
+            if (writable) {
+                const BxvmConfig invalid_bxvm = make_bxvm(0, 1, 0);
+                std::memcpy(readonly_page, &invalid_bxvm, sizeof(invalid_bxvm));
+                const bool readonly_again =
+                    VirtualProtect(readonly_page, readonly_page_bytes, PAGE_READONLY, &ignored_protect) != 0;
+                check(readonly_again, "protect the invalid-size BXVM page");
+                if (readonly_again) {
+                    check(D3D12ConfigureVirtualMemoryX(readonly_page) == E_INVALIDARG,
+                          "invalid BXVM size must be rejected before the read-only fallback");
+                    check(std::memcmp(readonly_page, &invalid_bxvm, sizeof(invalid_bxvm)) == 0,
+                          "rejected BXVM config bytes must stay unchanged");
+                }
+            }
         }
         VirtualFree(readonly_page, 0, MEM_RELEASE);
     }

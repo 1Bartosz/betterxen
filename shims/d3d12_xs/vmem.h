@@ -11,17 +11,18 @@
  * The export is PVOID and the frozen ABI has no size argument (abi/ is out of
  * scope). The first 8 bytes are therefore the initial probe: a magic word and
  * the following 32-bit value. Magic is 'BXVM' (0x4D565842); a matching header
- * and struct size select the full BetterXen block. A zero first word with a
- * non-zero second word selects the inferred Xbox candidate path, which checks
- * and reads its full 32-byte block; that does not establish the inferred ABI.
- * Other headers fall back after the 8-byte probe. A null pointer is not read.
- * The inferred Xbox block is never written.
+ * and struct size select the full BetterXen block. A zero first word selects
+ * the Xbox decoder, which checks the full block and may write its two address
+ * outputs. Other headers (including unrecognized nonzero Xbox flags) fall
+ * back with S_OK and no writes. A null pointer is not read.
  *
  * A block whose magic and size match is then checked in full. version is 1.
  * flags may be 0 or BX_D3D12_VMEM_FLAG_BACKING_HEAP. Any other flag bit, or a
  * non-zero reserved word, is not this struct either (logged S_OK, no write).
  * A recognised block with a bad size or a base_va that bx_xmem_query_region
- * does not resolve still returns E_INVALIDARG and is not written.
+ * does not resolve returns E_INVALIDARG even if its output is read-only. Valid
+ * inputs with an initially unwritable output fall back with S_OK and a stub
+ * log. A failed write after the accessibility check returns E_INVALIDARG.
  *
  * base_va is 0, or an address bx_xmem_query_region resolves. It is not a GPU pointer.
  * size_bytes is 0 or a 64 KiB multiple that does not exceed the active title limit.
