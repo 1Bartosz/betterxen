@@ -95,7 +95,6 @@ Every feature issue belongs to **one track** and defines an **exclusive file sco
 
 - Before integrating or copying any third-party code: verify the **per-file** license (not just repository metadata), confirm compatibility with `GPL-3.0-or-later` and every selected component, preserve copyright notices, record the upstream repository and exact commit/version, document modifications, and record the entry in `docs/research/upstream-registry.md` and `docs/research/component-reuse-matrix.md`. If licensing is uncertain, do not use it until resolved.
 - Never bundle, modify, or redistribute proprietary components (CrossOver binaries, D3DMetal, Rosetta 2, Apple tools) unless their license explicitly allows it. Never bypass licensing or activation requirements of any dependency.
-- **Provenance first:** Exclude anything (code, data, documentation, or observations) derived from leaked proprietary material or unauthorized software. A project's license being GPL does not clear material it was built from or for. Projects whose stated purpose depends on leaked or unauthorized builds (including VIctory, PE-Vulkan, KyTx, AnyPS5, and similar efforts) are never adopted as code, shader, asset, or tooling sources without a recorded per-file provenance and license audit. Game-specific patches, asset-specific workarounds, and decryption-related code are never adopted; general Xbox Game OS, Direct3D, DirectStorage, and runtime ABI contracts established from project-authorized builds that meet every Section 6 condition are in-scope compatibility work.
 
 ---
 
@@ -119,7 +118,6 @@ Every feature issue belongs to **one track** and defines an **exclusive file sco
   - Inspecting it requires no decryption and no circumvention of security, DRM, licensing, or activation controls.
 
   If any condition is unknown, do not use the build. State in the PR which contracts come from target-build observation, without naming the title or build.
-- **Never obtain or use** leaked executables or SDKs, confidential Xbox documentation, restricted console tools, firmware, encryption keys, unauthorized assets or source code, or unauthorized game builds and shader collections. Maintainer approval does not change this.
 - **Repository & clean-tree boundary:** Never commit or paste proprietary executables, SDKs, confidential vendor documentation, restricted console tools, firmware, encryption keys, unauthorized assets or source code, proprietary shaders, raw caller memory dumps, executable contents/addresses, private traces, proprietary file names or hashes, personal paths, or secrets into the repository, its Git history, commit messages, issues, or PR descriptions.
 - **Legal boundary (`docs/legal.md`):** BetterXen does not circumvent console security or DRM and does not load encrypted or protected content. Validate technical compatibility and safety of user-provided files; do not ask for ownership receipts, accounts, or acquisition provenance as part of file loading.
 
