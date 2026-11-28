@@ -88,6 +88,7 @@ static_assert(kFootprint <= kAlign, "texture footprint fits in one 64 KiB page")
 static_assert(kRegionBytes == 128ull * 1024ull, "configured region is 128 KiB");
 
 int g_checks = 0;
+int g_skipped = 0;
 int g_failures = 0;
 
 __attribute__((format(gnu_printf, 2, 3)))
@@ -435,6 +436,7 @@ void check_graphics_xmem_pairing(ID3D12Device* device, uint64_t cap) {
     if (cap != (512ull << 20)) {
         /* The pairing sizes are fixed against a 512 MiB cap, so at any other cap the
          * cross-DLL budget check does not run. Say so rather than pass silently. */
+        ++g_skipped;
         std::printf("SKIP: graphics/xmem pairing needs a 512 MiB cap "
                     "(BX_MEM_LIMIT_MB=512 bx-cli run --inherit-env ...); this run's cap is %llu MiB\n",
                     static_cast<unsigned long long>(cap >> 20));
@@ -1532,9 +1534,9 @@ int main() {
         std::fprintf(stderr, "FAIL: test_d3d12_placed (%d of %d checks failed)\n", g_failures, g_checks);
         return 1;
     }
-    std::printf("PASS: test_d3d12_placed (%d checks passed, buffer %u/%u bytes, texture %u/%u bytes, "
+    std::printf("PASS: test_d3d12_placed (%d checks passed, %d skipped, buffer %u/%u bytes, texture %u/%u bytes, "
                 "texture_path=%s, cpu_after_gpu %u/%u, small_align=%llu, upload_100000=%llu)\n",
-                g_checks, buf_match, kBufBytes, tex_match, kFootprint, texture_path, reverse_match, kBufBytes,
+                g_checks, g_skipped, buf_match, kBufBytes, tex_match, kFootprint, texture_path, reverse_match, kBufBytes,
                 static_cast<unsigned long long>(small_align), static_cast<unsigned long long>(odd_size));
     return 0;
 }
