@@ -1,5 +1,6 @@
 //! Track A (M1-A1): Native ARM64 macOS CLI for BetterXen hybrid execution.
 
+mod drives;
 mod stage;
 mod supervise;
 
@@ -858,6 +859,18 @@ fn cmd_run(args: &[String]) -> ExitCode {
     supervise::install_signal_handlers();
     let started = Instant::now();
 
+    // Drive links are prefix-global. Keep them stable until this guest exits so another bx-cli
+    // process cannot retarget G: underneath a running title. Taken before system32 staging, so
+    // a run refused here has not touched the shared prefix. Runs sharing a prefix are therefore
+    // serial: a second launcher on the same prefix is refused while the first is running.
+    let _drive_lock = match drives::lock_drive_mappings(&environment_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            diag(format_args!("error: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
     // #457: shims loaded with LOAD_LIBRARY_SEARCH_SYSTEM32 never see WINEPATH, so they are
     // copied into the environment's system32 first. A bare prefix is initialized for that.
     let system32 = stage::system32_dir(&environment_dir);
@@ -917,6 +930,25 @@ fn cmd_run(args: &[String]) -> ExitCode {
             ));
             return ExitCode::FAILURE;
         }
+    }
+
+    // An Xbox title opens its package on G: and writes temporary files to T:. A missing drive
+    // only matters to such a title, so it is reported and the run goes on.
+    match abs_exe.parent() {
+        Some(package_dir) => match drives::map_xbox_drives(&environment_dir, package_dir) {
+            Ok(mappings) => {
+                for mapping in &mappings {
+                    match mapping {
+                        drives::Mapping::Foreign { .. } => diag(mapping.describe()),
+                        _ => diag(format_args!("bx-cli: {}", mapping.describe())),
+                    }
+                }
+            }
+            Err(e) => diag(format_args!(
+                "warning: Xbox drives G: and T: not mapped: {e}"
+            )),
+        },
+        None => diag("warning: Xbox drive G: not mapped: the executable has no parent directory"),
     }
 
     let mut cmd = if let Some(ref bname) = bottle {
