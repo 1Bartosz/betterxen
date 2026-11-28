@@ -41,5 +41,5 @@ env -i HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" TMPDIR=/tmp LANG=C \
 
 Replace `<d3dmetal_bottle>` with the installed CrossOver bottle name.
 
-The negative control should exit 1 with a `pixel_readback` checkpoint identifying pixel
-`(0,0)` as mismatched.
+The negative control should print `NOTE: pixel mismatch control armed` and exit 1.
+The `pixel_readback` checkpoint should report `pixel (0,0) expected 01234567 got 9f598b46`.

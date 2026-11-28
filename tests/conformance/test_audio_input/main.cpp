@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <thread>
 
 extern "C" {
@@ -31,7 +33,62 @@ namespace {
 void WINAPI dummy_device_callback(uint64_t, void*, void*, uint64_t, uint32_t, uint32_t) {}
 } // namespace
 
+
+// Read the JSONL log the shim wrote, so the dispatcher's live-reference
+// count can be checked rather than assumed. The log is the only place the
+// count is observable: `Release` returning 0 proves the reference count
+// reached zero, and the `dispatch_mode` lines prove the live-dispatcher
+// counter followed it. They do not prove the object was freed: `Release`
+// updates the counter before `delete this`, so a leak would not show here.
+// `bx-cli run` appends to the supplied BX_LOG_FILE, so a re-run with the
+// same log can pass from stale lines even if this run emits none. Capture
+// the file's size before the run and assert only on the bytes appended by
+// this run.
+static uint64_t log_file_size(const char* path) {
+    if (!path || !*path) return 0;
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER size{};
+    const BOOL ok = GetFileSizeEx(f, &size);
+    CloseHandle(f);
+    return ok ? static_cast<uint64_t>(size.QuadPart) : 0;
+}
+
+static std::string read_log_file_from(const char* path, uint64_t offset) {
+    std::string text;
+    if (!path || !*path) return text;
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return text;
+    LARGE_INTEGER pos{};
+    pos.QuadPart = static_cast<LONGLONG>(offset);
+    if (!SetFilePointerEx(f, pos, nullptr, FILE_BEGIN)) {
+        CloseHandle(f);
+        return text;
+    }
+    char buf[4096];
+    DWORD got = 0;
+    while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got > 0) {
+        text.append(buf, got);
+    }
+    CloseHandle(f);
+    return text;
+}
+
 int main() {
+    // The dispatcher checks below read the shim's JSONL log, so BX_LOG_FILE
+    // must name it before the process starts (`bx-cli run --log`). Setting it
+    // here would be too late: AcpHal.dll imports bx_runtime_veh.dll, which
+    // reads BX_LOG_FILE once in DLL_PROCESS_ATTACH, before main runs.
+    char log_path[MAX_PATH]{};
+    const DWORD n = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
+    if (n == 0 || n >= sizeof(log_path)) {
+        std::fprintf(stderr, "FAIL: BX_LOG_FILE must be set before launch (run under bx-cli run --log)\n");
+        return 1;
+    }
+    const uint64_t log_start = log_file_size(log_path);
+
     void* object = nullptr;
     CHECK(AcpHalCreate(&object) == S_OK && object);
     auto* hal = static_cast<IUnknown*>(object);
@@ -186,8 +243,51 @@ int main() {
     CHECK(!unreg_cb(v0, tok2, 0));
     set_focus(v0, 0x2);
 
+    // Slot 14: IGameInput::CreateDispatcher. The singleton refcount is checked
+    // below via the pre-existing GameInput release sequence, which must be
+    // unchanged by dispatcher creation.
+    using CreateDispatcherFn = HRESULT (WINAPI*)(IUnknown*, void**);
+    using DispatchFn = bool (WINAPI*)(IUnknown*, uint64_t);
+    using OpenWaitHandleFn = HRESULT (WINAPI*)(IUnknown*, HANDLE*);
+    auto create_dispatcher = reinterpret_cast<CreateDispatcherFn>(table[14]);
+    CHECK(create_dispatcher(v0, nullptr) == E_POINTER);
+    void* dispatcher = reinterpret_cast<void*>(uintptr_t{1});
+    CHECK(create_dispatcher(v0, &dispatcher) == S_OK && dispatcher);
+    auto* disp_unknown = static_cast<IUnknown*>(dispatcher);
+    auto** disp_table = *reinterpret_cast<void***>(disp_unknown);
+    void* disp_qi = nullptr;
+    CHECK(reinterpret_cast<HRESULT (WINAPI*)(IUnknown*, REFIID, void**)>(disp_table[0])(
+              disp_unknown, IID_IUnknown, &disp_qi) == S_OK && disp_qi == dispatcher);
+    CHECK(disp_unknown->Release() == 1);
+    void* disp_other = reinterpret_cast<void*>(uintptr_t{1});
+    CHECK(reinterpret_cast<HRESULT (WINAPI*)(IUnknown*, REFIID, void**)>(disp_table[0])(
+              disp_unknown, kUnknownIid, &disp_other) == E_NOINTERFACE && !disp_other);
+    auto dispatch = reinterpret_cast<DispatchFn>(disp_table[3]);
+    CHECK(!dispatch(disp_unknown, 0));
+    CHECK(!dispatch(disp_unknown, 1000000));
+    auto open_wait = reinterpret_cast<OpenWaitHandleFn>(disp_table[4]);
+    CHECK(open_wait(disp_unknown, nullptr) == E_POINTER);
+    HANDLE wait1 = nullptr, wait2 = nullptr;
+    CHECK(open_wait(disp_unknown, &wait1) == S_OK && wait1);
+    CHECK(WaitForSingleObject(wait1, 0) == WAIT_TIMEOUT);
+    CHECK(open_wait(disp_unknown, &wait2) == S_OK && wait2 && wait2 != wait1);
+    CHECK(CloseHandle(wait1) && CloseHandle(wait2));
+    CHECK(disp_unknown->Release() == 0);
+
+    // `dispatch_mode` logs each manual/automatic transition with the live
+    // dispatcher count. These checks catch a Release that never calls
+    // `on_dispatcher_released` (no `live_dispatchers=0` line). They cannot
+    // catch a missing `delete this`, which runs after the counter update.
+    {
+        const std::string log = read_log_file_from(log_path, log_start);
+        CHECK(log.find("live_dispatchers=1") != std::string::npos);
+        CHECK(log.find("live_dispatchers=0") != std::string::npos);
+        CHECK(log.find("mode=manual") != std::string::npos);
+        CHECK(log.find("mode=automatic") != std::string::npos);
+    }
+
     CHECK(v0->Release() == 1);
     CHECK(input->Release() == 0);
     FreeLibrary(dll);
-    std::puts("PASS: audio mappings, APU and DSP queues, GameInput ordinal 1 and device callbacks");
+    std::puts("PASS: audio mappings, APU and DSP queues, GameInput ordinal 1, device callbacks, dispatcher");
 }
