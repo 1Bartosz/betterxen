@@ -955,7 +955,7 @@ int main(int argc, char** argv) {
         void* host_queue = nullptr;
         REQUIRE(queue->QueryInterface(kIidProxyHost, &host_queue) == S_OK && host_queue, "host queue behind the proxy");
         void** const real_vtable = *reinterpret_cast<void***>(host_queue);
-        void* hooked_vtable[kQueueSlots];
+        static void* hooked_vtable[kQueueSlots];
         std::memcpy(hooked_vtable, real_vtable, sizeof(hooked_vtable));
         g_faults.signal = reinterpret_cast<QueueSignalFn>(real_vtable[kSlotQueueSignal]);
         hooked_vtable[kSlotQueueSignal] = reinterpret_cast<void*>(&hooked_signal);
