@@ -1,5 +1,6 @@
 //! Track A (M1-A1): Native ARM64 macOS CLI for BetterXen hybrid execution.
 
+mod drives;
 mod stage;
 mod supervise;
 
@@ -876,6 +877,25 @@ fn cmd_run(args: &[String]) -> ExitCode {
             ));
             return ExitCode::FAILURE;
         }
+    }
+
+    // An Xbox title opens its package on G: and writes temporary files to T:. A missing drive
+    // only matters to such a title, so it is reported and the run goes on.
+    match abs_exe.parent() {
+        Some(package_dir) => match drives::map_xbox_drives(&environment_dir, package_dir) {
+            Ok(mappings) => {
+                for mapping in &mappings {
+                    match mapping {
+                        drives::Mapping::Foreign { .. } => diag(mapping.describe()),
+                        _ => diag(format_args!("bx-cli: {}", mapping.describe())),
+                    }
+                }
+            }
+            Err(e) => diag(format_args!(
+                "warning: Xbox drives G: and T: not mapped: {e}"
+            )),
+        },
+        None => diag("warning: Xbox drive G: not mapped: the executable has no parent directory"),
     }
 
     let mut cmd = if let Some(ref bname) = bottle {
