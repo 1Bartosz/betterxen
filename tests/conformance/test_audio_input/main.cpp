@@ -40,6 +40,10 @@ int main() {
     void *va = nullptr, *second = nullptr;
     uint32_t base = 0, other = 0;
     CHECK(ApuAlloc(&va, &base, 64, 64) == E_OUTOFMEMORY && !va && !base);
+    // A zero-capacity heap must not report S_OK: ApuAlloc would otherwise
+    // accept a 64-byte allocation against `capacity - used == 0` (#580).
+    CHECK(ApuCreateHeap(0, 0) == E_INVALIDARG);
+    CHECK(ApuAlloc(&va, &base, 64, 64) == E_OUTOFMEMORY && !va && !base);
     CHECK(ApuCreateHeap(64, 64) == S_OK);
     CHECK(ApuAlloc(&va, nullptr, 64, 64) == S_OK && va);
     CHECK(ApuFree(va) == S_OK);
