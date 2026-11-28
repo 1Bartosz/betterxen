@@ -165,7 +165,9 @@ bool parse_context_field(const std::string& line, uintptr_t& value) {
     if (key == std::string::npos) {
         return false;
     }
-    const char* start = line.c_str() + key;
+    // Parse from the value, after "context=". Starting at the key would make
+    // strtoull read the hex digit 'c' from "context" and stop at 'o' (#520).
+    const char* start = line.c_str() + key + std::strlen("context=");
     char* end = nullptr;
     const unsigned long long parsed = std::strtoull(start, &end, 16);
     if (end == start) {

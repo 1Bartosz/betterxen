@@ -631,8 +631,11 @@ int main() {
             const size_t decision = detail.find("decision=");
             const size_t hr = detail.find("hr=");
             // The summarizer extracts these by key, so the order the emitter
-            // writes them is the order it relies on.
-            if (!(pso != std::string::npos && pso < stage && stage < decision && decision < hr)) {
+            // writes them is the order it relies on. Every key must be present:
+            // a missing one is npos, the largest value, which would satisfy `<`.
+            const bool all_present = pso != std::string::npos && stage != std::string::npos &&
+                                     decision != std::string::npos && hr != std::string::npos;
+            if (!(all_present && pso < stage && stage < decision && decision < hr)) {
                 order_ok = false;
             }
             const bool unclassified = detail.find("unclassified") != std::string::npos;

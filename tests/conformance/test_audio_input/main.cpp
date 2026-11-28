@@ -142,8 +142,8 @@ int main() {
     void *va = nullptr, *second = nullptr;
     uint32_t base = 0, other = 0;
     CHECK(ApuAlloc(&va, &base, 64, 64) == E_OUTOFMEMORY && !va && !base);
-    // A zero-capacity heap must not report S_OK: ApuAlloc would otherwise
-    // accept a 64-byte allocation against `capacity - used == 0` (#580).
+    // A zero-capacity heap must not report S_OK: it can never satisfy an
+    // allocation (#580). ApuAlloc still refuses with E_OUTOFMEMORY.
     CHECK(ApuCreateHeap(0, 0) == E_INVALIDARG);
     CHECK(ApuAlloc(&va, &base, 64, 64) == E_OUTOFMEMORY && !va && !base);
     CHECK(ApuCreateHeap(64, 64) == S_OK);
@@ -182,7 +182,10 @@ int main() {
         CHECK(file_contains(log_path, log_start, "\"event\":\"unimpl_api\"", "AcpHal.dll!AcpHalAllocateShapeContexts"));
         CHECK(file_contains(log_path, log_start, "\"event\":\"unimpl_api\"", "AcpHal.dll!AcpHalReleaseShapeContexts"));
     } else {
-        std::fprintf(stderr, "SKIP: BX_LOG_FILE is not set; stub log records not verified\n");
+        // Unreachable under `bx-cli run --log`. A SKIP that still exits 0 would
+        // contradict the exit-77 protocol, so a missing log is a failure.
+        std::fprintf(stderr, "FAIL: BX_LOG_FILE must be set before launch (run under bx-cli run --log)\n");
+        return 1;
     }
 
     void *apu = nullptr, *peer = nullptr, *dsp = nullptr;

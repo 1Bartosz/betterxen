@@ -65,8 +65,9 @@ HRESULT WINAPI AcpHalReleaseShapeContexts(void) {
 HRESULT WINAPI ApuCreateHeap(uint32_t cached, uint32_t non_cached) {
     std::lock_guard guard(heap_lock);
     if (allocations) return HRESULT_FROM_WIN32(ERROR_BUSY);
-    // A zero-capacity heap must not report S_OK: ApuAlloc would then accept a
-    // 64-byte allocation against `capacity - used == 0` (#580).
+    // A zero-capacity heap must not report S_OK: it can never satisfy an
+    // allocation, so creating it is a caller error (#580). ApuAlloc already
+    // refused such requests with E_OUTOFMEMORY.
     if (uint64_t(cached) + non_cached == 0) return E_INVALIDARG;
     // Invariant: allocations == nullptr implies used == 0; reset explicitly.
     used = 0;
