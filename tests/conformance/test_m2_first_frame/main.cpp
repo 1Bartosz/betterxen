@@ -1,5 +1,12 @@
 // Original synthetic M2 workload. The compute output is copied into the flip
 // buffer and read back through a placed D3D12 buffer before the host flip.
+//
+// Limitations: the frame is a compute write copied into the back buffer, not a
+// rasterized draw. The shader-gate stage covers only the DXIL fast path. The
+// pixel compare reads pre-flip back-buffer contents, not what reached the
+// screen. The readback lives in the D3D12 WRITE_BACK backing heap's own map;
+// the xmem page only names the configured region and is checked to stay
+// untouched, so this does not show xmem-backed placed memory (#469).
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
@@ -81,8 +88,19 @@ struct Region {
     SIZE_T count = 1;
     ULONG_PTR page = 0;
     void* view = nullptr;
-    BxD3d12VirtualMemoryConfig config{BX_D3D12_VMEM_MAGIC, sizeof(BxD3d12VirtualMemoryConfig), 1,
-                                     BX_D3D12_VMEM_FLAG_BACKING_HEAP, 0, page_bytes, 0, 0};
+    BxD3d12VirtualMemoryConfig config = [] {
+        // Assigned by name so a field reorder in vmem.h cannot compile silently.
+        BxD3d12VirtualMemoryConfig c{};
+        c.magic = BX_D3D12_VMEM_MAGIC;
+        c.struct_size = sizeof(BxD3d12VirtualMemoryConfig);
+        c.version = 1;
+        c.flags = BX_D3D12_VMEM_FLAG_BACKING_HEAP;
+        c.base_va = 0;
+        c.size_bytes = page_bytes;
+        c.reserved = 0;
+        c.cpu_pointer = 0;
+        return c;
+    }();
     ~Region() {
         if (config.base_va) {
             config.base_va = config.size_bytes = 0;
@@ -244,9 +262,23 @@ void run(bool inject_pixel_mismatch) {
     checked(chain->GetHostSwapChain(IID_PPV_ARGS(&host)), "get host swapchain");
     UINT before = 0, after = 0;
     checked(host->GetLastPresentCount(&before), "initial host present count");
+    ComPtr<ID3D12Fence> fence;
+    checked(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "readback fence");
     queue->ExecuteCommandLists(1, commands);
     require(chain->Present(0, 0) == S_OK, "PresentX");
     checked(chain->WaitForIdle(5000), "wait for frame");
+    // Wait on our own queue fence before the CPU reads the backing map, so the
+    // readback does not depend on what WaitForIdle covers.
+    checked(queue->Signal(fence.Get(), 1), "signal readback fence");
+    if (fence->GetCompletedValue() < 1) {
+        HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        require(done != nullptr, "readback fence event");
+        const HRESULT wait_hr = fence->SetEventOnCompletion(1, done);
+        const DWORD waited = SUCCEEDED(wait_hr) ? WaitForSingleObject(done, 5000) : WAIT_FAILED;
+        cleanup(CloseHandle(done) != 0, "close readback fence event");
+        checked(wait_hr, "readback fence SetEventOnCompletion");
+        require(waited == WAIT_OBJECT_0, "readback fence wait timed out");
+    }
     checked(host->GetLastPresentCount(&after), "final host present count");
     require(after == before + 1, "host must present exactly once");
     checkpoint(true, "one host present completed");
@@ -254,6 +286,8 @@ void run(bool inject_pixel_mismatch) {
     stage = "pixel_readback";
     auto pixels = reinterpret_cast<const uint32_t*>(region.config.cpu_pointer);
     for (UINT i = 0; i < width * height; ++i) {
+        // Mirrors fill_cs66.hlsl in shader-transpiler/crates/d3dmetal-harness/probe/shaders;
+        // a change to that shader must change this formula too.
         uint32_t v = i * 0x9e3779b1u;
         uint32_t expected = (v ^ (v >> 15)) + 0x01234567u;
         if (pixels[i] != expected) {
