@@ -2,6 +2,7 @@
 #include <immintrin.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -122,13 +123,22 @@ static std::vector<ClwbRecord> parse_clwb_records(const std::string& data) {
         if (len_key == std::string::npos) {
             continue;
         }
-        rec.len = std::stoull(line.substr(len_key + 4));
+        // strtoull, not stoull: a malformed record must not throw past the FAIL message.
+        char* len_end = nullptr;
+        rec.len = std::strtoull(line.c_str() + len_key + 4, &len_end, 10);
+        if (len_end == line.c_str() + len_key + 4) {
+            continue;
+        }
         // total_traps=%llu
         const size_t tt_key = line.find("total_traps=");
         if (tt_key == std::string::npos) {
             continue;
         }
-        rec.total_traps = std::stoull(line.substr(tt_key + 12));
+        char* tt_end = nullptr;
+        rec.total_traps = std::strtoull(line.c_str() + tt_key + 12, &tt_end, 10);
+        if (tt_end == line.c_str() + tt_key + 12) {
+            continue;
+        }
         records.push_back(rec);
     }
     return records;

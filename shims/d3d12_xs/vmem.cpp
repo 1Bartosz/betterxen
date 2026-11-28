@@ -119,9 +119,12 @@ bool try_charge(uint64_t bytes) {
     return true;
 }
 
-/* Check the mirror first and pass xmem only an amount the mirror agrees is
- * outstanding. Refusing leaves a charge in place, which is safe (the cap stays
- * strict); crediting xmem first would lose other heaps' charges. */
+/* Each heap wrapper calls this exactly once, on its final Release, which is what
+ * keeps a heap from being released twice. The mirror check below is a coarse
+ * guard on the total: it refuses a release larger than all outstanding graphics
+ * charges (refusing leaves a charge in place, so the cap stays strict), but as a
+ * single total it cannot tell one heap's double release from another heap's
+ * charge. */
 void release_charge(uint64_t bytes) {
     Guard guard(g_section);
     if (bytes > g_record.charged_private_bytes) {
@@ -806,7 +809,10 @@ extern "C" HRESULT bx_d3d12_configure_virtual_memory(void* config) {
 
     char detail[384];
     std::snprintf(detail, sizeof(detail),
-                  "profile=%s title_limit=%llu xmem_used=%llu xmem_region=%d base=0x%llx region_bytes=%llu gpu_heap_bytes=%llu",
+                  /* cap_used is everything counted against the title cap, graphics heaps
+                   * included (xmem's stats include external charges); gpu_heap_bytes is the
+                   * graphics part of it, so the two must not be added. */
+                  "profile=%s title_limit=%llu cap_used=%llu xmem_region=%d base=0x%llx region_bytes=%llu gpu_heap_bytes=%llu",
                   profile_name(profile), static_cast<unsigned long long>(cap),
                   static_cast<unsigned long long>(stats.committed_virtual_bytes + stats.allocated_physical_bytes),
                   have_region ? 1 : 0, static_cast<unsigned long long>(have_region ? region.base_va : 0),

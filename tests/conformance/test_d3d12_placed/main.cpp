@@ -433,6 +433,11 @@ void check_placed_heap_charge(ID3D12Device* device, const char* log_path, uint64
  * that the private-ledger version allowed. */
 void check_graphics_xmem_pairing(ID3D12Device* device, uint64_t cap) {
     if (cap != (512ull << 20)) {
+        /* The pairing sizes are fixed against a 512 MiB cap, so at any other cap the
+         * cross-DLL budget check does not run. Say so rather than pass silently. */
+        std::printf("SKIP: graphics/xmem pairing needs a 512 MiB cap "
+                    "(BX_MEM_LIMIT_MB=512 bx-cli run --inherit-env ...); this run's cap is %llu MiB\n",
+                    static_cast<unsigned long long>(cap >> 20));
         return;
     }
     const uint64_t heap_bytes = 300ull << 20;
