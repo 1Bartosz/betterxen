@@ -49,4 +49,13 @@ Report exact commands, host hardware/macOS/CrossOver versions, and pass/fail/ski
 git commit -s -m "Describe the change"
 ```
 
+## Review and Merging
+
+- A PR needs at least one current approval, passing required checks and resolved blocking conversations. Any later push that changes the PR dismisses earlier approvals.
+- You do not merge your own PR. A maintainer other than the original author merges it.
+- Please leave **Allow edits by maintainers** enabled on fork PRs (GitHub does not offer it for organization-owned forks). Maintainers may then resolve conflicts and push fixes to your branch, and may still merge it.
+- A maintainer may re-approve after their own routine fix (conflicts, changelog, minor docs). Substantive changes need approval from someone who did not write them.
+
+The full rule, including what GitHub does not enforce, is in [AGENTS.md](AGENTS.md) §7, "Merge eligibility".
+
 See [AGENTS.md](AGENTS.md), [docs/legal.md](docs/legal.md), [SECURITY.md](SECURITY.md), and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
