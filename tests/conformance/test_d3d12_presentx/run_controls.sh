@@ -44,9 +44,21 @@ run wrong-expectation wrong-expectation
 must_fail wrong-expectation pixels
 expect wrong-expectation out "pixels_wrong=29184 "
 
+run unblocked-post-wait unblocked-post-wait
+must_fail unblocked-post-wait sync
+expect unblocked-post-wait out "post-present fence wait failure: hr=0x00000000"
+
+run wrong-removed-hr wrong-removed-hr
+must_fail wrong-removed-hr sync
+expect wrong-removed-hr out "post-present device reset must return DXGI_ERROR_DEVICE_RESET: hr=0x80040203"
+
+run zero-timeout-overrun zero-timeout-overrun
+must_fail zero-timeout-overrun sync
+expect zero-timeout-overrun out "WaitForIdle(0) must time out without signaling:"
+
 if [ "$bad" -ne 0 ]; then
     echo "FAIL: run_controls (output kept in $dir)"
     exit 1
 fi
 rm -rf "$dir"
-echo "PASS: run_controls (1 normal run, 3 negative controls)"
+echo "PASS: run_controls (1 normal run, 6 negative controls)"

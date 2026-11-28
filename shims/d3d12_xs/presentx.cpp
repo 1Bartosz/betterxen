@@ -15,6 +15,11 @@ namespace {
 
 constexpr HRESULT kWaitTimedOut = static_cast<HRESULT>(0x800705B4u); /* HRESULT_FROM_WIN32(ERROR_TIMEOUT) */
 
+bool is_device_removed_hr(HRESULT hr) {
+    return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_HUNG ||
+           hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+}
+
 void log_hr(bx_log_level_t level, const char* event, const char* what, HRESULT hr) {
     char detail[160];
     std::snprintf(detail, sizeof(detail), "%s hr=0x%08lx", what, static_cast<unsigned long>(hr));
@@ -61,6 +66,7 @@ private:
     HRESULT signal_locked(UINT64* value);
     HRESULT wait_locked(UINT64 value, ULONGLONG start, DWORD timeout_ms);
     HRESULT idle_locked(ULONGLONG start, DWORD timeout_ms);
+    HRESULT post_present_failure(const char* event, const char* what, HRESULT hr);
     HRESULT removed_reason();
     void destroy();
 
@@ -237,7 +243,27 @@ HRESULT BxPresentSwapChain::wait_locked(UINT64 value, ULONGLONG start, DWORD tim
     return kWaitTimedOut;
 }
 
+HRESULT BxPresentSwapChain::post_present_failure(const char* event, const char* what, HRESULT hr) {
+    const HRESULT removed = removed_reason();
+    if (FAILED(removed)) {
+        log_hr(BX_LOG_ERROR, "present_device_removed", what, removed);
+        return removed;
+    }
+    if (is_device_removed_hr(hr)) {
+        return hr;
+    }
+    if (event) {
+        log_hr(BX_LOG_ERROR, event, what, hr);
+    }
+    needs_idle_ = true;
+    return BX_PRESENT_E_COMPLETION_UNCONFIRMED;
+}
+
 HRESULT BxPresentSwapChain::idle_locked(ULONGLONG start, DWORD timeout_ms) {
+    if (GetTickCount64() - start >= timeout_ms) {
+        bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "present_wait_timeout", "wait budget expired before fence signal");
+        return kWaitTimedOut;
+    }
     UINT64 value = 0;
     HRESULT hr = signal_locked(&value);
     return FAILED(hr) ? hr : wait_locked(value, start, timeout_ms);
@@ -371,12 +397,8 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
     UINT64 value = 0;
     HRESULT sync_hr = signal_locked(&value);
     if (FAILED(sync_hr)) {
-        /*
-         * The host has the frame, but no fence value follows it, so buffer_value_ would still name
-         * older work. signal_locked logged the host HRESULT.
-         */
-        needs_idle_ = true;
-        return BX_PRESENT_E_COMPLETION_UNCONFIRMED;
+        /* signal_locked already logged present_signal_failed when the device stays live. */
+        return post_present_failure(nullptr, "signal after Present", sync_hr);
     }
     if (presented_index < DXGI_MAX_SWAP_CHAIN_BUFFERS) {
         buffer_value_[presented_index] = value;
@@ -388,9 +410,7 @@ HRESULT STDMETHODCALLTYPE BxPresentSwapChain::Present(UINT sync_interval, UINT f
             return BX_PRESENT_E_NEXT_BUFFER_BUSY;
         }
         if (FAILED(sync_hr)) {
-            log_hr(BX_LOG_ERROR, "present_post_wait_failed", "wait for next back buffer", sync_hr);
-            needs_idle_ = true;
-            return BX_PRESENT_E_COMPLETION_UNCONFIRMED;
+            return post_present_failure("present_post_wait_failed", "wait for next back buffer", sync_hr);
         }
     }
     return hr;
