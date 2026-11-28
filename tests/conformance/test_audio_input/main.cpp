@@ -39,12 +39,34 @@ void WINAPI dummy_device_callback(uint64_t, void*, void*, uint64_t, uint32_t, ui
 // count is observable: `Release` returning 0 proves the count reached zero,
 // not that the object was freed. Removing `delete this` would leave the
 // count correct while leaking, so this assertion is what catches it.
-static std::string read_log_file(const char* path) {
+// `bx-cli run` appends to the supplied BX_LOG_FILE, so a re-run with the
+// same log can pass from stale lines even if this run emits none. Capture
+// the file's size before the run and assert only on the bytes appended by
+// this run. This works whether the log path came from the runner or from
+// the temp file the fixture creates below.
+static uint64_t log_file_size(const char* path) {
+    if (!path || !*path) return 0;
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER size{};
+    const BOOL ok = GetFileSizeEx(f, &size);
+    CloseHandle(f);
+    return ok ? static_cast<uint64_t>(size.QuadPart) : 0;
+}
+
+static std::string read_log_file_from(const char* path, uint64_t offset) {
     std::string text;
     if (!path || !*path) return text;
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return text;
+    LARGE_INTEGER pos{};
+    pos.QuadPart = static_cast<LONGLONG>(offset);
+    if (!SetFilePointerEx(f, pos, nullptr, FILE_BEGIN)) {
+        CloseHandle(f);
+        return text;
+    }
     char buf[4096];
     DWORD got = 0;
     while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got > 0) {
@@ -67,6 +89,7 @@ int main() {
             CHECK(GetTempFileNameA(temp_dir, "bxg", 0, log_path) != 0);
             CHECK(SetEnvironmentVariableA("BX_LOG_FILE", log_path));
         }
+        const uint64_t log_start = log_file_size(log_path);
 
     void* object = nullptr;
     CHECK(AcpHalCreate(&object) == S_OK && object);
@@ -259,7 +282,7 @@ int main() {
     // on every transition, so a `delete this` removal that leaks the object
     // would leave `live_dispatchers=1` behind and fail here.
     {
-        const std::string log = read_log_file(log_path);
+        const std::string log = read_log_file_from(log_path, log_start);
         CHECK(log.find("live_dispatchers=1") != std::string::npos);
         CHECK(log.find("live_dispatchers=0") != std::string::npos);
         CHECK(log.find("mode=manual") != std::string::npos);
