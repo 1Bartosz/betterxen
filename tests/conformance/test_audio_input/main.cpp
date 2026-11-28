@@ -36,14 +36,14 @@ void WINAPI dummy_device_callback(uint64_t, void*, void*, uint64_t, uint32_t, ui
 
 // Read the JSONL log the shim wrote, so the dispatcher's live-reference
 // count can be checked rather than assumed. The log is the only place the
-// count is observable: `Release` returning 0 proves the count reached zero,
-// not that the object was freed. Removing `delete this` would leave the
-// count correct while leaking, so this assertion is what catches it.
+// count is observable: `Release` returning 0 proves the reference count
+// reached zero, and the `dispatch_mode` lines prove the live-dispatcher
+// counter followed it. They do not prove the object was freed: `Release`
+// updates the counter before `delete this`, so a leak would not show here.
 // `bx-cli run` appends to the supplied BX_LOG_FILE, so a re-run with the
 // same log can pass from stale lines even if this run emits none. Capture
 // the file's size before the run and assert only on the bytes appended by
-// this run. This works whether the log path came from the runner or from
-// the temp file the fixture creates below.
+// this run.
 static uint64_t log_file_size(const char* path) {
     if (!path || !*path) return 0;
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -77,19 +77,17 @@ static std::string read_log_file_from(const char* path, uint64_t offset) {
 }
 
 int main() {
-        // `bx-cli run` sets BX_LOG_FILE for the guest. When the fixture is
-        // run directly there is no such variable, so create a temp log and
-        // point the shim at it; otherwise the assertions below would read an
-        // empty file and fail for the wrong reason.
-        char log_path[MAX_PATH]{};
-        DWORD n = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
-        if (n == 0 || n >= sizeof(log_path)) {
-            char temp_dir[MAX_PATH]{};
-            CHECK(GetTempPathA(sizeof(temp_dir), temp_dir) > 0);
-            CHECK(GetTempFileNameA(temp_dir, "bxg", 0, log_path) != 0);
-            CHECK(SetEnvironmentVariableA("BX_LOG_FILE", log_path));
-        }
-        const uint64_t log_start = log_file_size(log_path);
+    // The dispatcher checks below read the shim's JSONL log, so BX_LOG_FILE
+    // must name it before the process starts (`bx-cli run --log`). Setting it
+    // here would be too late: AcpHal.dll imports bx_runtime_veh.dll, which
+    // reads BX_LOG_FILE once in DLL_PROCESS_ATTACH, before main runs.
+    char log_path[MAX_PATH]{};
+    const DWORD n = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
+    if (n == 0 || n >= sizeof(log_path)) {
+        std::fprintf(stderr, "FAIL: BX_LOG_FILE must be set before launch (run under bx-cli run --log)\n");
+        return 1;
+    }
+    const uint64_t log_start = log_file_size(log_path);
 
     void* object = nullptr;
     CHECK(AcpHalCreate(&object) == S_OK && object);
@@ -276,11 +274,10 @@ int main() {
     CHECK(CloseHandle(wait1) && CloseHandle(wait2));
     CHECK(disp_unknown->Release() == 0);
 
-    // The live-dispatcher count is the only observable evidence that the
-    // dispatcher was destroyed: `Release` returning 0 proves the count, not
-    // the deallocation. `dispatch_mode` logs `mode=manual live_dispatchers=N`
-    // on every transition, so a `delete this` removal that leaks the object
-    // would leave `live_dispatchers=1` behind and fail here.
+    // `dispatch_mode` logs each manual/automatic transition with the live
+    // dispatcher count. These checks catch a Release that never calls
+    // `on_dispatcher_released` (no `live_dispatchers=0` line). They cannot
+    // catch a missing `delete this`, which runs after the counter update.
     {
         const std::string log = read_log_file_from(log_path, log_start);
         CHECK(log.find("live_dispatchers=1") != std::string::npos);
