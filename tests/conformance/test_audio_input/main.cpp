@@ -110,15 +110,15 @@ int main() {
         // run directly there is no such variable, so create a temp log and
         // point the shim at it; otherwise the assertions below would read an
         // empty file and fail for the wrong reason.
-        char log_path[MAX_PATH]{};
-        DWORD n = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
-        if (n == 0 || n >= sizeof(log_path)) {
+        char dispatcher_log_path[MAX_PATH]{};
+        DWORD n = GetEnvironmentVariableA("BX_LOG_FILE", dispatcher_log_path, sizeof(dispatcher_log_path));
+        if (n == 0 || n >= sizeof(dispatcher_log_path)) {
             char temp_dir[MAX_PATH]{};
             CHECK(GetTempPathA(sizeof(temp_dir), temp_dir) > 0);
-            CHECK(GetTempFileNameA(temp_dir, "bxg", 0, log_path) != 0);
-            CHECK(SetEnvironmentVariableA("BX_LOG_FILE", log_path));
+            CHECK(GetTempFileNameA(temp_dir, "bxg", 0, dispatcher_log_path) != 0);
+            CHECK(SetEnvironmentVariableA("BX_LOG_FILE", dispatcher_log_path));
         }
-        const uint64_t log_start = log_file_size(log_path);
+        const uint64_t log_start = log_file_size(dispatcher_log_path);
 
     void* object = nullptr;
     CHECK(AcpHalCreate(&object) == S_OK && object);
@@ -331,7 +331,7 @@ int main() {
     // on every transition, so a `delete this` removal that leaks the object
     // would leave `live_dispatchers=1` behind and fail here.
     {
-        const std::string log = read_log_file_from(log_path, log_start);
+        const std::string log = read_log_file_from(dispatcher_log_path, log_start);
         CHECK(log.find("live_dispatchers=1") != std::string::npos);
         CHECK(log.find("live_dispatchers=0") != std::string::npos);
         CHECK(log.find("mode=manual") != std::string::npos);
