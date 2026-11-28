@@ -33,5 +33,7 @@ esac
 ```
 
 `bx-cli` does not itself reinterpret 77 (it is the guest's own status, and other fixtures use
-their own conventions), so always read the status before reporting a run. A run that prints a
-`SKIP:` line without exit 77, or exits 77 without one, is a defect in that fixture.
+their own conventions), so always read the status before reporting a run. For a fixture that
+adopts this protocol, printing a `SKIP:` line without exit 77, or exiting 77 without one, is a
+defect. Older per-check skip conventions, such as `test_d3d12_xs`, are separate: its `SKIP:`
+lines are informational and the fixture exits according to `g_failures`.

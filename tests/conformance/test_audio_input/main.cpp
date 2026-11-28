@@ -34,7 +34,7 @@ HRESULT WINAPI XDspDisconnect(void*);
 namespace {
 void WINAPI dummy_device_callback(uint64_t, void*, void*, uint64_t, uint32_t, uint32_t) {}
 
-bool file_contains(const char* path, const char* needle_a, const char* needle_b) {
+bool file_contains(const char* path, uint64_t offset, const char* needle_a, const char* needle_b) {
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
@@ -42,11 +42,25 @@ bool file_contains(const char* path, const char* needle_a, const char* needle_b)
     }
     bool found = false;
     LARGE_INTEGER size = {};
-    if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && size.QuadPart < (64ll << 20)) {
-        auto* buf = static_cast<char*>(HeapAlloc(GetProcessHeap(), 0, static_cast<SIZE_T>(size.QuadPart) + 1));
-        DWORD got = 0;
-        if (buf && ReadFile(f, buf, static_cast<DWORD>(size.QuadPart), &got, nullptr)) {
-            buf[got] = '\0';
+    if (GetFileSizeEx(f, &size) && size.QuadPart >= 0 &&
+        offset <= static_cast<uint64_t>(size.QuadPart) &&
+        static_cast<uint64_t>(size.QuadPart) - offset < (64ull << 20)) {
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(offset);
+        if (!SetFilePointerEx(f, pos, nullptr, FILE_BEGIN)) {
+            CloseHandle(f);
+            return false;
+        }
+        const DWORD remaining = static_cast<DWORD>(static_cast<uint64_t>(size.QuadPart) - offset);
+        auto* buf = static_cast<char*>(HeapAlloc(GetProcessHeap(), 0, static_cast<SIZE_T>(remaining) + 1));
+        DWORD total = 0;
+        while (buf && total < remaining) {
+            DWORD got = 0;
+            if (!ReadFile(f, buf + total, remaining - total, &got, nullptr) || got == 0) break;
+            total += got;
+        }
+        if (buf && total == remaining) {
+            buf[total] = '\0';
             /* Both needles must sit on the same JSONL line. */
             for (char* line = buf; line && *line && !found;) {
                 char* end = std::strchr(line, '\n');
@@ -165,8 +179,8 @@ int main() {
     char log_path[MAX_PATH];
     DWORD log_len = GetEnvironmentVariableA("BX_LOG_FILE", log_path, sizeof(log_path));
     if (log_len > 0 && log_len < sizeof(log_path)) {
-        CHECK(file_contains(log_path, "\"event\":\"unimpl_api\"", "AcpHal.dll!AcpHalAllocateShapeContexts"));
-        CHECK(file_contains(log_path, "\"event\":\"unimpl_api\"", "AcpHal.dll!AcpHalReleaseShapeContexts"));
+        CHECK(file_contains(log_path, log_start, "\"event\":\"unimpl_api\"", "AcpHal.dll!AcpHalAllocateShapeContexts"));
+        CHECK(file_contains(log_path, log_start, "\"event\":\"unimpl_api\"", "AcpHal.dll!AcpHalReleaseShapeContexts"));
     } else {
         std::fprintf(stderr, "SKIP: BX_LOG_FILE is not set; stub log records not verified\n");
     }
