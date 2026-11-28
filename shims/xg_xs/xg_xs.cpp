@@ -104,7 +104,8 @@ struct Rdna2TileQuery {
     uint32_t texel_y;
 };
 
-/* Named 64 KiB tiles. The address equation is intentionally absent. */
+/* Named 64 KiB tiles. Only SW_64KB_S has its address equation implemented; see
+ * rdna2_sw64kb_prepare below for the sources and the exact scope. */
 constexpr Rdna2TileMode kRdna2TileModes[] = {
     {BX_XG_LAYOUT_SW_64KB_S, 64u * 1024u, "SW_64KB_S"},
     {BX_XG_LAYOUT_SW_64KB_D, 64u * 1024u, "SW_64KB_D"},
@@ -304,8 +305,129 @@ static TextureComputer* impl_from(bx_xg_texture_computer* self) {
     return reinterpret_cast<TextureComputer*>(self);
 }
 
-/* M3 placeholder. Validates the tile request and returns no address. */
-static HRESULT rdna2_sw64kb_prepare(const Rdna2TileQuery* query) {
+/*
+ * SW_64KB_S (AMD ADDR_SW_64KB_S, enum 9) intra-block address, for the narrow
+ * case public sources actually specify: TEXTURE2D, one array slice, one mip,
+ * one sample.
+ *
+ * Sources, both public:
+ *   [1] Microsoft, D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE, 32-bpp masks
+ *       xBytesMask = 0xAA8F and yMask = 0x5570, combined with _pdep_u32.
+ *       https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_texture_layout
+ *   [2] AMD AddrLib (MIT), the GFX10 swizzle tables and equation:
+ *       src/amd/addrlib/src/gfx10/gfx10SwizzlePattern.h  (GFX10_SW_64K_S_RBPLUS_PATINFO)
+ *       src/amd/addrlib/src/gfx10/gfx10addrlib.h         (GetSwizzlePatternFromPatternInfo)
+ *       src/amd/addrlib/inc/addrtypes.h                  (ADDR_SW_64KB_S = 9)
+ *       https://gitlab.freedesktop.org/mesa/mesa/-/tree/main/src/amd/addrlib
+ *
+ * At 32 bpp the two agree bit-for-bit, which is why this mode is the one worth
+ * implementing first. The RB+ table is used because gfx1030 is Navi2x. For
+ * SW_64KB_S the choice does not matter: GFX10_SW_64K_S_PATINFO and
+ * GFX10_SW_64K_S_RBPLUS_PATINFO select the same nibble indices at every
+ * element size (2,3,3,0 at 4 B; 3,4,4,0 at 8 B; 4,5,5,0 at 16 B), so both
+ * tables expand to the masks below. They differ for other tile modes, not
+ * for this one.
+ *
+ * For a 64 KiB tile the intra-tile byte offset of texel (x, y) is the bit
+ * interleave below, for a 32-bpp format whose tile is 128x128 texels:
+ * pdep(x * 4, 0xAA8F) | pdep(y, 0x5570). x is multiplied by 4 because the
+ * D3D12 mask is defined over xBytes, not over texel x.
+ *
+ * SW_64KB_D differs from S at 32 bpp (AddrLib nibble01 index 39 versus 2, i.e.
+ * address bits 6 and 7 swapped), and SW_64KB_R has no public GFX10 form at all
+ * (ADDR_SW_64KB_R is Reserved on GFX10; the render-target mode is
+ * ADDR_SW_64KB_R_X, whose pipe/packer XOR is not public). Both stay E_NOTIMPL.
+ */
+/* SW_64KB_S is implemented for the element sizes the RB+ tables specify:
+ * 4-byte (32-bpp RGBA8), 8-byte (BC1/BC4) and 16-byte (BC2/3/5/6H/7) blocks. */
+static bool sw64kb_s_supported(const Rdna2TileQuery* query) {
+    if (query->mode != BX_XG_LAYOUT_SW_64KB_S) {
+        return false;
+    }
+    return query->block_bytes == 4u || query->block_bytes == 8u || query->block_bytes == 16u;
+}
+
+/* Bit-interleave one axis into a 32-bpp 64 KiB standard-swizzle tile. */
+static uint32_t sw64kb_s_pdep(uint32_t value, uint32_t mask) {
+    uint32_t out = 0;
+    for (uint32_t bit = 1; bit != 0 && mask != 0; bit <<= 1) {
+        const uint32_t lowest = mask & (0u - mask);
+        if (value & bit) {
+            out |= lowest;
+        }
+        mask ^= lowest;
+    }
+    return out;
+}
+
+/*
+ * Per-element-size SW_64KB_S parameters, derived from the AddrLib RB+ tables
+ * (GFX10_SW_64K_S_RBPLUS_PATINFO, MIT). For a 64 KiB tile the intra-tile byte
+ * offset of block (x, y) is pdep(x, x_mask) | pdep(y, y_mask), where x/y are
+ * BLOCK indices (one 4x4 texel block for BC, one texel for 32 bpp).
+ *
+ * The masks below were expanded by hand from the nibble tables
+ * GFX10_SW_PATTERN_NIBBLE01/2/3 at the patinfo indices the RB+ table selects
+ * for each elemLog2 (2 -> 4 B, 3 -> 8 B, 4 -> 16 B). At 32 bpp the x mask
+ * 0xAA8C equals Microsoft's public D3D12 xBytesMask 0xAA8F with the two
+ * intra-texel byte bits (0x3) removed, and the y mask 0x5570 matches D3D12
+ * exactly - two independent public sources agreeing, which is why S is the
+ * mode implemented. The 8 B and 16 B rows come from AddrLib alone.
+ *
+ * Each row was checked to be a bijection over its tile: 4 B -> 128x128
+ * texels, 8 B -> 128x64 blocks, 16 B -> 64x64 blocks, every offset distinct,
+ * block-aligned and inside the 64 KiB tile.
+ */
+struct Sw64kbSParams {
+    uint32_t block_bytes;
+    uint32_t x_mask;
+    uint32_t y_mask;
+    uint32_t tile_blocks_x;
+    uint32_t tile_blocks_y;
+};
+
+static bool sw64kb_s_params(uint32_t block_bytes, Sw64kbSParams* out) {
+    if (!out) {
+        return false;
+    }
+    switch (block_bytes) {
+        case 4u:
+            *out = Sw64kbSParams{4u, 0xAA8Cu, 0x5570u, 128u, 128u};
+            return true;
+        case 8u:
+            *out = Sw64kbSParams{8u, 0xAAC8u, 0x5530u, 128u, 64u};
+            return true;
+        case 16u:
+            *out = Sw64kbSParams{16u, 0xAAC0u, 0x5530u, 64u, 64u};
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Intra-64KiB-tile BYTE offset for SW_64KB_S, for any supported block size. */
+static uint32_t sw64kb_s_offset(const Sw64kbSParams* params, uint32_t x, uint32_t y) {
+    return sw64kb_s_pdep(x, params->x_mask) | sw64kb_s_pdep(y, params->y_mask);
+}
+
+static bool sw64kb_s_params_for(uint32_t block_bytes, Sw64kbSParams* out) {
+    Sw64kbSParams ignored{};
+    return sw64kb_s_params(block_bytes, out ? out : &ignored);
+}
+
+/* The 64 KiB tile every named tiled mode occupies. */
+constexpr uint32_t kTileBytes = 64u * 1024u;
+
+/* True when this object is a tiled resource whose addressing is implemented:
+ * SW_64KB_S, exactly one mip and one array slice, over a supported element
+ * size. Everything else stays E_NOTIMPL and is logged by reject_if_tiled. */
+static bool tiled_addressing_ok(const Resolved* resolved) {
+    return resolved->layout == BX_XG_LAYOUT_SW_64KB_S && resolved->mip_levels == 1u &&
+           resolved->array_size == 1u && sw64kb_s_params_for(resolved->block_bytes, nullptr);
+}
+
+static HRESULT rdna2_sw64kb_prepare(const Rdna2TileQuery* query, uint32_t* offset) {
+    if (offset) *offset = 0u;
     if (!query || query->mip_width == 0u || query->mip_height == 0u || query->block_bytes == 0u) {
         return E_INVALIDARG;
     }
@@ -319,34 +441,42 @@ static HRESULT rdna2_sw64kb_prepare(const Rdna2TileQuery* query) {
     if (!found || found->tile_bytes != (64u * 1024u) || found->name == nullptr) {
         return E_INVALIDARG;
     }
-    return E_NOTIMPL;
+    if (!sw64kb_s_supported(query) || !offset) {
+        return E_NOTIMPL;
+    }
+    Sw64kbSParams params{};
+    if (!sw64kb_s_params(query->block_bytes, &params)) {
+        return E_NOTIMPL;
+    }
+    /* One 64 KiB tile covers params.tile_blocks_x * params.tile_blocks_y
+     * blocks (texels for 32 bpp, 4x4 blocks for BC). */
+    if (query->texel_x >= params.tile_blocks_x || query->texel_y >= params.tile_blocks_y) {
+        return E_INVALIDARG;
+    }
+    *offset = sw64kb_s_offset(&params, query->texel_x, query->texel_y);
+    return S_OK;
 }
 
 static HRESULT reject_if_tiled(const TextureComputer* obj, uint32_t slot, const char* method) {
     if (obj->resolved.layout == BX_XG_LAYOUT_LINEAR) {
         return S_OK;
     }
-    Rdna2TileQuery query{};
-    query.mode = obj->resolved.layout;
-    query.mip_width = obj->resolved.width;
-    query.mip_height = obj->resolved.height;
-    query.block_bytes = obj->resolved.block_bytes;
-    query.texel_x = 0u;
-    query.texel_y = 0u;
-    const HRESULT hr = rdna2_sw64kb_prepare(&query);
-    if (hr == E_NOTIMPL) {
-        const Rdna2TileMode* mode = nullptr;
-        for (const Rdna2TileMode& candidate : kRdna2TileModes) {
-            if (candidate.mode == obj->resolved.layout) {
-                mode = &candidate;
-                break;
-            }
-        }
-        char label[80];
-        std::snprintf(label, sizeof(label), "%s %s", method, mode && mode->name ? mode->name : "SW_64KB");
-        BX_VTABLE_STUB_LOG("IXGTextureAddressComputer", slot, label);
+    /* SW_64KB_S, one mip, one slice, supported element size: implemented.
+     * Everything else named is still E_NOTIMPL, and the log records which. */
+    if (tiled_addressing_ok(&obj->resolved)) {
+        return S_OK;
     }
-    return hr;
+    const Rdna2TileMode* mode = nullptr;
+    for (const Rdna2TileMode& candidate : kRdna2TileModes) {
+        if (candidate.mode == obj->resolved.layout) {
+            mode = &candidate;
+            break;
+        }
+    }
+    char label[80];
+    std::snprintf(label, sizeof(label), "%s %s", method, mode && mode->name ? mode->name : "SW_64KB");
+    BX_VTABLE_STUB_LOG("IXGTextureAddressComputer", slot, label);
+    return E_NOTIMPL;
 }
 
 static HRESULT measure_mip(const Resolved* resolved, uint32_t mip, Placement* place) {
@@ -422,6 +552,38 @@ static HRESULT build_linear_table(TextureComputer* obj) {
     }
     obj->slice_stride = cursor;
     obj->stored_mips = obj->resolved.mip_levels;
+    return S_OK;
+}
+
+/*
+ * Placement table for an implemented tiled resource. A single 64 KiB tile
+ * holds one mip, so the "row" of the tile is one row of blocks and the tile's
+ * slice stride is exactly kTileBytes. Choosing these numbers lets the existing
+ * size, layout and offset code report the tile while the element addresses
+ * still come from rdna2_sw64kb_prepare.
+ */
+static HRESULT build_tiled_table(TextureComputer* obj) {
+    if (obj->resolved.layout == BX_XG_LAYOUT_LINEAR) {
+        return S_OK;
+    }
+    if (!tiled_addressing_ok(&obj->resolved)) {
+        return S_OK; /* rejected per call, with the stub log */
+    }
+    Sw64kbSParams params{};
+    if (!sw64kb_s_params(obj->resolved.block_bytes, &params)) {
+        return E_INVALIDARG;
+    }
+    MipInfo* info = &obj->mips[0];
+    info->offset = 0u;
+    info->logical_width = obj->resolved.width;
+    info->logical_height = obj->resolved.height;
+    info->footprint_width = params.tile_blocks_x * obj->resolved.block_w;
+    info->footprint_height = params.tile_blocks_y * obj->resolved.block_h;
+    info->row_pitch = params.tile_blocks_x * params.block_bytes;
+    info->row_count = params.tile_blocks_y;
+    info->row_bytes = info->row_pitch;
+    obj->slice_stride = kTileBytes;
+    obj->stored_mips = 1u;
     return S_OK;
 }
 
@@ -706,6 +868,68 @@ static HRESULT image_and_resource_pitch(
     return S_OK;
 }
 
+/*
+ * Copy one subresource of an implemented tiled SW_64KB_S resource, in swizzle
+ * order. The image is tight rows of blocks (4x4 blocks for BC, one texel per
+ * block for 32 bpp); each block lands at its AddrLib S offset inside the
+ * 64 KiB tile. `to_resource` selects the direction.
+ */
+static HRESULT copy_tiled_sw64kb_s(
+    const Resolved* resolved,
+    bool to_resource,
+    uint8_t* resource,
+    uint64_t resource_size,
+    const uint8_t* image,
+    uint64_t image_size,
+    uint64_t image_row_pitch,
+    uint64_t image_depth_pitch
+) {
+    Sw64kbSParams params{};
+    if (!sw64kb_s_params(resolved->block_bytes, &params)) {
+        return E_NOTIMPL;
+    }
+    const uint32_t blocks_w = div_up_u32(resolved->width, resolved->block_w);
+    const uint32_t blocks_h = div_up_u32(resolved->height, resolved->block_h);
+    if (blocks_w == 0u || blocks_h == 0u || blocks_w > params.tile_blocks_x ||
+        blocks_h > params.tile_blocks_y) {
+        return E_INVALIDARG;
+    }
+    const uint64_t tight_row = uint64_t(blocks_w) * resolved->block_bytes;
+    const uint64_t row_pitch = image_row_pitch == 0u ? tight_row : image_row_pitch;
+    if (row_pitch < tight_row) {
+        return E_INVALIDARG;
+    }
+    /* One slice spans blocks_h rows at the caller's row pitch, not at the tight
+     * row, so a depth pitch between the two would leave the last row outside
+     * the slice. Only the single-slice case is implemented, but the bound must
+     * still describe a slice. */
+    if (image_depth_pitch != 0u && image_depth_pitch < uint64_t(blocks_h) * row_pitch) {
+        return E_INVALIDARG;
+    }
+    /* CopyFromSubresource passes the caller's image as `resource` and the tiled
+     * resource as `image`, so the bound for each offset follows the direction. */
+    const uint64_t tiled_size = to_resource ? resource_size : image_size;
+    const uint64_t linear_size = to_resource ? image_size : resource_size;
+    for (uint32_t by = 0; by < blocks_h; ++by) {
+        for (uint32_t bx = 0; bx < blocks_w; ++bx) {
+            const uint64_t byte_col = uint64_t(bx) * resolved->block_bytes;
+            const uint64_t image_off = uint64_t(by) * row_pitch + byte_col;
+            const uint64_t tile_off = uint64_t(sw64kb_s_offset(&params, bx, by));
+            const uint64_t end = image_off + resolved->block_bytes;
+            if (end > linear_size || tile_off + resolved->block_bytes > tiled_size ||
+                tile_off + resolved->block_bytes > kTileBytes) {
+                return E_INVALIDARG;
+            }
+            if (to_resource) {
+                std::memcpy(resource + tile_off, image + image_off, resolved->block_bytes);
+            } else {
+                std::memcpy(resource + image_off, image + tile_off, resolved->block_bytes);
+            }
+        }
+    }
+    return S_OK;
+}
+
 static ULONG WINAPI computer_add_ref(bx_xg_texture_computer* self) {
     if (!self) {
         return 0u;
@@ -819,7 +1043,9 @@ static HRESULT WINAPI computer_get_resource_base_alignment_bytes(bx_xg_texture_c
     if (tiled != S_OK) {
         return tiled;
     }
-    *alignment_bytes = kPlacementAlignment;
+    /* An implemented tiled resource must start on a tile boundary; a linear
+     * one only needs the placement alignment. */
+    *alignment_bytes = tiled_addressing_ok(&obj->resolved) ? kTileBytes : kPlacementAlignment;
     return S_OK;
 }
 
@@ -873,6 +1099,31 @@ static HRESULT WINAPI computer_get_texel_element_offset_bytes(
     if (z != 0u || array_slice >= obj->resolved.array_size || mip_level >= obj->resolved.mip_levels) {
         return E_INVALIDARG;
     }
+    if (obj->resolved.layout != BX_XG_LAYOUT_LINEAR) {
+        /* Tiled: a single 64 KiB tile at offset 0, so the element offset is the
+         * intra-tile swizzled offset. Only SW_64KB_S reaches here (32 bpp and
+         * the BC block sizes); reject_if_tiled already returned E_NOTIMPL for
+         * every other tiled mode. */
+        if (array_slice != 0u || mip_level != 0u) {
+            return E_NOTIMPL;
+        }
+        Rdna2TileQuery query{};
+        query.mode = obj->resolved.layout;
+        query.mip_width = obj->resolved.width;
+        query.mip_height = obj->resolved.height;
+        query.block_bytes = obj->resolved.block_bytes;
+        const uint32_t block_x = x / obj->resolved.block_w;
+        const uint32_t block_y = y / obj->resolved.block_h;
+        query.texel_x = block_x;
+        query.texel_y = block_y;
+        uint32_t offset = 0u;
+        const HRESULT hr = rdna2_sw64kb_prepare(&query, &offset);
+        if (hr != S_OK) {
+            return hr;
+        }
+        *offset_bytes = offset;
+        return S_OK;
+    }
     const uint32_t index = mip_level + array_slice * obj->resolved.mip_levels;
     Placement place{};
     const HRESULT hr = placement_from_index(obj, index, 0, &place);
@@ -912,6 +1163,14 @@ static HRESULT WINAPI computer_copy_into_subresource(
     const HRESULT tiled = reject_if_tiled(obj, kSlotCopyIntoSubresource, "CopyIntoSubresource");
     if (tiled != S_OK) {
         return tiled;
+    }
+    if (tiled_addressing_ok(&obj->resolved)) {
+        if (subresource != 0u) {
+            return E_INVALIDARG;
+        }
+        return copy_tiled_sw64kb_s(
+            &obj->resolved, true, static_cast<uint8_t*>(destination), destination_size,
+            static_cast<const uint8_t*>(source), source_size, source_row_pitch, source_depth_pitch);
     }
     Placement place{};
     const HRESULT placed = placement_from_index(obj, subresource, 0, &place);
@@ -957,6 +1216,14 @@ static HRESULT WINAPI computer_copy_from_subresource(
     const HRESULT tiled = reject_if_tiled(obj, kSlotCopyFromSubresource, "CopyFromSubresource");
     if (tiled != S_OK) {
         return tiled;
+    }
+    if (tiled_addressing_ok(&obj->resolved)) {
+        if (subresource != 0u) {
+            return E_INVALIDARG;
+        }
+        return copy_tiled_sw64kb_s(
+            &obj->resolved, false, static_cast<uint8_t*>(destination), destination_size,
+            static_cast<const uint8_t*>(source), source_size, destination_row_pitch, destination_depth_pitch);
     }
     Placement place{};
     const HRESULT placed = placement_from_index(obj, subresource, 0, &place);
@@ -1020,7 +1287,10 @@ HRESULT WINAPI XGCreateTextureComputer(const bx_xg_resource_desc* desc, void** c
     obj->iface.lpVtbl = &kVtbl;
     obj->refcount = 1;
     obj->resolved = resolved;
-    const HRESULT built = build_linear_table(obj);
+    HRESULT built = build_linear_table(obj);
+    if (built == S_OK) {
+        built = build_tiled_table(obj);
+    }
     if (built != S_OK) {
         HeapFree(GetProcessHeap(), 0, obj);
         return built;
