@@ -66,9 +66,10 @@ struct Record {
     uint64_t config_size = 0;
     uint64_t config_generation = 0;
     bx_xmem_region_info_t region{};
-    /* Bytes of host heaps still alive. D3DMetal keeps freed memory in its own
-       pool, so this counts live heaps only: charge on create, credit on the
-       final Release. It does not assume the OS reclaimed the pages. */
+    /* Diagnostic mirror of the external xmem charges for live host heaps.
+       D3DMetal keeps freed memory in its own pool, so this counts live heaps
+       only: charge on create, credit on the final Release. It does not assume
+       the OS reclaimed the pages. xmem's external_bytes is authoritative. */
     uint64_t charged_private_bytes = 0;
     uint64_t cpu_pointer = 0;
     class BxChargedHeap* backing = nullptr;
@@ -102,44 +103,43 @@ uint64_t title_limit() {
     return 8ull << 30;
 }
 
-uint64_t active_cap(const bx_xmem_stats_t& stats) {
-    uint64_t cap = title_limit();
-    if (stats.title_limit_bytes != 0 && stats.title_limit_bytes < cap) {
-        cap = stats.title_limit_bytes;
-    }
-    return cap;
-}
-
 const char* profile_name(bx_hardware_profile_t profile) {
     return profile == BX_PROFILE_ANACONDA ? "anaconda" : "lockhart";
 }
 
-/* Private host heaps count against the same Lockhart/Anaconda cap as xmem. */
+/* Private host heaps count against the same Lockhart/Anaconda cap as xmem.
+ * xmem's external_bytes is the authoritative ledger: bx_xmem_try_charge_external
+ * admits atomically under usage_lock, against every owner, so no local pre-check
+ * can add anything correct (a snapshot taken outside that lock would also count
+ * live graphics heaps twice now that xmem's stats include external charges).
+ * The local mirror is kept only for the gpu_heap_bytes diagnostic log; it cannot
+ * wrap, because xmem has already admitted `bytes` under a cap <= UINT64_MAX.
+ * The hook is called while g_section is held (lock order g_section ->
+ * usage_lock, matching every other path in both DLLs). */
 bool try_charge(uint64_t bytes) {
     Guard guard(g_section);
-    bx_xmem_stats_t stats{};
-    bx_xmem_get_internal_stats(&stats);
-    const uint64_t cap = active_cap(stats);
-    const uint64_t xmem_used = stats.committed_virtual_bytes + stats.allocated_physical_bytes;
-    if (bytes > cap || xmem_used > cap || g_record.charged_private_bytes > cap - xmem_used) {
+    if (!bx_xmem_try_charge_external(bytes)) {
         return false;
     }
-    const uint64_t room = cap - xmem_used - g_record.charged_private_bytes;
-    if (bytes > room) {
-        return false;
-    }
-    g_record.charged_private_bytes += bytes;
+    g_record.charged_private_bytes += bytes; /* diagnostic mirror */
     return true;
 }
 
+/* Each heap wrapper calls this exactly once, on its final Release, which is what
+ * keeps a heap from being released twice. The mirror check below is a coarse
+ * guard on the total: it refuses a release larger than all outstanding graphics
+ * charges (refusing leaves a charge in place, so the cap stays strict), but as a
+ * single total it cannot tell one heap's double release from another heap's
+ * charge. */
 void release_charge(uint64_t bytes) {
     Guard guard(g_section);
     if (bytes > g_record.charged_private_bytes) {
-        bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "heap_budget", "GPU heap charge underflow on release");
-        g_record.charged_private_bytes = 0;
+        bx_log_emit(BX_LOG_ERROR, "d3d12_xs", "heap_budget",
+                    "GPU heap charge underflow on release; xmem charge left unchanged");
         return;
     }
     g_record.charged_private_bytes -= bytes;
+    bx_xmem_release_charge_external(bytes);
 }
 
 /*
@@ -902,7 +902,10 @@ HRESULT decode_bxvm_config(void* config) {
 
     char detail[416];
     std::snprintf(detail, sizeof(detail),
-                  "decoder=bxvm applied=1 profile=%s title_limit=%llu xmem_used=%llu xmem_region=%d base=0x%llx region_bytes=%llu gpu_heap_bytes=%llu",
+                  /* cap_used is everything counted against the title cap, graphics heaps
+                   * included (xmem's stats include external charges); gpu_heap_bytes is the
+                   * graphics part of it, so the two must not be added. */
+                  "decoder=bxvm applied=1 profile=%s title_limit=%llu cap_used=%llu xmem_region=%d base=0x%llx region_bytes=%llu gpu_heap_bytes=%llu",
                   profile_name(profile), static_cast<unsigned long long>(cap),
                   static_cast<unsigned long long>(stats.committed_virtual_bytes + stats.allocated_physical_bytes),
                   have_region ? 1 : 0, static_cast<unsigned long long>(have_region ? region.base_va : 0),
