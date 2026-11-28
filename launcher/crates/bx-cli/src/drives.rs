@@ -102,10 +102,14 @@ fn write_manifest(dosdevices: &Path, owned: &BTreeMap<char, PathBuf>) -> Result<
 /// Points `link` at `target`, replacing what is there through a rename so the link never
 /// disappears in between.
 fn relink(dosdevices: &Path, link: &Path, target: &Path) -> io::Result<()> {
-    let tmp = dosdevices.join(".bx-drive-tmp");
+    let tmp = dosdevices.join(format!(".bx-drive-tmp.{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     symlink(target, &tmp)?;
-    fs::rename(&tmp, link)
+    let result = fs::rename(&tmp, link);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Links `g:` to `package_dir` and `t:` to [`TEMP_TARGET`] in `prefix`'s `dosdevices`.
@@ -122,7 +126,6 @@ pub fn map_xbox_drives(prefix: &Path, package_dir: &Path) -> Result<Vec<Mapping>
         .map_err(|e| format!("cannot create {}: {e}", temp_dir.display()))?;
 
     let mut owned = read_manifest(&dosdevices)?;
-    let mut changed = false;
     let mut mappings = Vec::new();
     for (letter, target) in [
         ('g', package_dir.to_path_buf()),
@@ -146,14 +149,28 @@ pub fn map_xbox_drives(prefix: &Path, package_dir: &Path) -> Result<Vec<Mapping>
         };
         let mapping = match current {
             None => {
+                owned.insert(letter, target.clone());
+                write_manifest(&dosdevices, &owned)?;
                 relink(&dosdevices, &link, &target)
                     .map_err(|e| format!("cannot create {}: {e}", link.display()))?;
                 Mapping::Created(letter, target.clone())
             }
             Some(current) if current == target => Mapping::Unchanged(letter, target.clone()),
             Some(current) if owned.get(&letter) == Some(&current) => {
-                relink(&dosdevices, &link, &target)
-                    .map_err(|e| format!("cannot replace {}: {e}", link.display()))?;
+                owned.insert(letter, target.clone());
+                write_manifest(&dosdevices, &owned)?;
+                if let Err(error) = relink(&dosdevices, &link, &target) {
+                    owned.insert(letter, current);
+                    let restore = write_manifest(&dosdevices, &owned);
+                    let detail = restore
+                        .err()
+                        .map(|e| format!("; also could not restore the drive manifest: {e}"))
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "cannot replace {}: {error}{detail}",
+                        link.display()
+                    ));
+                }
                 Mapping::Retargeted(letter, target.clone())
             }
             Some(current) => {
@@ -165,14 +182,7 @@ pub fn map_xbox_drives(prefix: &Path, package_dir: &Path) -> Result<Vec<Mapping>
                 continue;
             }
         };
-        if matches!(mapping, Mapping::Created(..) | Mapping::Retargeted(..)) {
-            owned.insert(letter, target);
-            changed = true;
-        }
         mappings.push(mapping);
-    }
-    if changed {
-        write_manifest(&dosdevices, &owned)?;
     }
     Ok(mappings)
 }
@@ -300,5 +310,44 @@ mod tests {
         let t = TempDir::new("badmanifest");
         fs::write(t.prefix().join("dosdevices").join(MANIFEST), "g /x\n").unwrap();
         assert!(map_xbox_drives(&t.prefix(), &t.game()).is_err());
+    }
+
+    #[test]
+    fn a_failed_manifest_write_leaves_no_unrecorded_link() {
+        let t = TempDir::new("orphan");
+        let manifest = t.prefix().join("dosdevices").join(MANIFEST);
+        symlink(t.0.join("missing-dir/x"), &manifest).unwrap();
+        assert!(map_xbox_drives(&t.prefix(), &t.game()).is_err());
+        assert!(
+            fs::symlink_metadata(t.link('g')).is_err(),
+            "g: must not be created before ownership is recorded"
+        );
+
+        fs::remove_file(&manifest).unwrap();
+        map_xbox_drives(&t.prefix(), &t.game()).unwrap();
+        let other = t.0.join("other-game");
+        fs::create_dir_all(&other).unwrap();
+        let again = map_xbox_drives(&t.prefix(), &other).unwrap();
+        assert!(matches!(&again[0], Mapping::Retargeted('g', _)));
+    }
+
+    #[test]
+    fn a_failed_retarget_restores_the_previous_manifest_and_link() {
+        let t = TempDir::new("retarget-failure");
+        map_xbox_drives(&t.prefix(), &t.game()).unwrap();
+        let other = t.0.join("other-game");
+        fs::create_dir_all(&other).unwrap();
+
+        let temp_link = t
+            .prefix()
+            .join("dosdevices")
+            .join(format!(".bx-drive-tmp.{}", std::process::id()));
+        fs::create_dir(&temp_link).unwrap();
+        assert!(map_xbox_drives(&t.prefix(), &other).is_err());
+        assert_eq!(fs::read_link(t.link('g')).unwrap(), t.game());
+        assert_eq!(
+            read_manifest(&t.prefix().join("dosdevices")).unwrap()[&'g'],
+            t.game()
+        );
     }
 }
