@@ -18,42 +18,25 @@ BOOL WINAPI XMemTransferMemory(PVOID dst, LPCVOID src, SIZE_T bytes, uint64_t fl
 }
 
 // ---------------------------------------------------------------------------
-// BX_LOG_FILE reader (same pattern as test_win32_bridge / test_shader_gate).
-// If BX_LOG_FILE is unset we create a temp log and point the variable at it
-// so the runtime_veh logger writes somewhere we can read back.
+// BX_LOG_FILE reader. BX_LOG_FILE must name the log before the process
+// starts (`bx-cli run --log`): this EXE imports bx_runtime_veh.dll, which reads
+// the variable once in DLL_PROCESS_ATTACH, before main runs, so setting it here
+// would be too late and the checks would read an empty file.
 // ---------------------------------------------------------------------------
 
 struct LogReader {
     char path[MAX_PATH]{};
-    bool created_temp = false;
     int64_t start_offset = 0;
 
     bool init() {
         const DWORD existing_len =
             GetEnvironmentVariableA("BX_LOG_FILE", path, sizeof(path));
         if (existing_len == 0 || existing_len >= sizeof(path)) {
-            char temp_dir[MAX_PATH]{};
-            const DWORD dir_len = GetTempPathA(sizeof(temp_dir), temp_dir);
-            if (dir_len == 0 || dir_len >= sizeof(temp_dir) ||
-                GetTempFileNameA(temp_dir, "bxc", 0, path) == 0) {
-                std::fprintf(stderr, "FAIL: could not create temporary CLWB log file\n");
-                return false;
-            }
-            if (!SetEnvironmentVariableA("BX_LOG_FILE", path)) {
-                DeleteFileA(path);
-                std::fprintf(stderr, "FAIL: could not set BX_LOG_FILE\n");
-                return false;
-            }
-            created_temp = true;
+            std::fprintf(stderr, "FAIL: BX_LOG_FILE must be set before launch (run under bx-cli run --log)\n");
+            return false;
         }
         start_offset = query_file_size(path);
         return true;
-    }
-
-    ~LogReader() {
-        if (created_temp) {
-            DeleteFileA(path);
-        }
     }
 
     static int64_t query_file_size(const char* p) {
