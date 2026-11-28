@@ -1,7 +1,6 @@
 set(d3d12_xs_headers "${BX_ROOT_DIR}/shims/d3d12_xs")
 if(NOT EXISTS "${d3d12_xs_headers}/vmem.h" OR NOT EXISTS "${d3d12_xs_headers}/presentx.h")
-    message(STATUS "Skipping test_m2_first_frame target until the placed-resource and PresentX contracts are available (#486 and #471)")
-    return()
+    message(FATAL_ERROR "test_m2_first_frame requires the placed-resource and PresentX contracts (#486 and #471)")
 endif()
 
 add_executable(test_m2_first_frame main.cpp)

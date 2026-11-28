@@ -177,6 +177,7 @@ void run(bool inject_pixel_mismatch) {
     char path[MAX_PATH];
     DWORD length = GetEnvironmentVariableA("BX_LOG_FILE", path, sizeof(path));
     require(length && length < sizeof(path), "BX_LOG_FILE required");
+    // Start at EOF before PSO creation so stale shader_gate records cannot pass this check.
     std::ifstream log(path, std::ios::binary | std::ios::ate);
     require(log.good(), "open launch log");
     D3D12_ROOT_PARAMETER param{};
