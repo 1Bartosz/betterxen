@@ -548,8 +548,14 @@ int main() {
     }
 
     // 3. Constraint-carrying DXIL still passes; its constraints are logged (results not dispatched).
+    // A wave wider than 32 lanes is refused at creation (#591): D3DMetal creates the PSO
+    // and never runs it, so an S_OK here would be a silent no-op. The fixture asserts the
+    // failure rather than only reading the log, because the log alone cannot tell a caller
+    // what happened.
     hr = create_compute(device, root_uav, g_wave64_lanes_cs, sizeof(g_wave64_lanes_cs), &pso);
-    std::printf("wave64 PSO hr=0x%08lx\n", ul(hr));
+    check(hr == E_NOTIMPL && !pso,
+          "wave64 PSO is refused at creation: hr=0x%08lx (want E_NOTIMPL) pso=%p", ul(hr),
+          static_cast<void*>(pso));
     if (pso) pso->Release();
     hr = create_compute(device, root_table, g_atomic64_image_cs, sizeof(g_atomic64_image_cs), &pso);
     std::printf("atomic64 typed PSO hr=0x%08lx\n", ul(hr));
@@ -576,8 +582,13 @@ int main() {
           "shader_gate record passing the DXIL stream compute shader");
     check(log_has(log, {"\"event\":\"pso_stream\"", "shaders_not_parsed=0"}),
           "pso_stream record says the stream's shaders were parsed");
-    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=pass_dxil", "wave_ops=1", "wave_lanes=64-64"}),
-          "shader_gate record with WaveSize(64)");
+    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=reject_wave_wide", "hr=0x80004001"}),
+          "shader_gate record refusing the wave64 stage");
+    // The wave64 stage is now refused before `pass_dxil` is logged (#591), so the record to
+    // assert is the rejection, carrying the same wave constraints the gap was measured on.
+    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=reject_wave_wide", "wave_ops=1",
+                        "wave_lanes=64-64"}),
+          "shader_gate record with WaveSize(64), refused");
     check(log_has(log, {"\"event\":\"shader_d3dmetal_gap\"", "wave_lanes_min=64"}),
           "shader_d3dmetal_gap record for WaveSize(64)");
     check(log_has(log, {"\"event\":\"shader_gate\"", "decision=pass_dxil", "int64_ops=1", "atomic64=typed,"}),
