@@ -176,6 +176,28 @@ pub fn probe_pe32_plus(bytes: &[u8]) -> Result<PeSummary, ProbeError> {
     let size_of_image = u32_le(bytes, opt + 56).ok_or(ProbeError::NotPe32Plus("size_of_image"))?;
     let num_rvas = u32_le(bytes, opt + 108).ok_or(ProbeError::NotPe32Plus("num_rvas"))?;
 
+    // The import data directory is entry index 1, an 8-byte RVA/size pair at
+    // optional-header offset 112 + 8. Microsoft's PE format requires probes to
+    // honour both NumberOfRvaAndSizes and SizeOfOptionalHeader, so the entry is
+    // validated while the optional header is read: a short optional header must
+    // not let the read fall through into the section table.
+    const IMPORT_DIR_INDEX: u32 = 1;
+    const IMPORT_DIR_OFF: usize = 112 + 8;
+    let mut import_dir: Option<(u32, u32)> = None;
+    if num_rvas > IMPORT_DIR_INDEX {
+        let entry = bytes
+            .get(opt + IMPORT_DIR_OFF..opt + IMPORT_DIR_OFF + 8)
+            .ok_or(ProbeError::NotPe32Plus("truncated import directory"))?;
+        if IMPORT_DIR_OFF + 8 > opt_size {
+            return Err(ProbeError::NotPe32Plus(
+                "import directory outside SizeOfOptionalHeader",
+            ));
+        }
+        let rva = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        let size = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+        import_dir = Some((rva, size));
+    }
+
     let sec_base = opt + opt_size;
     let section_table_size = (section_count as usize)
         .checked_mul(40)
@@ -199,13 +221,14 @@ pub fn probe_pe32_plus(bytes: &[u8]) -> Result<PeSummary, ProbeError> {
     }
 
     let mut imports: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    if num_rvas > 1 {
-        let imp_rva = u32_le(bytes, opt + 112 + 8)
-            .ok_or(ProbeError::NotPe32Plus("truncated import directory"))?;
+    if let Some((imp_rva, imp_size)) = import_dir {
         if imp_rva != 0
-            && let Some((mut desc_off, mut desc_bytes_left)) =
-                rva_to_off_bounded(&sections, imp_rva)
+            && let Some((mut desc_off, section_bytes_left)) = rva_to_off_bounded(&sections, imp_rva)
         {
+            // Bound the 20-byte IMAGE_IMPORT_DESCRIPTOR walk by BOTH the
+            // declared directory Size and the section's raw bytes, whichever
+            // ends first, so descriptors past the directory are not reported.
+            let mut desc_bytes_left = section_bytes_left.min(imp_size as usize);
             while desc_bytes_left >= 20 {
                 let (Some(orig_thunk), Some(name_rva), Some(first_thunk)) = (
                     u32_le(bytes, desc_off),
@@ -352,6 +375,9 @@ mod tests {
         write_section(&mut bytes, SEC, SECTION_RVA, RAW_PTR, 40);
         write_section(&mut bytes, SEC + 40, DATA_RVA, DATA_PTR, 0x100);
         put_u32(&mut bytes, OPT + 112 + 8, SECTION_RVA);
+        // Declare the directory to cover the whole descriptor section, so the
+        // section bound (not the Size) is what this fixture exercises.
+        put_u32(&mut bytes, OPT + 112 + 12, 40);
 
         for (base, dll_rva, thunk_rva) in [
             (RAW_PTR as usize, DATA_RVA, DATA_RVA + 0x80),
@@ -476,10 +502,11 @@ mod tests {
     #[test]
     fn rejects_truncated_import_directory() {
         let mut image = minimal_pe32_plus();
-        // An empty section table that fits, and an import data-directory entry
-        // cut after two of its four bytes.
+        // An empty section table that fits, an optional header long enough to
+        // declare the import entry, and a file cut after two of the entry's
+        // RVA bytes.
         put_u16(&mut image, COFF + 2, 0);
-        put_u16(&mut image, COFF + 16, 2);
+        put_u16(&mut image, COFF + 16, 0xE0);
         image.truncate(OPT + 112 + 8 + 2);
         assert_eq!(
             probe_pe32_plus(&image).unwrap_err(),
@@ -494,6 +521,84 @@ mod tests {
             ("ONE.DLL".to_owned(), vec!["ORDINAL:1".to_owned()]),
             ("TWO.DLL".to_owned(), vec!["ORDINAL:2".to_owned()]),
         ]);
+        assert_eq!(summary.imports, expected);
+    }
+
+    /// (a) A short SizeOfOptionalHeader puts the import data-directory entry
+    /// past the end of the optional header, so its 8 bytes would otherwise be
+    /// read from the section table. The entry index is still within
+    /// NumberOfRvaAndSizes, so only the SizeOfOptionalHeader check rejects it.
+    #[test]
+    fn rejects_import_directory_outside_short_optional_header() {
+        let mut image = two_import_pe32_plus();
+        // Import entry spans optional-header offsets 120..128; declare the
+        // optional header to end at 120, inside the entry.
+        put_u16(&mut image, COFF + 16, 120);
+        assert_eq!(
+            probe_pe32_plus(&image).unwrap_err(),
+            ProbeError::NotPe32Plus("import directory outside SizeOfOptionalHeader")
+        );
+
+        // One byte short of the full 8-byte entry is still out of range.
+        let mut image = two_import_pe32_plus();
+        put_u16(&mut image, COFF + 16, 127);
+        assert_eq!(
+            probe_pe32_plus(&image).unwrap_err(),
+            ProbeError::NotPe32Plus("import directory outside SizeOfOptionalHeader")
+        );
+
+        // Exactly 128 bytes covers the whole entry, so the import directory is
+        // read normally. The section table now starts at OPT + 128, so write it
+        // there for this size.
+        let mut image = two_import_pe32_plus();
+        put_u16(&mut image, COFF + 16, 128);
+        write_section(&mut image, OPT + 128, SECTION_RVA, RAW_PTR, 0x200);
+        let summary = probe_pe32_plus(&image).unwrap();
+        assert!(summary.imports.contains_key("ALPHA.DLL"));
+        assert!(summary.imports.contains_key("BETA.DLL"));
+    }
+
+    /// NumberOfRvaAndSizes == 1 means only entry 0 (export) is declared, so the
+    /// import entry (index 1) must not be probed even though its bytes are
+    /// present and inside SizeOfOptionalHeader.
+    #[test]
+    fn ignores_import_directory_beyond_number_of_rva_and_sizes() {
+        let mut image = two_import_pe32_plus();
+        put_u32(&mut image, OPT + 108, 1);
+        let summary = probe_pe32_plus(&image).unwrap();
+        assert!(summary.imports.is_empty());
+    }
+
+    /// (b) The declared import directory Size is shorter than the containing
+    /// section, so descriptors past the declared size must not be reported even
+    /// though they are valid and inside the section's raw bytes.
+    #[test]
+    fn bounds_import_descriptor_walk_by_declared_directory_size() {
+        // Size 40 covers exactly the two real descriptors; the third valid
+        // descriptor at +40 lies outside the directory but inside the section.
+        let mut image = import_table_without_terminator_pe32_plus();
+        put_u32(&mut image, OPT + 112 + 12, 40);
+        let summary = probe_pe32_plus(&image).unwrap();
+        let expected = BTreeMap::from([
+            ("ONE.DLL".to_owned(), vec!["ORDINAL:1".to_owned()]),
+            ("TWO.DLL".to_owned(), vec!["ORDINAL:2".to_owned()]),
+        ]);
+        assert_eq!(summary.imports, expected);
+        assert!(!summary.imports.contains_key("THREE.DLL"));
+
+        // Size 20 reports only the first descriptor.
+        let mut image = import_table_without_terminator_pe32_plus();
+        put_u32(&mut image, OPT + 112 + 12, 20);
+        let summary = probe_pe32_plus(&image).unwrap();
+        let expected = BTreeMap::from([("ONE.DLL".to_owned(), vec!["ORDINAL:1".to_owned()])]);
+        assert_eq!(summary.imports, expected);
+
+        // A size that is not a multiple of 20 stops before the next descriptor
+        // would exceed the directory.
+        let mut image = import_table_without_terminator_pe32_plus();
+        put_u32(&mut image, OPT + 112 + 12, 39);
+        let summary = probe_pe32_plus(&image).unwrap();
+        let expected = BTreeMap::from([("ONE.DLL".to_owned(), vec!["ORDINAL:1".to_owned()])]);
         assert_eq!(summary.imports, expected);
     }
 }
