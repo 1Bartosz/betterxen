@@ -29,13 +29,16 @@
 //! at least 16. `BitcodeSize` must be non-zero, and `8 + BitcodeOffset +
 //! BitcodeSize` must fit in `SizeInUint32 * 4`. A zero-length bitcode is
 //! [`ParseError::BadDxilHeader`], matching DXC's `IsValidDxilProgramHeader`,
-//! so preparation does not copy it.
+//! so preparation does not copy it. A bitcode payload starting with `NOBC`
+//! marks a header-only container (no executable bitcode), which keeps `DXIL`
+//! size and stage metadata but does not classify as executable `DXIL`.
 //!
 //! The C entry points in [`c_abi`] match `abi/include/bx_shader_bridge.h`.
 //! `bx_shader_inspect` fills the C struct without logging. `bx_shader_prepare_for_d3dmetal`
-//! copies `container_size` bytes when a `DXIL` chunk is present, including when
-//! an accompanying `FSPX` table is malformed, and logs only an ACCC-only
-//! `BX_SHADER_ERR_UNSUPPORTED` result. RDNA 2 to DXIL translation is not implemented.
+//! copies `container_size` bytes when an executable `DXIL` chunk is present,
+//! including when an accompanying `FSPX` table is malformed, and logs only an
+//! ACCC-only `BX_SHADER_ERR_UNSUPPORTED` result. RDNA 2 to DXIL translation
+//! is not implemented.
 
 mod c_abi;
 mod fspx;
@@ -424,6 +427,37 @@ fn kind_from_flags(has_dxil: bool, has_accc: bool, has_legacy: bool) -> ShaderKi
     }
 }
 
+#[derive(Default)]
+struct DxilChunkState {
+    has_executable: bool,
+    size: u32,
+    executable_stage: Option<(ShaderStage, u8, u8)>,
+    header_only_stage: Option<(ShaderStage, u8, u8)>,
+}
+
+impl DxilChunkState {
+    /// Record a `DXIL` chunk, keeping executable metadata ahead of `NOBC`
+    /// header-only placeholders regardless of chunk order.
+    fn record(&mut self, chunk: usize, size: u32, payload: &[u8]) -> Result<(), ParseError> {
+        match read_dxil_program(payload).map_err(|()| ParseError::BadDxilHeader { chunk })? {
+            DxilProgram::Executable(stage) => {
+                self.has_executable = true;
+                self.size = size;
+                self.executable_stage = Some(stage);
+            }
+            DxilProgram::HeaderOnly(stage) => {
+                if !self.has_executable {
+                    self.size = size;
+                }
+                if self.header_only_stage.is_none() {
+                    self.header_only_stage = Some(stage);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Scalar fields of a container. Used by `bx_shader_inspect`, which does not
 /// keep chunk or section lists.
 pub(crate) struct DxbcSummary {
@@ -442,37 +476,16 @@ pub(crate) struct DxbcSummary {
 ///
 /// A malformed `FSPX` table is still [`Err`], so inspection can report it.
 pub(crate) fn summarize_dxbc(bytes: &[u8]) -> Result<DxbcSummary, ParseError> {
-    let mut has_dxil = false;
+    let mut dxil = DxilChunkState::default();
     let mut has_accc = false;
     let mut has_legacy = false;
     let mut has_root_signature = false;
-    let mut dxil_size = 0u32;
     let mut accc_size = 0u32;
-    let mut dxil_stage = None;
-    let mut header_only_dxil_stage = None;
     let mut legacy_stage = None;
     let mut fspx_stage = None;
     let header = visit_chunks(bytes, |index, _offset, fourcc, size, payload| {
         match &fourcc {
-            b"DXIL" => {
-                let program = read_dxil_program(payload)
-                    .map_err(|()| ParseError::BadDxilHeader { chunk: index })?;
-                match program {
-                    DxilProgram::Executable(stage) => {
-                        has_dxil = true;
-                        dxil_size = size;
-                        dxil_stage = Some(stage);
-                    }
-                    DxilProgram::HeaderOnly(stage) => {
-                        if !has_dxil {
-                            dxil_size = size;
-                        }
-                        if header_only_dxil_stage.is_none() {
-                            header_only_dxil_stage = Some(stage);
-                        }
-                    }
-                }
-            }
+            b"DXIL" => dxil.record(index, size, payload)?,
             b"ACCC" => {
                 has_accc = true;
                 accc_size = size;
@@ -493,20 +506,21 @@ pub(crate) fn summarize_dxbc(bytes: &[u8]) -> Result<DxbcSummary, ParseError> {
         }
         Ok(())
     })?;
-    let (stage, shader_model_major, shader_model_minor) = dxil_stage
+    let (stage, shader_model_major, shader_model_minor) = dxil
+        .executable_stage
         .or(legacy_stage)
         .or(fspx_stage)
-        .or(header_only_dxil_stage)
+        .or(dxil.header_only_stage)
         .unwrap_or((ShaderStage::Unknown, 0, 0));
     Ok(DxbcSummary {
-        kind: kind_from_flags(has_dxil, has_accc, has_legacy),
+        kind: kind_from_flags(dxil.has_executable, has_accc, has_legacy),
         stage,
         shader_model_major,
         shader_model_minor,
         container_size: header.container_size,
         digest: header.digest,
         has_root_signature,
-        dxil_size,
+        dxil_size: dxil.size,
         accc_size,
     })
 }
@@ -545,40 +559,19 @@ pub(crate) fn dxil_container_len(bytes: &[u8]) -> Result<Option<u32>, ParseError
 /// container through.
 pub fn inspect_dxbc(bytes: &[u8]) -> Result<ShaderInspection, ParseError> {
     let mut chunks = Vec::new();
-    let mut has_dxil = false;
+    let mut dxil = DxilChunkState::default();
     let mut has_accc = false;
     let mut has_legacy = false;
     let mut has_root_signature = false;
-    let mut dxil_size = 0u32;
     let mut accc_size = 0u32;
     let mut accc_is_fspx = false;
-    let mut dxil_stage = None;
-    let mut header_only_dxil_stage = None;
     let mut legacy_stage = None;
     let mut fspx_stage = None;
     let mut fspx = None;
 
     let header = visit_chunks(bytes, |index, offset, fourcc, size, payload| {
         match &fourcc {
-            b"DXIL" => {
-                let program = read_dxil_program(payload)
-                    .map_err(|()| ParseError::BadDxilHeader { chunk: index })?;
-                match program {
-                    DxilProgram::Executable(stage) => {
-                        has_dxil = true;
-                        dxil_size = size;
-                        dxil_stage = Some(stage);
-                    }
-                    DxilProgram::HeaderOnly(stage) => {
-                        if !has_dxil {
-                            dxil_size = size;
-                        }
-                        if header_only_dxil_stage.is_none() {
-                            header_only_dxil_stage = Some(stage);
-                        }
-                    }
-                }
-            }
+            b"DXIL" => dxil.record(index, size, payload)?,
             b"ACCC" => {
                 has_accc = true;
                 accc_size = size;
@@ -616,21 +609,22 @@ pub fn inspect_dxbc(bytes: &[u8]) -> Result<ShaderInspection, ParseError> {
         Ok(())
     })?;
 
-    let (stage, sm_major, sm_minor) = dxil_stage
+    let (stage, sm_major, sm_minor) = dxil
+        .executable_stage
         .or(legacy_stage)
         .or(fspx_stage)
-        .or(header_only_dxil_stage)
+        .or(dxil.header_only_stage)
         .unwrap_or((ShaderStage::Unknown, 0, 0));
 
     Ok(ShaderInspection {
-        kind: kind_from_flags(has_dxil, has_accc, has_legacy),
+        kind: kind_from_flags(dxil.has_executable, has_accc, has_legacy),
         stage,
         shader_model_major: sm_major,
         shader_model_minor: sm_minor,
         container_size: header.container_size,
         digest: header.digest,
         has_root_signature,
-        dxil_size,
+        dxil_size: dxil.size,
         accc_size,
         accc_is_fspx,
         fspx,
@@ -1027,8 +1021,11 @@ mod tests {
 
     #[test]
     fn truncated_prefixes_do_not_panic() {
+        let mut nobc_dxil = minimal_dxil_program((6u32 << 4) | 6u32);
+        nobc_dxil[24..28].copy_from_slice(b"NOBC");
         let blobs = [
             synthetic_dxil_blob(),
+            build_synthetic_dxbc(&[(b"DXIL", &nobc_dxil)]),
             build_synthetic_dxbc(&[(b"ACCC", &synthetic_fspx_payload())]),
             build_synthetic_dxbc(&[(b"ACCC", &fspx_two_sections(20))]),
             vec![0xFF; 64],
@@ -1036,6 +1033,8 @@ mod tests {
         for blob in blobs {
             for len in 0..=blob.len() {
                 let _ = inspect_dxbc(&blob[..len]);
+                let _ = summarize_dxbc(&blob[..len]);
+                let _ = dxil_container_len(&blob[..len]);
             }
         }
     }
@@ -1652,6 +1651,106 @@ mod tests {
         assert_eq!(info2.stage, ShaderStage::Compute);
         assert_eq!((info2.shader_model_major, info2.shader_model_minor), (6, 5));
         assert_eq!(info2.dxil_size, 28);
+        let summary2 = summarize_dxbc(&blob_nobc_first).expect("mixed DXIL summary");
+        assert_eq!(summary2.kind, ShaderKind::Dxil);
+        assert_eq!(summary2.stage, ShaderStage::Compute);
+        assert_eq!(summary2.dxil_size, 28);
+    }
+
+    #[test]
+    fn nobc_dxil_with_malformed_fspx_returns_invalid_blob() {
+        clear_shader_log();
+        let mut nobc = minimal_dxil_program((6u32 << 4) | 6u32);
+        nobc[24..28].copy_from_slice(b"NOBC");
+        let bad_fspx = fspx_header(99, 0, &[], 16);
+        let blob = build_synthetic_dxbc(&[(b"DXIL", &nobc), (b"ACCC", &bad_fspx)]);
+
+        assert_eq!(
+            inspect_dxbc(&blob),
+            Err(ParseError::FspxBadVersion {
+                chunk: 1,
+                version: 99,
+            })
+        );
+        assert_eq!(dxil_container_len(&blob), Ok(None));
+
+        let mut out_ptr = ptr_sentinel();
+        let mut out_len = 8usize;
+        let status = unsafe {
+            bx_shader_prepare_for_d3dmetal(blob.as_ptr(), blob.len(), &mut out_ptr, &mut out_len)
+        };
+        assert_eq!(status, BX_SHADER_ERR_INVALID_BLOB);
+        assert!(out_ptr.is_null());
+        assert_eq!(out_len, 0);
+        assert!(shader_log_lines().is_empty());
+    }
+
+    #[test]
+    fn dxil_bitcode_bounds_and_offset_checks() {
+        let prog = (5u32 << 16) | (6u32 << 4) | 6u32;
+
+        // Bitcode shorter than 4 bytes (`NOB`) must not misclassify as `NOBC` or read out of bounds.
+        let mut short_bitcode = [0u8; 28];
+        short_bitcode[0..4].copy_from_slice(&prog.to_le_bytes());
+        short_bitcode[4..8].copy_from_slice(&7u32.to_le_bytes());
+        short_bitcode[8..12].copy_from_slice(b"DXIL");
+        short_bitcode[12..16].copy_from_slice(&0x0100u32.to_le_bytes());
+        short_bitcode[16..20].copy_from_slice(&16u32.to_le_bytes());
+        short_bitcode[20..24].copy_from_slice(&3u32.to_le_bytes());
+        short_bitcode[24..27].copy_from_slice(b"NOB");
+        let blob_short = build_synthetic_dxbc(&[(b"DXIL", &short_bitcode)]);
+        assert_eq!(
+            inspect_dxbc(&blob_short).expect("3-byte bitcode").kind,
+            ShaderKind::Dxil
+        );
+
+        // `NOBC` check follows `BitcodeOffset`, not a fixed offset 24.
+        let mut shifted_nobc = vec![0u8; 36];
+        shifted_nobc[0..4].copy_from_slice(&prog.to_le_bytes());
+        shifted_nobc[4..8].copy_from_slice(&9u32.to_le_bytes());
+        shifted_nobc[8..12].copy_from_slice(b"DXIL");
+        shifted_nobc[12..16].copy_from_slice(&0x0100u32.to_le_bytes());
+        shifted_nobc[16..20].copy_from_slice(&24u32.to_le_bytes());
+        shifted_nobc[20..24].copy_from_slice(&4u32.to_le_bytes());
+        shifted_nobc[32..36].copy_from_slice(b"NOBC");
+        let blob_shifted_nobc = build_synthetic_dxbc(&[(b"DXIL", &shifted_nobc)]);
+        assert_eq!(
+            inspect_dxbc(&blob_shifted_nobc).expect("shifted NOBC").kind,
+            ShaderKind::Unknown
+        );
+        assert_eq!(dxil_container_len(&blob_shifted_nobc), Ok(None));
+
+        // Bytes before `BitcodeOffset` containing `NOBC` do not make executable bitcode header-only.
+        let mut shifted_exec = shifted_nobc;
+        shifted_exec[24..28].copy_from_slice(b"NOBC");
+        shifted_exec[32..36].copy_from_slice(&[0xD1, 0x11, 0xC0, 0xDE]);
+        let blob_shifted_exec = build_synthetic_dxbc(&[(b"DXIL", &shifted_exec)]);
+        assert_eq!(
+            inspect_dxbc(&blob_shifted_exec)
+                .expect("shifted executable")
+                .kind,
+            ShaderKind::Dxil
+        );
+
+        // Overflowing bitcode offset / size must reject cleanly as `BadDxilHeader`.
+        for (bitcode_off, bitcode_sz) in [(16u32, u32::MAX), (u32::MAX - 4, 4u32)] {
+            let mut overflow = minimal_dxil_program(prog);
+            overflow[16..20].copy_from_slice(&bitcode_off.to_le_bytes());
+            overflow[20..24].copy_from_slice(&bitcode_sz.to_le_bytes());
+            let blob = build_synthetic_dxbc(&[(b"DXIL", &overflow)]);
+            assert_eq!(
+                inspect_dxbc(&blob),
+                Err(ParseError::BadDxilHeader { chunk: 0 })
+            );
+            assert_eq!(
+                summarize_dxbc(&blob).map(|_| ()),
+                Err(ParseError::BadDxilHeader { chunk: 0 })
+            );
+            assert_eq!(
+                dxil_container_len(&blob),
+                Err(ParseError::BadDxilHeader { chunk: 0 })
+            );
+        }
     }
 
     fn fspx_table_with_sections(count: u32) -> Vec<u8> {
