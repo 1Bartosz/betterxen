@@ -10,6 +10,13 @@
 //! A version-1 table holds at most [`FSPX_MAX_SECTIONS`] descriptors. A larger
 //! count is rejected before any descriptor is compared with another, so
 //! inspection stays allocation-free and the pairwise check stays bounded.
+//!
+//! A descriptor whose offset lands inside the 16-byte header or the
+//! descriptor table itself is a layout mismatch, reported apart from a
+//! section that runs past the end of the payload. Read through this layout,
+//! such a table is not merely truncated or corrupt: its descriptors do not
+//! mean `(id, offset, size)` relative to the payload as this module assumes.
+//! It is still an error, and the container is still refused.
 
 use super::{ShaderStage, read_u32_le};
 
@@ -82,9 +89,22 @@ impl FspxInfo {
 pub(crate) enum FspxError {
     Truncated,
     BadVersion(u32),
-    SectionOutOfBounds { section_id: u32 },
-    DuplicateSection { section_id: u32 },
-    Overlap { section_id: u32 },
+    SectionOutOfBounds {
+        section_id: u32,
+    },
+    /// The descriptor's offset lies inside the header plus descriptor table,
+    /// the region this layout reserves, so the table does not follow it.
+    LayoutMismatch {
+        section_id: u32,
+        offset: u32,
+        table_end: u32,
+    },
+    DuplicateSection {
+        section_id: u32,
+    },
+    Overlap {
+        section_id: u32,
+    },
     BadStageConfig,
     TooManySections(u32),
 }
@@ -217,6 +237,15 @@ fn walk_sections(
 ) -> Result<(), FspxError> {
     for index in 0..header.count {
         let (id, offset, size) = descriptor_at(payload, index)?;
+        if usize::try_from(offset).is_ok_and(|start| start < header.table_end) {
+            // `table_end` is at most 16 + 64 * 12 bytes, so it fits in u32.
+            let table_end = u32::try_from(header.table_end).unwrap_or(u32::MAX);
+            return Err(FspxError::LayoutMismatch {
+                section_id: id,
+                offset,
+                table_end,
+            });
+        }
         let end = section_end(offset, size, header.table_end, payload.len())
             .ok_or(FspxError::SectionOutOfBounds { section_id: id })?;
         for prev in 0..index {

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "xg_texture.h"
 
@@ -468,7 +469,9 @@ static void test_copies() {
 }
 
 static void test_swizzle_placeholder() {
-    const uint32_t modes[] = {BX_XG_LAYOUT_SW_64KB_S, BX_XG_LAYOUT_SW_64KB_D, BX_XG_LAYOUT_SW_64KB_R};
+    /* SW_64KB_S is implemented (32 bpp + the BC family); only D and R remain
+     * E_NOTIMPL for every tiled query. */
+    const uint32_t modes[] = {BX_XG_LAYOUT_SW_64KB_D, BX_XG_LAYOUT_SW_64KB_R};
     for (uint32_t mode : modes) {
         bx_xg_resource_desc desc = desc_2d(DXGI_FORMAT_BC7_UNORM, 32, 32, 1, 0, mode);
         void* object = nullptr;
@@ -513,6 +516,370 @@ static void test_swizzle_placeholder() {
     }
     check(XGSuggestSwizzleMode(BX_XG_DIMENSION_TEXTURE2D, DXGI_FORMAT_BC7_UNORM, 32, 32, 1, 0, 1, 0) == BX_XG_LAYOUT_LINEAR,
           "suggest stays on the implemented mode");
+}
+
+/*
+ * SW_64KB_S at 32 bpp, the one tiled mode BetterXen implements (#505).
+ *
+ * The expected byte offsets below are re-derived here from Microsoft's public
+ * D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE 32-bpp masks - xBytes pdep mask
+ * 0xAA8F, y pdep mask 0x5570 - using this file's own pdep, NOT read out of the
+ * shim. The two sources agree at 32 bpp, which is why this mode is the one
+ * implemented (AddrLib is the other; MIT).
+ */
+static uint32_t test_pdep(uint32_t value, uint32_t mask) {
+    uint32_t out = 0;
+    for (uint32_t bit = 1; bit != 0 && mask != 0; bit <<= 1) {
+        const uint32_t lowest = mask & (0u - mask);
+        if (value & bit) {
+            out |= lowest;
+        }
+        mask ^= lowest;
+    }
+    return out;
+}
+
+/* Expected byte offset of texel (x, y) inside a 64 KiB 32-bpp S tile. */
+static uint64_t expected_sw64kb_s_32bpp(uint32_t x, uint32_t y) {
+    return uint64_t(test_pdep(x * 4u, 0xAA8Fu) | test_pdep(y, 0x5570u));
+}
+
+static void test_sw64kb_s_32bpp() {
+    bx_xg_resource_desc desc = desc_2d(DXGI_FORMAT_R8G8B8A8_UNORM, 128, 128, 1, 1, BX_XG_LAYOUT_SW_64KB_S);
+    void* object = nullptr;
+    check_hr("s64 create", XGCreateTextureComputer(&desc, &object), S_OK);
+    auto* computer = static_cast<bx_xg_texture_computer*>(object);
+    if (!computer) {
+        return;
+    }
+
+    check_hr("s64 align", computer->lpVtbl->GetResourceBaseAlignmentBytes(computer, nullptr), E_POINTER);
+
+    /* An implemented tiled resource reports the 64 KiB tile: base alignment,
+     * size, and the single-subresource layout all describe that one tile. */
+    uint64_t align = 0;
+    check_hr("s64 align value", computer->lpVtbl->GetResourceBaseAlignmentBytes(computer, &align), S_OK);
+    check(align == 65536u, "s64 base alignment is the 64 KiB tile");
+    uint64_t size = 0;
+    check_hr("s64 size", computer->lpVtbl->GetResourceSizeBytes(computer, &size), S_OK);
+    check(size == 65536u, "s64 resource size is the 64 KiB tile");
+    bx_xg_placed_footprint layout{};
+    uint32_t rows = 0;
+    uint64_t row_bytes = 0;
+    uint64_t total = 0;
+    check_hr("s64 layout",
+             computer->lpVtbl->GetResourceLayout(computer, 0, 1, 0, &layout, &rows, &row_bytes, &total), S_OK);
+    check(layout.offset == 0u && total == 65536u, "s64 layout describes the single tile");
+    uint64_t mip_offset = 0;
+    check_hr("s64 mip offset", computer->lpVtbl->GetMipLevelOffsetBytes(computer, 0, 0, &mip_offset), S_OK);
+    check(mip_offset == 0u, "s64 single mip starts at the tile base");
+    check_hr("s64 mip out of range",
+             computer->lpVtbl->GetMipLevelOffsetBytes(computer, 0, 1, &mip_offset), E_INVALIDARG);
+
+    /* A spread of texels, including the axes, the corners and a few interior
+     * points, checked against the independently computed expectation. */
+    const uint32_t points[][2] = {
+        {0, 0}, {1, 0}, {4, 0}, {8, 0}, {16, 0}, {64, 0}, {127, 0},
+        {0, 1}, {0, 4}, {0, 8}, {0, 16}, {0, 64}, {0, 127},
+        {3, 3}, {17, 5}, {127, 127}, {64, 64}, {100, 27},
+    };
+    for (const auto& point : points) {
+        uint64_t offset = 0xEEEEEEEEEEEEEEEEull;
+        check_hr("s64 texel",
+                 computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, point[0], point[1], 0, &offset),
+                 S_OK);
+        check(offset == expected_sw64kb_s_32bpp(point[0], point[1]), "s64 texel offset matches D3D12 masks");
+    }
+
+    /* Distinct texels must map to distinct, in-tile, 4-byte-aligned offsets. */
+    bool bijective = true;
+    bool aligned = true;
+    std::vector<uint8_t> seen(65536, 0);
+    for (uint32_t y = 0; y < 128 && bijective; ++y) {
+        for (uint32_t x = 0; x < 128 && bijective; ++x) {
+            uint64_t offset = 0;
+            if (computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, x, y, 0, &offset) != S_OK) {
+                bijective = false;
+                break;
+            }
+            if (offset >= 65536u || seen[size_t(offset)] != 0) {
+                bijective = false;
+                break;
+            }
+            if (offset % 4u != 0) {
+                aligned = false;
+            }
+            seen[size_t(offset)] = 1;
+        }
+    }
+    check(bijective, "s64 is a bijection over the 128x128 tile");
+    check(aligned, "s64 offsets stay 4-byte aligned");
+
+    /* Out-of-tile texels are rejected. */
+    uint64_t offset = 0;
+    check_hr("s64 x out of tile",
+             computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, 128, 0, 0, &offset), E_INVALIDARG);
+    check_hr("s64 y out of tile",
+             computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, 0, 128, 0, &offset), E_INVALIDARG);
+
+    release_computer(computer);
+
+    /* The modes and shapes that stay unimplemented must still say so. */
+    bx_xg_resource_desc d_desc = desc_2d(DXGI_FORMAT_R8G8B8A8_UNORM, 128, 128, 1, 1, BX_XG_LAYOUT_SW_64KB_D);
+    void* d_object = nullptr;
+    check_hr("s64 D create", XGCreateTextureComputer(&d_desc, &d_object), S_OK);
+    auto* d_computer = static_cast<bx_xg_texture_computer*>(d_object);
+    if (d_computer) {
+        uint64_t d_offset = 0;
+        check_hr("s64 D still notimpl",
+                 d_computer->lpVtbl->GetTexelElementOffsetBytes(d_computer, 0, 0, 0, 0, 0, &d_offset), E_NOTIMPL);
+        release_computer(d_computer);
+    }
+
+    check(XGSuggestSwizzleMode(BX_XG_DIMENSION_TEXTURE2D, DXGI_FORMAT_R8G8B8A8_UNORM, 128, 128, 1, 0, 1, 0) ==
+              BX_XG_LAYOUT_LINEAR,
+          "suggest still stays on the linear mode");
+}
+
+/*
+ * SW_64KB_S for the BC family (#505). One "texel" element is a 4x4 block, so
+ * elemLog2 = log2(block_bytes): 8-byte blocks (BC1/BC4) and 16-byte blocks
+ * (BC2/3/5/6H/7).
+ *
+ * The expected byte offsets are re-derived here from AMD's public AddrLib
+ * (MIT) RB+ tables - GFX10_SW_64K_S_RBPLUS_PATINFO expanded through
+ * GFX10_SW_PATTERN_NIBBLE01/2/3 - using this file's own pdep, NOT read out of
+ * the shim. The masks below were expanded by hand from those nibble tables:
+ *   8-byte  (elemLog2=3): x 0xAAC8, y 0x5530, tile 128x64 blocks
+ *   16-byte (elemLog2=4): x 0xAAC0, y 0x5530, tile  64x64 blocks
+ * Each was checked to be a bijection over its 64 KiB tile.
+ */
+static uint64_t expected_sw64kb_s_bc(uint32_t block_bytes, uint32_t x, uint32_t y) {
+    uint32_t x_mask = 0;
+    uint32_t y_mask = 0;
+    switch (block_bytes) {
+        case 4u:
+            x_mask = 0xAA8Cu;
+            y_mask = 0x5570u;
+            break;
+        case 8u:
+            x_mask = 0xAAC8u;
+            y_mask = 0x5530u;
+            break;
+        default:
+            x_mask = 0xAAC0u;
+            y_mask = 0x5530u;
+            break;
+    }
+    return uint64_t(test_pdep(x, x_mask) | test_pdep(y, y_mask));
+}
+
+static void test_sw64kb_s_bc_format(uint32_t format, uint32_t block_bytes, uint32_t tile_bx, uint32_t tile_by, const char* name) {
+    /* Size the texture to exactly one 64 KiB tile: tile_bx*4 x tile_by*4 texels. */
+    bx_xg_resource_desc desc = desc_2d(format, tile_bx * 4u, tile_by * 4u, 1, 1, BX_XG_LAYOUT_SW_64KB_S);
+    void* object = nullptr;
+    check_hr(name, XGCreateTextureComputer(&desc, &object), S_OK);
+    auto* computer = static_cast<bx_xg_texture_computer*>(object);
+    if (!computer) {
+        return;
+    }
+
+    /* An implemented tiled resource reports the 64 KiB tile: base alignment,
+     * size, and the single-subresource layout all describe that one tile. */
+    uint64_t align = 0;
+    check_hr(name, computer->lpVtbl->GetResourceBaseAlignmentBytes(computer, &align), S_OK);
+    check(align == 65536u, "s64 BC base alignment is the 64 KiB tile");
+    uint64_t size = 0;
+    check_hr(name, computer->lpVtbl->GetResourceSizeBytes(computer, &size), S_OK);
+    check(size == 65536u, "s64 BC resource size is the 64 KiB tile");
+    bx_xg_placed_footprint layout{};
+    uint32_t rows = 0;
+    uint64_t row_bytes = 0;
+    uint64_t total = 0;
+    check_hr(name,
+             computer->lpVtbl->GetResourceLayout(computer, 0, 1, 0, &layout, &rows, &row_bytes, &total), S_OK);
+    check(layout.offset == 0u && total == 65536u, "s64 BC layout describes the single tile");
+    uint64_t mip_offset = 0;
+    check_hr(name, computer->lpVtbl->GetMipLevelOffsetBytes(computer, 0, 0, &mip_offset), S_OK);
+    check(mip_offset == 0u, "s64 BC single mip starts at the tile base");
+
+    /* A spread of block coordinates, including the axes, the corners and a few
+     * interior points, checked against the independently computed expectation.
+     * x/y are TEXEL coordinates; the block index is x/4, y/4. */
+    const uint32_t points[][2] = {
+        {0, 0}, {4, 0}, {8, 0}, {16, 0}, {32, 0},
+        {0, 4}, {0, 8}, {0, 16}, {0, 32},
+        {12, 12}, {20, 8}, {36, 24},
+    };
+    for (const auto& point : points) {
+        if (point[0] >= tile_bx * 4u || point[1] >= tile_by * 4u) {
+            continue;
+        }
+        const uint32_t bx = point[0] / 4u;
+        const uint32_t by = point[1] / 4u;
+        uint64_t offset = 0xEEEEEEEEEEEEEEEEull;
+        check_hr(name,
+                 computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, point[0], point[1], 0, &offset),
+                 S_OK);
+        check(offset == expected_sw64kb_s_bc(block_bytes, bx, by), "s64 BC texel offset matches AddrLib masks");
+        /* Intra-block texels (the 4x4 texels inside one BC block) all share the
+         * block's byte offset. */
+        for (uint32_t dy = 0; dy < 4u; ++dy) {
+            for (uint32_t dx = 0; dx < 4u; ++dx) {
+                uint64_t intra = 0xEEEEEEEEEEEEEEEEull;
+                check_hr(name,
+                         computer->lpVtbl->GetTexelElementOffsetBytes(
+                             computer, 0, 0, bx * 4u + dx, by * 4u + dy, 0, &intra),
+                         S_OK);
+                check(intra == offset, "s64 BC intra-block texels share the block offset");
+            }
+        }
+    }
+
+    /* Distinct blocks must map to distinct, in-tile, block-aligned offsets. */
+    bool bijective = true;
+    bool aligned = true;
+    std::vector<uint8_t> seen(65536, 0);
+    for (uint32_t by = 0; by < tile_by && bijective; ++by) {
+        for (uint32_t bx = 0; bx < tile_bx && bijective; ++bx) {
+            uint64_t offset = 0;
+            if (computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, bx * 4u, by * 4u, 0, &offset) != S_OK) {
+                bijective = false;
+                break;
+            }
+            if (offset >= 65536u || seen[size_t(offset)] != 0) {
+                bijective = false;
+                break;
+            }
+            if (offset % block_bytes != 0) {
+                aligned = false;
+            }
+            seen[size_t(offset)] = 1;
+        }
+    }
+    check(bijective, "s64 BC is a bijection over the tile");
+    check(aligned, "s64 BC offsets stay block-aligned");
+
+    /* Out-of-tile texels are rejected. */
+    uint64_t offset = 0;
+    check_hr("s64 BC x out of tile",
+             computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, tile_bx * 4u, 0, 0, &offset), E_INVALIDARG);
+    check_hr("s64 BC y out of tile",
+             computer->lpVtbl->GetTexelElementOffsetBytes(computer, 0, 0, 0, tile_by * 4u, 0, &offset), E_INVALIDARG);
+
+    release_computer(computer);
+}
+
+static void test_sw64kb_s_bc() {
+    /* 8-byte blocks: BC1 and BC4. Tile is 128x64 blocks = 512x256 texels. */
+    test_sw64kb_s_bc_format(DXGI_FORMAT_BC1_UNORM, 8u, 128u, 64u, "s64 BC1");
+    test_sw64kb_s_bc_format(DXGI_FORMAT_BC4_UNORM, 8u, 128u, 64u, "s64 BC4");
+    /* 16-byte blocks: BC2/3/5/6H/7. Tile is 64x64 blocks = 256x256 texels. */
+    test_sw64kb_s_bc_format(DXGI_FORMAT_BC2_UNORM, 16u, 64u, 64u, "s64 BC2");
+    test_sw64kb_s_bc_format(DXGI_FORMAT_BC3_UNORM, 16u, 64u, 64u, "s64 BC3");
+    test_sw64kb_s_bc_format(DXGI_FORMAT_BC5_UNORM, 16u, 64u, 64u, "s64 BC5");
+    test_sw64kb_s_bc_format(DXGI_FORMAT_BC6H_UF16, 16u, 64u, 64u, "s64 BC6H");
+    test_sw64kb_s_bc_format(DXGI_FORMAT_BC7_UNORM, 16u, 64u, 64u, "s64 BC7");
+}
+
+/*
+ * CopyIntoSubresource / CopyFromSubresource round trip for an implemented
+ * SW_64KB_S resource (#505). The image is tight rows of blocks; the resource
+ * is one 64 KiB tile. After the copy, every block's byte offset inside the
+ * tile must equal the independently derived AddrLib S offset, and the
+ * readback must be byte-identical to the image.
+ */
+static void test_sw64kb_s_round_trip(uint32_t format, uint32_t block_bytes, uint32_t block_dim, uint32_t tile_bx, uint32_t tile_by, const char* name) {
+    bx_xg_resource_desc desc = desc_2d(format, tile_bx * block_dim, tile_by * block_dim, 1, 1, BX_XG_LAYOUT_SW_64KB_S);
+    void* object = nullptr;
+    check_hr(name, XGCreateTextureComputer(&desc, &object), S_OK);
+    auto* computer = static_cast<bx_xg_texture_computer*>(object);
+    if (!computer) {
+        return;
+    }
+
+    const size_t image_bytes = size_t(tile_bx) * size_t(tile_by) * block_bytes;
+    uint8_t* image = alloc_bytes(image_bytes, 0);
+    uint8_t* resource = alloc_bytes(65536u + 32u, 0);
+    uint8_t* readback = alloc_bytes(image_bytes + 32u, 0xA5);
+    if (!image || !resource || !readback) {
+        std::free(image);
+        std::free(resource);
+        std::free(readback);
+        release_computer(computer);
+        return;
+    }
+    std::memset(resource + 65536u, 0xA5, 32u);
+    for (size_t i = 0; i < image_bytes; ++i) {
+        image[i] = static_cast<uint8_t>((i * 13u + 7u) & 0xFFu);
+    }
+
+    check_hr(name,
+             computer->lpVtbl->CopyIntoSubresource(
+                 computer, resource, 65536u, 0, image, image_bytes, static_cast<uint32_t>(tile_bx * block_bytes), 0),
+             S_OK);
+    check(bytes_are(resource + 65536u, 32u, 0xA5), "s64 copy leaves the canary");
+
+    /* Every block's byte offset inside the tile must match the AddrLib S
+     * offset, and the bytes there must be the image's block. */
+    bool offsets_ok = true;
+    for (uint32_t by = 0; by < tile_by && offsets_ok; ++by) {
+        for (uint32_t bx = 0; bx < tile_bx && offsets_ok; ++bx) {
+            const uint64_t expected = expected_sw64kb_s_bc(block_bytes, bx, by);
+            const uint64_t image_off = (uint64_t(by) * tile_bx + bx) * block_bytes;
+            if (expected >= 65536u || std::memcmp(resource + expected, image + image_off, block_bytes) != 0) {
+                offsets_ok = false;
+            }
+        }
+    }
+    check(offsets_ok, "s64 copy lands each block at its AddrLib S offset");
+
+    std::memset(readback, 0xA5, image_bytes + 32u);
+    check_hr(name,
+             computer->lpVtbl->CopyFromSubresource(
+                 computer, readback, image_bytes, static_cast<uint32_t>(tile_bx * block_bytes), 0, resource, 65536u, 0),
+             S_OK);
+    check(std::memcmp(readback, image, image_bytes) == 0, "s64 round trip is byte identical");
+    check(bytes_are(readback + image_bytes, 32u, 0xA5), "s64 readback leaves its canary");
+
+    std::free(image);
+    std::free(resource);
+    std::free(readback);
+    release_computer(computer);
+}
+
+/*
+ * CopyFromSubresource into an image buffer too small for the caller's row
+ * pitch must be refused before any byte lands past the buffer. 2x2 RGBA8 with
+ * a 1000-byte pitch needs 1008 bytes; the buffer holds 1004 plus a canary.
+ * Before the direction-aware bounds check this wrote 4 bytes past the buffer.
+ */
+static void test_sw64kb_s_copy_from_bounds() {
+    bx_xg_resource_desc desc = desc_2d(DXGI_FORMAT_R8G8B8A8_UNORM, 2u, 2u, 1, 1, BX_XG_LAYOUT_SW_64KB_S);
+    void* object = nullptr;
+    check_hr("s64 short readback create", XGCreateTextureComputer(&desc, &object), S_OK);
+    auto* computer = static_cast<bx_xg_texture_computer*>(object);
+    if (!computer) {
+        return;
+    }
+    uint8_t* resource = alloc_bytes(65536u, 0x11);
+    uint8_t* readback = alloc_bytes(1004u + 32u, 0xA5);
+    if (resource && readback) {
+        check_hr("s64 short readback",
+                 computer->lpVtbl->CopyFromSubresource(computer, readback, 1004u, 1000u, 0, resource, 65536u, 0),
+                 E_INVALIDARG);
+        check(bytes_are(readback + 1004u, 32u, 0xA5), "s64 short readback leaves its canary");
+    }
+    std::free(resource);
+    std::free(readback);
+    release_computer(computer);
+}
+
+static void test_sw64kb_s_round_trips() {
+    test_sw64kb_s_round_trip(DXGI_FORMAT_R8G8B8A8_UNORM, 4u, 1u, 128u, 128u, "s64 rgba round trip");
+    test_sw64kb_s_round_trip(DXGI_FORMAT_BC1_UNORM, 8u, 4u, 128u, 64u, "s64 bc1 round trip");
+    test_sw64kb_s_round_trip(DXGI_FORMAT_BC7_UNORM, 16u, 4u, 64u, 64u, "s64 bc7 round trip");
+    test_sw64kb_s_copy_from_bounds();
 }
 
 static bool row_is(const uint8_t* row, uint8_t value) {
@@ -642,6 +1009,9 @@ int main() {
     test_overlapping_copies();
     test_large_array_offsets();
     test_swizzle_placeholder();
+    test_sw64kb_s_32bpp();
+    test_sw64kb_s_bc();
+    test_sw64kb_s_round_trips();
     test_refcount();
 
     if (g_failures != 0) {

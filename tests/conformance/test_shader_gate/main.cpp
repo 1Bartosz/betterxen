@@ -188,6 +188,49 @@ HRESULT create_compute(ID3D12Device* device, ID3D12RootSignature* root, const vo
     return device->CreateComputePipelineState(&desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(pso));
 }
 
+/* Builds a stream PSO using the REAL subobject layout: alignas(void*) on the class, so a
+ * 4-byte-aligned payload sits at offset 4, not 8. Encoding the layout from the compiler,
+ * rather than from the shim's own assumption, is what lets these tests catch a desync in the
+ * shim's walker (#576 review). */
+template<class Payload>
+struct alignas(void*) TestSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    Payload payload;
+};
+
+struct StreamBuilder {
+    std::vector<uint8_t> bytes;
+    template<class Payload>
+    void add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const Payload& payload) {
+        using Record = TestSubobject<Payload>;
+        const size_t at = bytes.size();
+        bytes.resize(at + sizeof(Record), 0);
+        std::memcpy(bytes.data() + at + offsetof(Record, type), &type, sizeof(type));
+        std::memcpy(bytes.data() + at + offsetof(Record, payload), &payload, sizeof(payload));
+    }
+    D3D12_PIPELINE_STATE_STREAM_DESC desc() const {
+        D3D12_PIPELINE_STATE_STREAM_DESC d = {};
+        d.SizeInBytes = bytes.size();
+        d.pPipelineStateSubobjectStream = const_cast<uint8_t*>(bytes.data());
+        return d;
+    }
+};
+
+StreamBuilder compute_stream(const void* code, size_t size, ID3D12RootSignature* root) {
+    StreamBuilder stream;
+    D3D12_SHADER_BYTECODE cs = {code, size};
+    stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, cs);
+    stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root);
+    return stream;
+}
+
+HRESULT create_stream(ID3D12Device* device, const D3D12_PIPELINE_STATE_STREAM_DESC& desc,
+                      ID3D12PipelineState** pso) {
+    *pso = nullptr;
+    auto* device2 = static_cast<ID3D12Device2*>(device);
+    return device2->CreatePipelineState(&desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(pso));
+}
+
 /* Runs fill_cs66 and checks every output word. */
 void run_dxil(ID3D12Device* device, ID3D12RootSignature* root, ID3D12PipelineState* pso) {
     D3D12_COMMAND_QUEUE_DESC queue_desc = {};
@@ -301,6 +344,12 @@ int no_bridge_main() {
     graphics.SampleDesc.Count = 1;
     hr = device->CreateGraphicsPipelineState(&graphics, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&pso));
     check(hr == E_NOTIMPL && !pso, "no-bridge: ACCC-only graphics VS hr=0x%08lx (want E_NOTIMPL)", ul(hr));
+    if (pso) pso->Release();
+    // The stream form refuses ACCC-only with or without the bridge (#576).
+    StreamBuilder accc_stream = compute_stream(accc.data(), accc.size(), root);
+    const D3D12_PIPELINE_STATE_STREAM_DESC accc_desc = accc_stream.desc();
+    hr = create_stream(device, accc_desc, &pso);
+    check(hr == E_NOTIMPL && !pso, "no-bridge: ACCC-only stream CS hr=0x%08lx (want E_NOTIMPL)", ul(hr));
     if (pso) pso->Release();
     root->Release();
     device->Release();
@@ -425,9 +474,88 @@ int main() {
     check(SUCCEEDED(hr) && pso, "DXIL PSO after a refusal hr=0x%08lx", ul(hr));
     if (pso) pso->Release();
 
+    // 2b. The stream form (ID3D12Device2::CreatePipelineState) is gated too (#576): the same
+    //     ACCC-only container is refused through the stream, and DXIL passes and runs.
+    {
+        StreamBuilder refused = compute_stream(accc.data(), accc.size(), root_uav);
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream = refused.desc();
+        hr = create_stream(device, stream, &pso);
+        check(hr == E_NOTIMPL && !pso,
+              "ACCC-only stream PSO: hr=0x%08lx (want E_NOTIMPL) pso=%p", ul(hr), static_cast<void*>(pso));
+        if (pso) pso->Release();
+
+        StreamBuilder accepted = compute_stream(g_fill_cs66, sizeof(g_fill_cs66), root_uav);
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream_dxil = accepted.desc();
+        hr = create_stream(device, stream_dxil, &pso);
+        check(SUCCEEDED(hr) && pso, "DXIL stream PSO hr=0x%08lx", ul(hr));
+        if (pso) {
+            run_dxil(device, root_uav, pso);
+            pso->Release();
+        }
+
+        // A truncated stream, and an unknown subobject type, are rejected before the host.
+        StreamBuilder truncated = compute_stream(g_fill_cs66, sizeof(g_fill_cs66), root_uav);
+        D3D12_PIPELINE_STATE_STREAM_DESC short_desc = truncated.desc();
+        short_desc.SizeInBytes -= 8;
+        hr = create_stream(device, short_desc, &pso);
+        check(hr == E_INVALIDARG && !pso, "truncated stream hr=0x%08lx (want E_INVALIDARG)", ul(hr));
+        if (pso) pso->Release();
+
+        StreamBuilder unknown = compute_stream(g_fill_cs66, sizeof(g_fill_cs66), root_uav);
+        /* Append a record whose type tag is not a known subobject. */
+        const size_t at = unknown.bytes.size();
+        const uint32_t bogus = 0x7f;
+        unknown.bytes.resize(at + 8, 0);
+        std::memcpy(unknown.bytes.data() + at, &bogus, sizeof(bogus));
+        const D3D12_PIPELINE_STATE_STREAM_DESC bogus_desc = unknown.desc();
+        hr = create_stream(device, bogus_desc, &pso);
+        check(hr == E_INVALIDARG && !pso, "unknown-subobject stream hr=0x%08lx (want E_INVALIDARG)", ul(hr));
+        if (pso) pso->Release();
+
+        // A graphics stream whose non-shader payloads are 4-byte aligned (SAMPLE_MASK,
+        // RENDER_TARGET_FORMATS, RASTERIZER, BLEND, FLAGS) must still reach the host. The
+        // first version of this change assumed every payload sat at offset 8 and desynced
+        // here, rejecting a valid stream with E_INVALIDARG (#576 review).
+        {
+            // A *compute* stream carrying 4-byte-aligned payloads. The first version used
+            // `g_fill_cs66` as a VS, which is a compute execution model and not a valid
+            // vertex shader, so the host could reject it for a reason unrelated to payload
+            // alignment (review on #577). NODE_MASK and FLAGS are UINT payloads at offset 4
+            // and are legal subobjects for a compute PSO, so this exercises the layout
+            // without depending on a vertex-stage fixture.
+            StreamBuilder aligned_stream;
+            aligned_stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root_uav);
+            D3D12_SHADER_BYTECODE cs = {g_fill_cs66, sizeof(g_fill_cs66)};
+            aligned_stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, cs);
+            UINT node_mask = 0;
+            aligned_stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, node_mask);
+            UINT stream_flags = 0;
+            aligned_stream.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, stream_flags);
+            const D3D12_PIPELINE_STATE_STREAM_DESC aligned_desc = aligned_stream.desc();
+            hr = create_stream(device, aligned_desc, &pso);
+            check(SUCCEEDED(hr) && pso, "compute stream with 4-byte-aligned payloads hr=0x%08lx", ul(hr));
+            if (pso) pso->Release();
+        }
+
+        // A duplicated subobject type is rejected by ID3D12Device2's own rules.
+        StreamBuilder duplicate = compute_stream(g_fill_cs66, sizeof(g_fill_cs66), root_uav);
+        D3D12_SHADER_BYTECODE again = {g_fill_cs66, sizeof(g_fill_cs66)};
+        duplicate.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, again);
+        const D3D12_PIPELINE_STATE_STREAM_DESC dup_desc = duplicate.desc();
+        hr = create_stream(device, dup_desc, &pso);
+        check(hr == E_INVALIDARG && !pso, "duplicate-CS stream hr=0x%08lx (want E_INVALIDARG)", ul(hr));
+        if (pso) pso->Release();
+    }
+
     // 3. Constraint-carrying DXIL still passes; its constraints are logged (results not dispatched).
+    // A wave wider than 32 lanes is refused at creation (#591): D3DMetal creates the PSO
+    // and never runs it, so an S_OK here would be a silent no-op. The fixture asserts the
+    // failure rather than only reading the log, because the log alone cannot tell a caller
+    // what happened.
     hr = create_compute(device, root_uav, g_wave64_lanes_cs, sizeof(g_wave64_lanes_cs), &pso);
-    std::printf("wave64 PSO hr=0x%08lx\n", ul(hr));
+    check(hr == E_NOTIMPL && !pso,
+          "wave64 PSO is refused at creation: hr=0x%08lx (want E_NOTIMPL) pso=%p", ul(hr),
+          static_cast<void*>(pso));
     if (pso) pso->Release();
     hr = create_compute(device, root_table, g_atomic64_image_cs, sizeof(g_atomic64_image_cs), &pso);
     std::printf("atomic64 typed PSO hr=0x%08lx\n", ul(hr));
@@ -448,8 +576,19 @@ int main() {
           "shader_gate record rejecting the ACCC-only compute shader");
     check(log_has(log, {"\"event\":\"shader_gate\"", "pso=graphics", "stage=VS", "decision=reject_accc_only"}),
           "shader_gate record rejecting the ACCC-only vertex shader");
-    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=pass_dxil", "wave_ops=1", "wave_lanes=64-64"}),
-          "shader_gate record with WaveSize(64)");
+    check(log_has(log, {"\"event\":\"shader_gate\"", "pso=stream", "stage=CS", "decision=reject_accc_only"}),
+          "shader_gate record rejecting the ACCC-only stream compute shader");
+    check(log_has(log, {"\"event\":\"shader_gate\"", "pso=stream", "stage=CS", "decision=pass_dxil"}),
+          "shader_gate record passing the DXIL stream compute shader");
+    check(log_has(log, {"\"event\":\"pso_stream\"", "shaders_not_parsed=0"}),
+          "pso_stream record says the stream's shaders were parsed");
+    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=reject_wave_wide", "hr=0x80004001"}),
+          "shader_gate record refusing the wave64 stage");
+    // The wave64 stage is now refused before `pass_dxil` is logged (#591), so the record to
+    // assert is the rejection, carrying the same wave constraints the gap was measured on.
+    check(log_has(log, {"\"event\":\"shader_gate\"", "decision=reject_wave_wide", "wave_ops=1",
+                        "wave_lanes=64-64"}),
+          "shader_gate record with WaveSize(64), refused");
     check(log_has(log, {"\"event\":\"shader_d3dmetal_gap\"", "wave_lanes_min=64"}),
           "shader_d3dmetal_gap record for WaveSize(64)");
     check(log_has(log, {"\"event\":\"shader_gate\"", "decision=pass_dxil", "int64_ops=1", "atomic64=typed,"}),
