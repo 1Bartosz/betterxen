@@ -851,32 +851,35 @@ HRESULT decode_bxvm_config(void* config) {
     BxChargedHeap* old_heap = nullptr;
     ID3D12Resource* old_buffer = nullptr;
     uint64_t published = 0;
+    bool output_written = false;
     {
         Guard guard(g_section);
         const bool same = g_record.configured && g_record.config_base == new_base && g_record.config_size == new_size;
-        if (!same) {
-            take_cached_heap_locked(&old_heap, &old_buffer);
+        published = same ? g_record.cpu_pointer : 0;
+        output_written = write_cpu_pointer(config, published);
+        if (output_written) {
+            if (!same) {
+                take_cached_heap_locked(&old_heap, &old_buffer);
+            }
+            if (!same || g_record.backing_opt_in != backing_opt_in || g_record.have_region != have_region) {
+                ++g_record.config_generation;
+            }
+            g_record.configured = true;
+            g_record.backing_opt_in = backing_opt_in;
+            g_record.profile = profile;
+            g_record.title_limit = cap;
+            g_record.have_region = have_region;
+            g_record.config_base = new_base;
+            g_record.config_size = new_size;
+            g_record.region = have_region ? region : bx_xmem_region_info_t{};
         }
-        if (!same || g_record.backing_opt_in != backing_opt_in || g_record.have_region != have_region) {
-            ++g_record.config_generation;
-        }
-        g_record.configured = true;
-        g_record.backing_opt_in = backing_opt_in;
-        g_record.profile = profile;
-        g_record.title_limit = cap;
-        g_record.have_region = have_region;
-        g_record.config_base = new_base;
-        g_record.config_size = new_size;
-        g_record.region = have_region ? region : bx_xmem_region_info_t{};
-        published = g_record.cpu_pointer;
     }
-    release_backing_pair(old_heap, old_buffer);
-    /* The only write to caller memory, and it happens before this call returns. */
-    if (!write_cpu_pointer(config, published)) {
+    if (!output_written) {
         log_vmem_failed("bxvm", "unwritable_output", E_INVALIDARG);
         BX_STUB_LOG("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX");
         return E_INVALIDARG;
     }
+    release_backing_pair(old_heap, old_buffer);
     uint64_t charged = 0;
     {
         Guard guard(g_section);

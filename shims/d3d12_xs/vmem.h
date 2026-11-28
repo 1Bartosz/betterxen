@@ -9,11 +9,13 @@
  * BetterXen-defined parameter block for D3D12ConfigureVirtualMemoryX.
  *
  * The export is PVOID and the frozen ABI has no size argument (abi/ is out of
- * scope). The first 8 bytes are therefore the minimum dereference: magic then
- * the struct size. Magic is 'BXVM' (0x4D565842). struct_size must equal
- * sizeof(BxD3d12VirtualMemoryConfig). Any other pointer, including null, is not
- * this struct: the call logs the unimplemented-API stub and returns S_OK. It
- * does not read past those 8 bytes and it does not write.
+ * scope). The first 8 bytes are therefore the initial probe: a magic word and
+ * the following 32-bit value. Magic is 'BXVM' (0x4D565842); a matching header
+ * and struct size select the full BetterXen block. A zero first word with a
+ * non-zero second word selects the inferred Xbox candidate path, which checks
+ * and reads its full 32-byte block; that does not establish the inferred ABI.
+ * Other headers fall back after the 8-byte probe. A null pointer is not read.
+ * The inferred Xbox block is never written.
  *
  * A block whose magic and size match is then checked in full. version is 1.
  * flags may be 0 or BX_D3D12_VMEM_FLAG_BACKING_HEAP. Any other flag bit, or a
