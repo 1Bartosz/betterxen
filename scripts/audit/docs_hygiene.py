@@ -25,6 +25,9 @@ MARKER = re.compile(r"^(<{7}( |$)|={7}$|>{7}( |$))")
 LINK = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 FENCE = re.compile(r"^\s*(```|~~~)")
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+# GitHub slugs the rendered heading, so an inline link contributes only its
+# text: ``## See [ADR](x.md)`` slugs as ``see-adr``, not ``see-adrxmd``.
+INLINE_LINK = re.compile(r"(?<!\!)\[([^\]]*)\]\([^)]*\)")
 
 
 def tracked():
@@ -65,7 +68,7 @@ def markdown_slugs(body):
         m = HEADING.match(line)
         if not m:
             continue
-        base = _slug(m.group(2))
+        base = _slug(INLINE_LINK.sub(r"\1", m.group(2)))
         if not base:
             continue
         # Advance the numeric suffix until we find a slug that has not

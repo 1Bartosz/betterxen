@@ -59,6 +59,33 @@ class SlugTests(unittest.TestCase):
         slugs = docs_hygiene.markdown_slugs(body)
         self.assertEqual(slugs, {"foo-1", "foo", "foo-2"})
 
+    def test_heading_link_contributes_only_its_text(self):
+        # GitHub slugs the rendered heading, where the link's URL is gone.
+        # Slugging the raw source appended the URL and made the first real
+        # link to the anchor look broken.
+        slugs = docs_hygiene.markdown_slugs("## Setup [guide](other.md) notes\n")
+        self.assertEqual(slugs, {"setup-guide-notes"})
+
+    def test_heading_link_matches_github_for_the_readme_heading(self):
+        # The exact heading at README.md:53; GitHub renders
+        # `#active-milestone--m2-first-rendered-frame--shader-format-gate`.
+        body = ("### Active Milestone \u2014 [M2: First Rendered Frame & Shader "
+                "Format Gate](https://github.com/MacosPorters/betterxen/milestone/18)\n")
+        slugs = docs_hygiene.markdown_slugs(body)
+        self.assertEqual(
+            slugs, {"active-milestone--m2-first-rendered-frame--shader-format-gate"})
+
+    def test_heading_link_duplicate_still_gets_a_suffix(self):
+        body = "## See [ADR](a.md) notes\n\n## See [ADR](b.md) notes\n"
+        slugs = docs_hygiene.markdown_slugs(body)
+        self.assertEqual(slugs, {"see-adr-notes", "see-adr-notes-1"})
+
+    def test_heading_image_is_not_treated_as_a_link(self):
+        # An image contributes its alt text through GitHub's rendering, but
+        # the `(?<!\!)` guard must keep this path unchanged for now.
+        slugs = docs_hygiene.markdown_slugs("## ![img](a.png) caption\n")
+        self.assertEqual(len(slugs), 1)
+
     def test_fenced_code_block_ignored(self):
         body = "```\n# Not A Heading\n```\n\n# Real Heading\n"
         slugs = docs_hygiene.markdown_slugs(body)
